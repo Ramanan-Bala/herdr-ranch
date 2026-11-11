@@ -60,6 +60,7 @@ export default {
   id: "copilot",
   name: "Copilot",
   icon: "icons/copilot.svg",
+  tint: true, // one-colour glyph (fill="currentColor"): draw with svg() in the text colour
   helper: "helpers/copilot-usage.sh",
   parse,
 };

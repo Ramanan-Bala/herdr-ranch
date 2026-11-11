@@ -79,6 +79,7 @@ export default {
   id: "opencode",
   name: "OpenCode Go",
   icon: "icons/opencode.svg",
+  tint: true, // one-colour glyph (fill="currentColor"): draw with svg() in the text colour
   helper: "helpers/opencode-usage.sh",
   parse,
 };
