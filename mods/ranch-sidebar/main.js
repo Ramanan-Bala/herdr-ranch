@@ -8,7 +8,7 @@ import {
   spaces, machines, agents, panes, setAgentOrder, exec, watchFolder, run,
   openOverlay, theme, shared, setShared, nextCommand, window, home,
 } from "herdr";
-import { buildTree, BADGE_COLORS, badgeColorIndex, initials, diffSquares } from "./model.js";
+import { buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials, diffSquares } from "./model.js";
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent } from "./lib/format.js";
 import { repoSummary, parsePr, createTtlCache, runGh, PR_JSON_FIELDS } from "./lib/git.js";
 import { SETTINGS_KEY, FILTER_KEY, resolveSettings } from "./lib/settings.js";
@@ -29,7 +29,7 @@ export default class RanchSidebar extends View {
     this.cardById = new Map();
     this.settings = resolveSettings(shared(SETTINGS_KEY));
 
-    // Folding: { m: {machineKey: bool}, s: {spaceId: bool}, settled: {spaceId: bool} }
+    // Folding: { m: {machineKey: bool}, s: {spaceId: bool}, w: {worktreeSpaceId: bool}, settled: {spaceId: bool} }
     this.collapsed = this.loadCollapsed();
 
     // Git: repos `${machine}|${top}` -> {summary, at}; topOf `${machine}|${cwd}`
@@ -70,9 +70,9 @@ export default class RanchSidebar extends View {
 
   loadCollapsed() {
     try {
-      return { m: {}, s: {}, settled: {}, ...JSON.parse(localStorage.getItem(COLLAPSE_KEY) ?? "{}") };
+      return { m: {}, s: {}, w: {}, settled: {}, ...JSON.parse(localStorage.getItem(COLLAPSE_KEY) ?? "{}") };
     } catch {
-      return { m: {}, s: {}, settled: {} };
+      return { m: {}, s: {}, w: {}, settled: {} };
     }
   }
 
@@ -356,28 +356,38 @@ export default class RanchSidebar extends View {
         .child(svg(ICON(open ? "chevron-down" : "chevron-right")).size(10).flex_none().text_color(t.dim)));
   }
 
-  spaceRow(sp) {
+  /** The "+" button that opens the new-tab menu, shared by space and worktree rows. */
+  plusBtn(space) {
     const t = theme();
-    const folded = !!this.collapsed.s[sp.space];
-    const plus = div().id(`plus-${sp.space}`).flex_none().size(16).flex().items_center().justify_center()
+    return div().id(`plus-${space}`).flex_none().size(16).flex().items_center().justify_center()
       .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
-        run("space.select", { id: sp.space });
+        run("space.select", { id: space });
         openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 });
       })
       .child(svg(ICON("plus")).size(11));
-    const spark = div().id(`spark-${sp.space}`).flex_none().size(16).flex().items_center().justify_center()
+  }
+
+  /** The sparkle button that opens the start-agent dialog, same rows. */
+  sparkBtn(space) {
+    const t = theme();
+    return div().id(`spark-${space}`).flex_none().size(16).flex().items_center().justify_center()
       .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .tooltip("Start agent with a task")
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
-        run("space.select", { id: sp.space });
-        openOverlay({ mod: "ranch-launch", kind: "dialog", width: 520, height: 256, props: { space: sp.space } });
+        run("space.select", { id: space });
+        openOverlay({ mod: "ranch-launch", kind: "dialog", width: 520, height: 256, props: { space } });
       })
       .child(svg(ICON("sparkle")).size(11));
+  }
+
+  spaceRow(sp) {
+    const t = theme();
+    const folded = !!this.collapsed.s[sp.space];
     const fold = div().id(`fold-${sp.space}`).flex_none().size(16).flex().items_center().justify_center()
       .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .tooltip(folded ? "Expand" : "Collapse")
@@ -397,6 +407,10 @@ export default class RanchSidebar extends View {
     const badge = div().flex_none().size(17).rounded(4).flex().items_center().justify_center()
       .bg(tintBg).text_size(8.5).font_bold().text_color(tint)
       .child(initials(sp.name) || "·");
+    // Checkout facts moved up from the cards: branch (+" · primary" when
+    // worktrees hang off this space), diff stats and PR badge.
+    const co = sp.checkout ?? null;
+    const coBranch = co ? (co.detached ? `detached @${co.head ?? ""}` : co.branch ?? null) : null;
     return h_flex().id(`space-${sp.space}`).h(28).mt(10).flex_none().pl(10).pr(8).gap(8).items_center()
       .cursor_pointer().hover((s) => s.bg(t.hover))
       .on_hover((isIn, cx) => {
@@ -408,15 +422,76 @@ export default class RanchSidebar extends View {
       })
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click(() => run("space.select", { id: sp.space }))
+      .on_mouse_down("right", (_e, cx) => {
+        cx.stop_propagation();
+        openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: sp.space } } });
+      })
       .child(badge)
-      .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold()
+      // The name keeps its width; the dim branch label shrinks first.
+      .child(div().when(Boolean(coBranch), (e) => e.flex_none().max_w(130)).when(!coBranch, (e) => e.flex_1().min_w(0))
+        .truncate().text_size(12).font_semibold()
         .text_color(sp.active ? t.foreground : t.muted).child(sp.name))
+      .when(Boolean(coBranch), (e) => e.child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim)
+        .child(coBranch + (sp.worktrees?.length > 0 ? " · primary" : ""))))
+      .when(Boolean(co) && this.settings.card.line3 && co.stat?.files > 0, (e) => e
+        .child(div().flex_none().text_size(10).text_color(t.ansi2).child(`+${co.stat.add}`))
+        .when(co.stat.del > 0, (el) => el.child(div().flex_none().text_size(10).text_color(t.ansi1).child(`\u2212${co.stat.del}`))))
+      .when(Boolean(this.settings.card.pr && sp.pr), (e) => e.child(this.prBadge(`pr-sp-${sp.space}`, sp.pr)))
       // Plus/sparkle appear only on hover, left of the ring, so the ring,
       // count and chevron keep their place.
-      .when(this.hoveredSpace === sp.space, (e) => e.child(plus).child(spark))
+      .when(this.hoveredSpace === sp.space, (e) => e.child(this.plusBtn(sp.space)).child(this.sparkBtn(sp.space)))
       .when(Boolean(sp.status), (e) => e.child(this.ring(sp.status, 9)))
       .when(folded, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
         .child(String(sp.cards.length + sp.settled.length))))
+      .child(fold);
+  }
+
+  /** The compact 24px row drawn under a main space for each of its worktrees. */
+  worktreeRow(wt) {
+    const t = theme();
+    const folded = !!this.collapsed.w[wt.space];
+    const fold = div().id(`fold-${wt.space}`).flex_none().size(16).flex().items_center().justify_center()
+      .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip(folded ? "Expand" : "Collapse")
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        this.toggleFold("w", wt.space, cx);
+      })
+      .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
+    const label = wt.checkout
+      ? (wt.checkout.detached ? `detached @${wt.checkout.head ?? ""}` : wt.checkout.branch ?? wt.name)
+      : wt.name;
+    const stat = wt.checkout?.stat ?? null;
+    return h_flex().id(`worktree-${wt.space}`).h(24).mt(2).flex_none().pl(10).pr(8).gap(8).items_center()
+      .cursor_pointer().hover((s) => s.bg(t.hover))
+      .on_hover((isIn, cx) => {
+        const next = isIn ? wt.space : null;
+        if (this.hoveredSpace !== next) {
+          this.hoveredSpace = next;
+          cx.notify();
+        }
+      })
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click(() => run("space.select", { id: wt.space }))
+      .on_mouse_down("right", (_e, cx) => {
+        cx.stop_propagation();
+        openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: wt.space } } });
+      })
+      .tooltip([wt.name, wt.checkout?.top ?? null].filter(Boolean).join("\n"))
+      .child(div().flex_none().text_size(11).text_color(t.dim).child(wt.tree))
+      .child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim))
+      .child(div().flex_1().min_w(0).truncate().text_size(11).font_semibold()
+        .text_color(wt.active ? t.foreground : t.muted).child(truncateMiddle(label, 28)))
+      .when(this.settings.card.line3 && stat?.files > 0, (e) => e
+        .child(div().flex_none().text_size(10).text_color(t.ansi2).child(`+${stat.add}`))
+        .when(stat.del > 0, (el) => el.child(div().flex_none().text_size(10).text_color(t.ansi1).child(`\u2212${stat.del}`))))
+      .when(Boolean(this.settings.card.pr && wt.pr), (e) => e.child(this.prBadge(`pr-wt-${wt.space}`, wt.pr)))
+      .when(this.hoveredSpace === wt.space, (e) => e.child(this.plusBtn(wt.space)).child(this.sparkBtn(wt.space)))
+      .when(folded && Boolean(wt.status), (e) => e.child(this.ring(wt.status, 9)))
+      .when(folded && wt.blocked > 0, (e) => e.child(div().flex_none().text_size(10).text_color(t.blocked).child("Needs you")))
+      .when(folded && !(wt.blocked > 0), (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
+        .child(String(wt.cards.length + wt.settled.length))))
       .child(fold);
   }
 
@@ -459,7 +534,28 @@ export default class RanchSidebar extends View {
         .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(10).flex_none().text_color(t.dim)));
   }
 
-  card(c, { settled = false } = {}) {
+  /** The PR link badge (git-compare icon + "#N"), coloured by PR state. */
+  prBadge(id, pr) {
+    const t = theme();
+    // Same colours as the Session panel's PR pill (GitHub's).
+    const color = pr.state === "open" ? t.ansi2
+      : pr.state === "draft" ? t.dim
+      : pr.state === "merged" ? t.ansi5
+      : t.blocked;
+    const stateWord = { open: "Open", draft: "Draft", merged: "Merged", closed: "Closed" }[pr.state] ?? "";
+    return div().id(id).flex_none().text_size(10).font_medium().text_color(color)
+      .cursor_pointer().tooltip([stateWord, pr.title ?? `Pull request #${pr.number}`].filter(Boolean).join(" · "))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        if (pr.url) this.openPr(pr.url);
+      })
+      .child(h_flex().items_center().gap(3)
+        .child(svg(ICON("git-compare")).size(10).flex_none())
+        .child(`#${pr.number}`));
+  }
+
+  card(c, { settled = false, grouped = false } = {}) {
     const t = theme();
     const active = c.active && !settled;
     const hovered = this.hovered === c.tabId;
@@ -475,22 +571,30 @@ export default class RanchSidebar extends View {
           .children(acts.map((a) => this.actionBtn(c, a)))));
 
     const branch = this.branchOf(c);
+    // Grouped under a checkout whose facts moved to the row above: line 2
+    // keeps the branch/folder segment only when it differs from the
+    // checkout's branch, and line 3 (diff stats + PR) is not drawn.
+    const co = this.checkoutBySpace.get(c.spaceId) ?? null;
+    const coBranch = co ? (co.detached ? `detached @${co.head ?? ""}` : co.branch ?? null) : null;
+    const showLoc = !grouped || branch !== coBranch;
     // Task progress from the primary agent's store (the namer's tick keeps it
     // fresh): "done/total" on line 2, and the active task in the tooltip.
     const tasks = c.primaryAgent ? (this.namer.cachedStore(c.primaryAgent)?.tasks ?? []) : [];
     const prog = tasks.length ? progress(tasks) : null;
     const activeTask = tasks.find((task) => task.status === "in_progress") ?? null;
     const parts2 = [];
-    if (branch) {
-      parts2.push(h_flex().flex_1().min_w(0).items_center().gap(4)
-        .child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim))
-        .child(div().flex_1().min_w(0).truncate()
-          .text_color(settled ? t.dim : t.muted)
-          .child(truncateMiddle(branch, 28))));
-    } else if (c.cwd) {
-      parts2.push(h_flex().flex_1().min_w(0).items_center().gap(4)
-        .child(svg(ICON("folder")).size(10).flex_none().text_color(t.dim))
-        .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(c.repo ?? c.cwd)));
+    if (showLoc) {
+      if (branch) {
+        parts2.push(h_flex().flex_1().min_w(0).items_center().gap(4)
+          .child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim))
+          .child(div().flex_1().min_w(0).truncate()
+            .text_color(settled ? t.dim : t.muted)
+            .child(truncateMiddle(branch, 28))));
+      } else if (c.cwd) {
+        parts2.push(h_flex().flex_1().min_w(0).items_center().gap(4)
+          .child(svg(ICON("folder")).size(10).flex_none().text_color(t.dim))
+          .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(c.repo ?? c.cwd)));
+      }
     }
     const icon = c.agentIcon?.icon;
     if (prog) {
@@ -509,10 +613,12 @@ export default class RanchSidebar extends View {
         .bg(color).text_size(7).font_semibold().text_color(t.background)
         .child(initials(c.agentIcon.name ?? c.primaryAgent) || "?"));
     }
-    const line2 = h_flex().flex_none().items_center().justify_between().gap(6).children(parts2);
+    const line2 = parts2.length
+      ? h_flex().flex_none().items_center().justify_between().gap(6).children(parts2)
+      : null;
 
     const parts3 = [];
-    if (this.settings.card.line3 && !settled) {
+    if (this.settings.card.line3 && !settled && !grouped) {
       const stat = c.summary?.stat ?? null;
       if (stat && stat.files > 0) {
         parts3.push(div().flex_none().text_size(10.5).text_color(t.muted)
@@ -526,26 +632,12 @@ export default class RanchSidebar extends View {
         ));
       }
       if (this.settings.card.pr && c.pr) {
-        // Same colours as the Session panel's PR pill (GitHub's).
-        const color = c.pr.state === "open" ? t.ansi2
-          : c.pr.state === "draft" ? t.dim
-          : c.pr.state === "merged" ? t.ansi5
-          : t.blocked;
-        const stateWord = { open: "Open", draft: "Draft", merged: "Merged", closed: "Closed" }[c.pr.state] ?? "";
-        parts3.push(div().id(`pr-${c.tabId}`).flex_none().text_size(10).font_medium().text_color(color)
-          .cursor_pointer().tooltip([stateWord, c.pr.title ?? `Pull request #${c.pr.number}`].filter(Boolean).join(" · "))
-          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-          .on_click((_e, cx) => {
-            cx.stop_propagation();
-            if (c.pr.url) this.openPr(c.pr.url);
-          })
-          .child(h_flex().items_center().gap(3)
-            .child(svg(ICON("git-compare")).size(10).flex_none())
-            .child(`#${c.pr.number}`)));
+        parts3.push(this.prBadge(`pr-${c.tabId}`, c.pr));
       }
     }
     // Line 3 renders only when there is something to show (diff stats, PR);
-    // the card's height follows, so there is no empty slot any more.
+    // the card's height follows, so there is no empty slot any more. Line 2
+    // likewise: a grouped card with nothing left on line 2 is 30px tall.
     const line3 = parts3.length
       ? h_flex().flex_none().h(16).items_center().gap(5).children([...parts3.slice(0, -1), div().flex_1(), parts3.at(-1)])
       : null;
@@ -564,7 +656,7 @@ export default class RanchSidebar extends View {
     const barStatus = c.status ?? (isAgent ? "idle" : null);
     const bar = { idle: t.muted, working: t.ansi3, blocked: t.ansi1, done: t.ansi4 }[barStatus] ?? null;
     // my(3): a 6px gap between cards so each session reads as its own block.
-    return v_flex().id(`card-${c.tabId}`).relative().mx(6).my(3).h(parts3.length ? 58 : 44).rounded(6).pl(10).pr(8).py(6).gap(3).justify_center().text_size(11)
+    return v_flex().id(`card-${c.tabId}`).relative().mx(6).my(3).h(parts3.length ? 58 : parts2.length ? 44 : 30).rounded(6).pl(10).pr(8).py(6).gap(3).justify_center().text_size(11)
       .when(active, (e) => e.bg(t.selected))
       .when(Boolean(bar), (e) => e.child(
         div().absolute().left(0).top(8).bottom(8).w(2).rounded(1).bg(bar)))
@@ -701,6 +793,7 @@ export default class RanchSidebar extends View {
   decorate(tree, s, now) {
     this.wanted = new Set();
     this.cardById = new Map();
+    this.checkoutBySpace = new Map();
     const jobs = [];
     const jobKeys = new Set();
     // Herdr's status first; else what Ranch's own hooks recorded for the tab.
@@ -747,6 +840,11 @@ export default class RanchSidebar extends View {
         const all = [...sp.cards, ...sp.settled];
         sp.status = mostUrgent(all.map((c) => c.status));
         sp.blocked = all.filter((c) => c.status === "blocked").length;
+        // Facts that belong to the checkout move to the space/worktree row:
+        // the first card's git summary and the first matching PR.
+        sp.checkout = all.find((c) => c.summary)?.summary ?? null;
+        sp.pr = all.find((c) => c.pr && c.top === sp.checkout?.top)?.pr ?? null;
+        this.checkoutBySpace.set(sp.space, sp.checkout);
       }
       g.blocked = g.spaces.reduce((n, sp) => n + sp.blocked, 0);
     }
@@ -755,9 +853,13 @@ export default class RanchSidebar extends View {
   }
 
   allCards(tree) {
+    // Same walk as render: main cards, then each worktree's, in display order.
     const out = [];
     for (const g of tree.groups) {
-      for (const sp of g.spaces) out.push(...sp.cards, ...sp.settled);
+      for (const e of nestWorktrees(g.spaces, (sp) => sp.checkout)) {
+        out.push(...e.cards, ...e.settled);
+        for (const wt of e.worktrees) out.push(...wt.cards, ...wt.settled);
+      }
     }
     return out;
   }
@@ -809,20 +911,45 @@ export default class RanchSidebar extends View {
           rows.push(this.machineHeader(g, i === 0));
           if (this.collapsed.m[key]) continue;
         }
-        for (const sp of g.spaces) {
-          rows.push(this.spaceRow(sp));
-          if (this.collapsed.s[sp.space]) continue; // folded: count shows on the row
-          for (const c of sp.cards) {
-            rows.push(this.card(c, {}));
+        for (const e of nestWorktrees(g.spaces, (sp) => sp.checkout)) {
+          rows.push(this.spaceRow(e));
+          if (this.collapsed.s[e.space]) continue; // folded: hides its worktrees too
+          const grouped = (c) => Boolean(e.checkout) && c.top === e.checkout.top;
+          for (const c of e.cards) {
+            rows.push(this.card(c, { grouped: grouped(c) }));
             this.order.push(c.tabId);
           }
-          if (sp.settled.length) {
-            rows.push(this.settledRow(sp));
-            if (!this.collapsed.settled[sp.space]) {
-              for (const c of sp.settled) {
-                rows.push(this.card(c, { settled: true }));
+          if (e.settled.length) {
+            rows.push(this.settledRow(e));
+            if (!this.collapsed.settled[e.space]) {
+              for (const c of e.settled) {
+                rows.push(this.card(c, { settled: true, grouped: grouped(c) }));
                 this.order.push(c.tabId);
               }
+            }
+          }
+          for (const wt of e.worktrees) {
+            rows.push(this.worktreeRow(wt));
+            if (this.collapsed.w[wt.space]) continue;
+            const wtGrouped = (c) => Boolean(wt.checkout) && c.top === wt.checkout.top;
+            const body = [];
+            for (const c of wt.cards) {
+              body.push(this.card(c, { grouped: wtGrouped(c) }));
+              this.order.push(c.tabId);
+            }
+            if (wt.settled.length) {
+              body.push(this.settledRow(wt));
+              if (!this.collapsed.settled[wt.space]) {
+                for (const c of wt.settled) {
+                  body.push(this.card(c, { settled: true, grouped: wtGrouped(c) }));
+                  this.order.push(c.tabId);
+                }
+              }
+            }
+            // Cards indented under the tree glyph, with a 1px guide line.
+            if (body.length) {
+              rows.push(v_flex().id(`worktree-body-${wt.space}`).flex_none().ml(13)
+                .border_l(1).border_color(t.border).children(body));
             }
           }
         }

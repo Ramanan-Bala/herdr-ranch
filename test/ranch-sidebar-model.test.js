@@ -9,7 +9,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 // lib/ must be inside the mod folder before its imports resolve.
 execFileSync("sh", [join(root, "scripts/sync-lib.sh")]);
 
-const { buildTree, BADGE_COLORS, initials, badgeColorIndex, diffSquares } =
+const { buildTree, nestWorktrees, BADGE_COLORS, initials, badgeColorIndex, diffSquares } =
   await import(join(root, "mods/ranch-sidebar/model.js"));
 
 const NOW = Date.parse("2026-11-11T10:00:00Z");
@@ -273,4 +273,80 @@ test("a card at this computer's home reads ~, not the user's folder name", () =>
     now: 0,
   });
   assert.equal(tree.groups[0].spaces[0].cards[0].repo, "~");
+});
+
+// ---------------------------------------------------------------------------
+// nestWorktrees
+
+const repo = (over = {}) => ({ common: over.common ?? "/r/.git", linked: over.linked ?? false });
+const entry = (id) => ({ space: id, name: id, cards: [], settled: [] });
+const noInfo = () => null;
+
+test("nestWorktrees: no repos keeps order with empty worktrees", () => {
+  const input = [entry("s1"), entry("s2")];
+  const out = nestWorktrees(input, noInfo);
+  assert.deepEqual(out.map((e) => e.space), ["s1", "s2"]);
+  assert.deepEqual(out.map((e) => e.worktrees), [[], []]);
+  assert.deepEqual(out.map((e) => e.tree), [null, null]);
+});
+
+test("nestWorktrees: worktrees nest under the main in order with tree glyphs", () => {
+  const input = [entry("main"), entry("wt1"), entry("wt2")];
+  const info = (sp) =>
+    sp.space === "main" ? repo() : repo({ linked: true });
+  const out = nestWorktrees(input, info);
+  assert.deepEqual(out.map((e) => e.space), ["main"]);
+  assert.deepEqual(
+    out[0].worktrees.map((e) => [e.space, e.tree]),
+    [["wt1", "├─"], ["wt2", "└─"]]
+  );
+  assert.deepEqual(out[0].worktrees.map((e) => e.worktrees), [[], []]);
+});
+
+test("nestWorktrees: a worktree listed before its main still nests under it", () => {
+  const input = [entry("wt"), entry("main")];
+  const info = (sp) => (sp.space === "main" ? repo() : repo({ linked: true }));
+  const out = nestWorktrees(input, info);
+  assert.deepEqual(out.map((e) => e.space), ["main"]);
+  assert.deepEqual(out[0].worktrees.map((e) => e.space), ["wt"]);
+  assert.equal(out[0].worktrees[0].tree, "└─");
+});
+
+test("nestWorktrees: an orphan worktree with no main stays top-level", () => {
+  const input = [entry("other"), entry("wt")];
+  const info = (sp) => (sp.space === "wt" ? repo({ common: "/elsewhere/.git", linked: true }) : null);
+  const out = nestWorktrees(input, info);
+  assert.deepEqual(out.map((e) => e.space), ["other", "wt"]);
+  assert.equal(out[1].tree, null);
+  assert.deepEqual(out[1].worktrees, []);
+});
+
+test("nestWorktrees: two mains with the same common nest under the first only", () => {
+  const input = [entry("m1"), entry("m2"), entry("wt")];
+  const info = (sp) => (sp.space === "wt" ? repo({ linked: true }) : repo());
+  const out = nestWorktrees(input, info);
+  assert.deepEqual(out.map((e) => e.space), ["m1", "m2"]);
+  assert.deepEqual(out[0].worktrees.map((e) => e.space), ["wt"]);
+  assert.deepEqual(out[1].worktrees, []);
+});
+
+test("nestWorktrees: mixed mains and worktrees keep positions", () => {
+  const input = [entry("a"), entry("wtA"), entry("b"), entry("wtB")];
+  const info = (sp) =>
+    sp.space === "a" ? repo({ common: "/a/.git" })
+    : sp.space === "b" ? repo({ common: "/b/.git" })
+    : sp.space === "wtA" ? repo({ common: "/a/.git", linked: true })
+    : repo({ common: "/b/.git", linked: true });
+  const out = nestWorktrees(input, info);
+  assert.deepEqual(out.map((e) => e.space), ["a", "b"]);
+  assert.deepEqual(out[0].worktrees.map((e) => e.space), ["wtA"]);
+  assert.deepEqual(out[1].worktrees.map((e) => e.space), ["wtB"]);
+});
+
+test("nestWorktrees: never mutates its inputs", () => {
+  const input = [entry("main"), entry("wt")];
+  const before = JSON.stringify(input);
+  nestWorktrees(input, (sp) => (sp.space === "main" ? repo() : repo({ linked: true })));
+  assert.equal(JSON.stringify(input), before);
+  assert.equal(input[0].worktrees, undefined);
 });

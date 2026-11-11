@@ -277,6 +277,10 @@ export async function repoSummary(git) {
   const urlOut = await git(["remote", "get-url", "origin"]);
   const host = urlOut.code === 0 ? webHost(urlOut.stdout.trim()) : null;
 
+  // A worktree's common dir is the main checkout's .git, not this top's.
+  const commonOut = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  const common = commonOut.code === 0 ? commonOut.stdout.trim() : null;
+
   return {
     top: top.stdout.trim(),
     branch: detached ? null : branch,
@@ -289,6 +293,8 @@ export async function repoSummary(git) {
     ahead,
     behind,
     host,
+    common,
+    linked: common !== null && common !== `${top.stdout.trim()}/.git`,
   };
 }
 
