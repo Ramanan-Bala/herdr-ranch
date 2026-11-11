@@ -13,6 +13,7 @@ execFileSync("sh", [join(root, "scripts/sync-lib.sh")]);
 const { parse: parseClaude } = await import(join(root, "mods/ranch-usage/providers/claude.js"));
 const { parse: parseCodex } = await import(join(root, "mods/ranch-usage/providers/codex.js"));
 const { parse: parseCopilot } = await import(join(root, "mods/ranch-usage/providers/copilot.js"));
+const { parse: parseOpenCode } = await import(join(root, "mods/ranch-usage/providers/opencode.js"));
 const { level } = await import(join(root, "mods/ranch-usage/usage/format.js"));
 
 const NOW = Math.floor(Date.parse("2026-11-11T10:00:00Z") / 1000);
@@ -151,6 +152,72 @@ test("copilot parse: no usable snapshot is unavailable, garbage is an error", ()
   assert.equal(empty.message, "No Copilot limits");
   const garbage = parseCopilot("gh: not logged in\n", NOW);
   assert.equal(garbage.status, "error");
+  assert.deepEqual(garbage.windows, []);
+});
+
+// ------------------------------------------------------------------ opencode
+
+// Real reply, trimmed: opencode api GET /api/experimental/usage/limits.
+const opencodeReply = JSON.stringify({
+  location: { directory: "/Users/x" },
+  data: {
+    workspace: { id: "wrk_X", name: "Default", usageURL: "https://opencode.ai/console/wrk_X/activity/overview" },
+    go: {
+      rolling: { percent: 1, limited: false, resetsAt: 1794416002000 },
+      weekly: { percent: 32, limited: false, resetsAt: 1794787200000 },
+      monthly: { percent: 30, limited: false, resetsAt: 1796628870000 },
+    },
+    budgets: [],
+  },
+});
+
+test("opencode parse: one window per data.go meter, resets in seconds", () => {
+  const r = parseOpenCode(opencodeReply, NOW);
+  assert.equal(r.status, "ok");
+  assert.equal(r.plan, "Go");
+  assert.equal(r.windows.length, 3);
+  assert.deepEqual(r.windows.map((w) => w.id), ["rolling", "weekly", "monthly"]);
+  assert.deepEqual(r.windows.map((w) => w.short), ["5h", "wk", "mo"]);
+  assert.deepEqual(r.windows.map((w) => w.long), ["5-hour", "Weekly", "Monthly"]);
+  assert.deepEqual(r.windows.map((w) => w.percent), [1, 32, 30]);
+  assert.deepEqual(r.windows.map((w) => w.resetsAt), [1794416002000 / 1000, 1794787200000 / 1000, 1796628870000 / 1000]);
+  assert.deepEqual(r.windows.map((w) => w.durationSec), [5 * 3600, 7 * 24 * 3600, 30 * 24 * 3600]);
+});
+
+test("opencode parse: a meter at its limit reads as 100%", () => {
+  const r = parseOpenCode(JSON.stringify({
+    data: { go: { rolling: { percent: 1, limited: true, resetsAt: 1794416002000 } }, budgets: [] },
+  }), NOW);
+  assert.equal(r.status, "ok");
+  assert.equal(r.windows[0].percent, 100);
+});
+
+test("opencode parse: one window per USD budget, spent as a share of limit", () => {
+  const r = parseOpenCode(JSON.stringify({
+    data: {
+      go: undefined,
+      budgets: [{ id: "team", limit: 20, spent: 5, resetsAt: 1796628870000 }],
+    },
+  }), NOW);
+  assert.equal(r.status, "ok");
+  assert.equal(r.plan, null);
+  assert.deepEqual(r.windows.map((w) => w.id), ["budget:team"]);
+  assert.deepEqual(r.windows.map((w) => w.short), ["$"]);
+  assert.deepEqual(r.windows.map((w) => w.long), ["Budget $20"]);
+  assert.deepEqual(r.windows.map((w) => w.percent), [25]);
+  assert.equal(r.windows[0].resetsAt, 1796628870000 / 1000);
+});
+
+test("opencode parse: data null is not signed in, no go or budgets is unavailable, garbage is an error", () => {
+  const signedOut = parseOpenCode(JSON.stringify({ data: null }), NOW);
+  assert.equal(signedOut.status, "unavailable");
+  assert.equal(signedOut.message, "Not signed in to OpenCode Console");
+  const noPlan = parseOpenCode(JSON.stringify({ data: { workspace: { id: "wrk_X" }, budgets: [] } }), NOW);
+  assert.equal(noPlan.status, "unavailable");
+  assert.equal(noPlan.message, "No OpenCode Go plan or budgets");
+  const garbage = parseOpenCode("opencode: not logged in\n", NOW);
+  assert.equal(garbage.status, "error");
+  assert.equal(garbage.message, "No reply from the opencode CLI");
   assert.deepEqual(garbage.windows, []);
 });
 

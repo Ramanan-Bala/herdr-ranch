@@ -328,7 +328,7 @@ export default class UsageLimits extends View {
     if (session) body.child(v_flex().pt(10).border_t(1).border_color(t.border).child(this.sessionBlock(session, t)));
     const cooling = this.cooling();
     return body.child(h_flex().gap(2).items_center()
-      .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child("Data: claude, codex and gh CLIs, numbers from session logs."))
+      .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child("Data: claude, codex, gh and opencode CLIs, numbers from session logs."))
       .child(this.iconButton("ul-refresh", "refresh", cooling ? "Refreshing…" : "Refresh now", !cooling, (cx) => this.refresh(cx), t))
       .child(this.iconButton("ul-settings", "gear", "Settings", true, (cx) => this.show("settings", cx), t)));
   }
@@ -383,7 +383,7 @@ export default class UsageLimits extends View {
           return this.check(`s-${row}`, isOnBar(prefs, row), [div().text_color(t.foreground).child(name)],
             () => save(toggleOnBar(this.prefs(), row)), t);
         })))
-      .child(div().text_size(10.5).text_color(t.dim).child("Data: claude, codex and gh CLIs, numbers from session logs."));
+      .child(div().text_size(10.5).text_color(t.dim).child("Data: claude, codex, gh and opencode CLIs, numbers from session logs."));
   }
 
   render(cx) {
