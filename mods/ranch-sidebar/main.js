@@ -24,6 +24,7 @@ export default class RanchSidebar extends View {
     this.size = null; // root size, null until first layout
     this.highlight = null; // keyboard-highlighted tab id
     this.hovered = null; // pointer-hovered tab id (drives the card action strip)
+    this.hoveredSpace = null; // pointer-hovered space id (drives plus/sparkle)
     this.order = []; // visible card tab ids, display order
     this.cardById = new Map();
     this.settings = resolveSettings(shared(SETTINGS_KEY));
@@ -318,18 +319,23 @@ export default class RanchSidebar extends View {
       .child(div().text_size(10).text_color(t.blocked).child(String(count)));
   }
 
-  machineHeader(g) {
+  machineHeader(g, first) {
     const t = theme();
     const key = g.machine ?? "";
     const open = !this.collapsed.m[key];
-    return h_flex().id(`machine-${key || "local"}`).h(24).flex_none().pl(4).pr(6).gap(3).items_center()
+    // Machine icon in the space-badge column; chevron in the space-row chevron
+    // column so every fold control lines up.
+    return h_flex().id(`machine-${key || "local"}`).h(30).flex_none().pl(10).pr(8).gap(8).items_center()
+      .when(first, (e) => e.mt(4))
+      .when(!first, (e) => e.mt(10).border_t(1).border_color(t.border).pt(1))
       .cursor_pointer().hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click(() => this.toggleFold("m", key))
-      .child(svg(ICON(open ? "chevron-down" : "chevron-right")).size(10).flex_none().text_color(t.dim))
-      .child(div().flex_1().min_w(0).truncate().text_size(11).font_semibold().text_color(t.dim).child(g.label))
+      .child(div().flex_none().size(17).flex().items_center().justify_center()
+        .child(svg(ICON(g.machine ? "server" : "laptop")).size(13).flex_none().text_color(t.muted)))
+      .child(div().flex_1().min_w(0).truncate().text_size(11.5).font_semibold().text_color(t.muted).child(g.label))
       .when(g.state !== "ready", (e) => e.child(
-        div().flex_none().text_size(10).text_color(t.dim)
+        div().flex_none().text_size(10.5).text_color(t.dim)
           .child(g.state === "loading" ? "connecting…" : "offline")))
       .when(g.blocked > 0, (e) => e.child(this.badge(g.blocked)))
       .when(g.state === "unavailable" && g.machine, (e) => e.child(
@@ -340,7 +346,11 @@ export default class RanchSidebar extends View {
             cx.stop_propagation();
             cx.write_to_clipboard(`hc machine login ${g.machine}`);
           })
-          .child("Copy")));
+          .child("Copy")))
+      .when(!open, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
+        .child(String(g.spaces.length))))
+      .child(div().flex_none().size(16).flex().items_center().justify_center()
+        .child(svg(ICON(open ? "chevron-down" : "chevron-right")).size(10).flex_none().text_color(t.dim)));
   }
 
   spaceRow(sp) {
@@ -381,14 +391,22 @@ export default class RanchSidebar extends View {
       .child(initials(sp.name) || "·");
     return h_flex().id(`space-${sp.space}`).h(28).mt(10).flex_none().pl(10).pr(8).gap(8).items_center()
       .cursor_pointer().hover((s) => s.bg(t.hover))
+      .on_hover((isIn, cx) => {
+        const next = isIn ? sp.space : null;
+        if (this.hoveredSpace !== next) {
+          this.hoveredSpace = next;
+          cx.notify();
+        }
+      })
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click(() => run("space.select", { id: sp.space }))
       .child(badge)
       .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold()
         .text_color(sp.active ? t.foreground : t.muted).child(sp.name))
+      // Plus/sparkle appear only on hover, left of the ring, so the ring,
+      // count and chevron keep their place.
+      .when(this.hoveredSpace === sp.space, (e) => e.child(plus).child(spark))
       .when(Boolean(sp.status), (e) => e.child(this.ring(sp.status, 9)))
-      .child(plus)
-      .child(spark)
       .when(folded, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
         .child(String(sp.cards.length + sp.settled.length))))
       .child(fold);
@@ -770,10 +788,10 @@ export default class RanchSidebar extends View {
     } else if (narrow) {
       rows.push(this.rail(tree));
     } else {
-      for (const g of tree.groups) {
+      for (const [i, g] of tree.groups.entries()) {
         const key = g.machine ?? "";
         if (tree.showMachines) {
-          rows.push(this.machineHeader(g));
+          rows.push(this.machineHeader(g, i === 0));
           if (this.collapsed.m[key]) continue;
         }
         for (const sp of g.spaces) {
