@@ -30,6 +30,7 @@ import {
   links,
   parsePr,
   runGh,
+  createTtlCache,
   PR_JSON_FIELDS,
 } from "./lib/git.js";
 import { TASKS_DIR, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
@@ -58,6 +59,9 @@ import {
   fileRow,
   herdrSubStatus,
   activityStatus,
+  prStateToken,
+  prStateLabel,
+  prRepoText,
 } from "./model.js";
 import { isWinHome, whereFirstPath, editorLaunch, windowsHome } from "./win.js";
 
@@ -97,6 +101,9 @@ export default class RanchSession extends View {
     this.git = { key: null, summary: null, details: null, top: null, busy: false, dirty: true, at: 0, readyKey: null };
     this.gitWatchGen = 0;
     this.pr = { key: null, parsed: null, busy: false, dirty: true, at: 0, failed: false, error: null };
+    this.recordedPrCache = createTtlCache(60000); // url -> parsePr() of a recorded PR
+    this.recordedPrTtl = 60000; // recreated when refresh.prSec changes
+    this.recordedPrBusy = new Set(); // URLs with a lookup in flight
     this.agentKey = null; // `${address}@${machine}` of the last seen chosen agent (I2)
     this.sessionKey = null;
     this.commitsOpen = localStorage.getItem("commitsOpen") === "1";
@@ -665,6 +672,42 @@ export default class RanchSession extends View {
     if (!this.pr.busy && this.git.readyKey === gitKey && (this.pr.dirty || now - this.pr.at >= prEvery)) {
       this.refreshPr(cx);
     }
+    // Recorded PRs ("Opened by this agent"): fetch each URL's real state and
+    // title at the branch PR's cadence, one lookup per URL at a time.
+    const recordedTtl = Math.max(5, set.refresh.prSec) * 1000; // not the 20 s CI-pending cadence
+    if (recordedTtl !== this.recordedPrTtl) {
+      this.recordedPrTtl = recordedTtl;
+      this.recordedPrCache = createTtlCache(recordedTtl);
+    }
+    if (s.cwd) {
+      for (const p of this.recordedPrs(s, this.pr.parsed)) {
+        if (!this.recordedPrBusy.has(p.url) && this.recordedPrCache.get(p.url, now) === undefined) {
+          this.lookupRecordedPr(cx, s, p.url);
+        }
+      }
+    }
+  }
+
+  /** One recorded PR's state/title, parsed like the branch PR's. */
+  async lookupRecordedPr(cx, s, url) {
+    this.recordedPrBusy.add(url);
+    try {
+      const gh = (cmd, args) => exec(cmd, args, { cwd: s.cwd, on: s.machine, timeout: 15000 });
+      const r = await runGh(gh, ["pr", "view", url, "--json", PR_JSON_FIELDS]);
+      let parsed = null;
+      if (r.code === 0) {
+        try {
+          parsed = parsePr(JSON.parse(r.stdout));
+        } catch {
+          parsed = null;
+        }
+      }
+      this.recordedPrCache.set(url, parsed, Date.now());
+    } catch {
+      this.recordedPrCache.set(url, null, Date.now()); // retried after the TTL
+    }
+    this.recordedPrBusy.delete(url);
+    cx.notify();
   }
 
   // ---- ui ---------------------------------------------------------------
@@ -1380,10 +1423,16 @@ export default class RanchSession extends View {
     }
 
     // PRs the agent created (`gh pr create`, recorded by the adapters, I4),
-    // shown in addition to the branch PR.
+    // shown in addition to the branch PR. State/title come from the recorded
+    // PR lookups (pump); until they arrive, show `#n owner/repo`.
     if (extra.length) {
-      card.child(div().text_size(11).text_color(t.dim).child("Created by agent:"));
+      card.child(div().text_size(11).text_color(t.dim).child("Opened by this agent:"));
+      const now = Date.now();
       for (const p of extra) {
+        const parsed = this.recordedPrCache.get(p.url, now) ?? null;
+        const token = parsed ? prStateToken(parsed.state) : null;
+        const label = parsed ? prStateLabel(parsed.state) : null;
+        const repo = prRepoText(p.url) ?? p.url;
         card.child(
           h_flex()
             .id(`agent-pr-${p.number}`)
@@ -1392,12 +1441,21 @@ export default class RanchSession extends View {
             .min_w(0)
             .cursor_pointer()
             .hover((h) => h.bg(t.hover))
+            .tooltip(p.url)
             .on_click(() => this.openUrl(p.url))
             .child(h_flex().h(18).flex_none().items_center().child(
-              svg("mods/ranch-session/git-pull-request.svg").size(12).text_color(t.ansi2)
+              svg("mods/ranch-session/git-pull-request.svg").size(12).text_color(token ? t[token] : t.dim)
             ))
-            .child(div().flex_none().text_size(12).text_color(t.foreground).child(`#${p.number}`))
-            .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child(p.url))
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .truncate()
+                .text_size(12)
+                .text_color(t.foreground)
+                .child(parsed?.title ? `#${p.number} ${parsed.title}` : `#${p.number} ${repo}`)
+            )
+            .when(Boolean(label), (el) => el.child(this.pill(t, label, token)))
         );
       }
     }
