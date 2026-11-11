@@ -8,6 +8,7 @@
     "test": "sh scripts/sync-lib.sh && node --test test/*.test.js",
     "sync": "sh scripts/sync-lib.sh",
     "check": "sh scripts/sync-lib.sh && sh scripts/check.sh",
-    "verify": "npm test && npm run check"
+    "verify": "npm test && npm run check",
+    "reload": "sh scripts/link-dev.sh --reload"
   }
 }

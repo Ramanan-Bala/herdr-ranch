@@ -89,6 +89,9 @@ function editorName(path) {
   return EDITOR_NAMES[base] ?? base;
 }
 
+/** How long a task-store read may run before a new one replaces it. */
+const TASKS_READ_STALL_MS = 5000;
+
 export default class RanchSession extends View {
   init(_props, cx) {
     this.remembered = new Map(); // tabId -> chosen agent address
@@ -254,11 +257,16 @@ export default class RanchSession extends View {
 
   /** Reads the chosen agent's store file (one read in flight). */
   async loadTasks(cx) {
-    if (this.tasksBusy) {
+    // A read that never settles (seen across a mod reload) must not leave
+    // tasksBusy set forever: after TASKS_READ_STALL_MS a new read takes over
+    // and the stalled one's result is ignored by its generation.
+    if (this.tasksBusy && Date.now() - (this.tasksBusyAt ?? 0) < TASKS_READ_STALL_MS) {
       this.tasksPending = true;
       return;
     }
+    const gen = (this.tasksGen = (this.tasksGen ?? 0) + 1);
     this.tasksBusy = true;
+    this.tasksBusyAt = Date.now();
     try {
       const s = this.session();
       const agent = s.chosen;
@@ -270,6 +278,7 @@ export default class RanchSession extends View {
       const key = `${agent.address}@${s.machine ?? ""}`;
       const homeDir = await this.homeFor(s.machine);
       const { parsed } = await this.readStoreText(s.machine, homeDir, agent.address);
+      if (gen !== this.tasksGen) return; // superseded after a stall
       // Stale read (I2): the focused agent changed while the file was read.
       const now = this.session();
       if (now.chosen?.address !== agent.address || (now.machine ?? null) !== (s.machine ?? null)) return;
@@ -282,10 +291,13 @@ export default class RanchSession extends View {
       this.loadSubTasks(s, cx);
       return;
     } finally {
-      this.tasksBusy = false;
-      if (this.tasksPending) {
-        this.tasksPending = false;
-        this.loadTasks(cx);
+      // A newer read (after a stall) owns the flags.
+      if (gen === this.tasksGen) {
+        this.tasksBusy = false;
+        if (this.tasksPending) {
+          this.tasksPending = false;
+          this.loadTasks(cx);
+        }
       }
     }
   }
@@ -413,7 +425,7 @@ export default class RanchSession extends View {
   /** The main agent's and each sub-agent's task list (only visible stores). */
   taskLists(s) {
     const lists = [];
-    if (this.tasks.parsed?.ok && listVisible(this.tasks.parsed, this.liveFor(s.chosen, s.machine))) {
+    if (this.tasksReady(s) && this.tasks.parsed?.ok && listVisible(this.tasks.parsed, this.liveFor(s.chosen, s.machine))) {
       lists.push(this.tasks.parsed.store.tasks);
     }
     for (const k of this.subTerminals(s)) {
@@ -560,7 +572,7 @@ export default class RanchSession extends View {
     // No PR to look up on the default branch or without a known web host.
     const noPr = branch && (branch === this.git.summary?.default || !this.git.summary?.host);
     if (!s.cwd || !branch || noPr) {
-      this.pr = { key: null, parsed: null, busy: false, dirty: false, at: Date.now(), failed: false, error: null };
+      this.pr = { key: null, parsed: null, busy: false, dirty: false, at: Date.now(), failed: false, error: null, readyFor: `${s.machine ?? ""}|${s.cwd ?? ""}` };
       cx.notify();
       return;
     }
@@ -605,6 +617,7 @@ export default class RanchSession extends View {
     }
     this.pr.busy = false;
     this.pr.at = Date.now();
+    this.pr.readyFor = `${s.machine ?? ""}|${s.cwd}`;
     cx.notify();
   }
 
@@ -642,7 +655,8 @@ export default class RanchSession extends View {
       this.push = { busy: false, err: null };
       this.copyAt = 0;
     }
-    if (akey !== this.tasks.key && !this.tasksBusy) this.loadTasks(cx);
+    // loadTasks guards itself (and takes over from a stalled read).
+    if (akey !== this.tasks.key) this.loadTasks(cx);
     // The action bar's Editor button needs one detection per machine.
     this.maybeDetectEditor(s.machine, cx);
     // Only needed while the store is missing (to offer Set up), once a minute.
@@ -897,7 +911,7 @@ export default class RanchSession extends View {
    * copy branch, push and PR. Only known/possible actions show.
    */
   actionBar(t, s) {
-    const sum = this.git.summary;
+    const sum = this.gitReady(s) ? this.git.summary : null;
     const top = sum?.top ?? s.cwd;
     const branch = sum?.branch ?? null;
     const lk = sum?.host ? links(sum.host) : null;
@@ -1162,14 +1176,49 @@ export default class RanchSession extends View {
 
   // ---- git card ----------------------------------------------------------
 
+  /**
+   * True once git has been read for this tab's folder. A tab change keeps the
+   * previous folder's summary until the new read lands (slow on Windows), so
+   * callers show "Refreshing…" instead of another repo's branch.
+   */
+  gitReady(s) {
+    return Boolean(s.cwd) && this.git.readyKey === `${s.machine ?? ""}|${s.cwd}`;
+  }
+
+  /** True once the PR lookup has finished for this tab's folder (after git). */
+  prReady(s) {
+    return this.gitReady(s) && this.pr.readyFor === `${s.machine ?? ""}|${s.cwd}`;
+  }
+
+  /** True once the chosen agent's own store has been read (not the previous tab's). */
+  tasksReady(s) {
+    const key = s.chosen ? `${s.chosen.address}@${s.machine ?? ""}` : null;
+    return this.tasks.read && this.tasks.key === key;
+  }
+
+  /** The "Refreshing…" badge a card header shows while its data loads. */
+  refreshing(t) {
+    return h_flex().gap(5).items_center().flex_none().text_size(11).text_color(t.dim)
+      .child(svg("mods/ranch-session/spinner.svg").size(11).flex_none().text_color(t.working).spin(900))
+      .child("Refreshing\u2026");
+  }
+
   gitCard(t, s, set) {
     const card = this.cardShell(t);
-    card.child(this.cardTitle(t, "Git"));
-    const sum = this.git.summary;
+    const ready = this.gitReady(s);
+    card.child(
+      h_flex().gap(6).items_center().min_w(0)
+        .child(this.cardTitle(t, "Git"))
+        .child(div().flex_1().min_w(0))
+        .when(Boolean(s.cwd) && !ready, (el) => el.child(this.refreshing(t)))
+    );
     if (!s.cwd) {
       card.child(div().text_size(12).text_color(t.dim).child("—"));
       return card;
     }
+    // Another folder's data would mislead: wait for this tab's read.
+    if (!ready) return card;
+    const sum = this.git.summary;
     if (!sum) {
       card.child(div().text_size(12).text_color(t.dim).child("No git repo"));
       return card;
@@ -1350,6 +1399,14 @@ export default class RanchSession extends View {
   // ---- pull request card -------------------------------------------------
 
   prCard(t, s) {
+    if (s.cwd && !this.prReady(s)) {
+      return this.cardShell(t).child(
+        h_flex().gap(6).items_center().min_w(0)
+          .child(this.cardTitle(t, "Pull request"))
+          .child(div().flex_1().min_w(0))
+          .child(this.refreshing(t))
+      );
+    }
     const pr = this.pr.parsed;
     const extra = this.recordedPrs(s, pr);
     if (!pr && !extra.length) return null;
@@ -1503,12 +1560,11 @@ export default class RanchSession extends View {
    * main agent's and each sub-agent's store, deduped against the branch PR.
    */
   recordedPrs(s, pr) {
-    const host = this.git.summary?.host;
-    const branchUrl = pr?.url || (host && pr?.number ? links(host).pr(pr.number) : null);
+    const branchUrl = this.branchPrUrl(pr);
     const seenUrls = new Set(branchUrl ? [branchUrl] : []);
     const out = [];
     const stores = [];
-    if (this.tasks.parsed?.ok) stores.push(this.tasks.parsed.store);
+    if (this.tasksReady(s) && this.tasks.parsed?.ok) stores.push(this.tasks.parsed.store);
     for (const k of this.subTerminals(s)) {
       const entry = this.subTasks.get(k.address);
       if (entry?.parsed?.ok) stores.push(entry.parsed.store);
@@ -1533,6 +1589,12 @@ export default class RanchSession extends View {
     return out;
   }
 
+  /** The branch PR's URL (gh's, else built from the host and number). */
+  branchPrUrl(pr) {
+    const host = this.git.summary?.host;
+    return pr?.url || (host && pr?.number ? links(host).pr(pr.number) : null);
+  }
+
   /** The CI glyph: ✕ failed, ○ ring running, ✓ passed, – skipped. */
   ciGlyph(t, kind) {
     if (kind === "fail") {
@@ -1554,7 +1616,8 @@ export default class RanchSession extends View {
     // Nesting (fixes 3.6): a store sub-agent that belongs to one of the
     // Herdr sub terminals shows in that terminal's card, not twice here.
     const nested = new Set(herdrSubs.map((k) => k.address));
-    const storeSubs = (this.tasks.parsed?.ok ? this.tasks.parsed.store.subagents : [])
+    const tasksReady = this.tasksReady(s);
+    const storeSubs = (tasksReady && this.tasks.parsed?.ok ? this.tasks.parsed.store.subagents : [])
       .filter((sub) => !sub.parent_terminal || !nested.has(sub.parent_terminal));
     if (!herdrSubs.length && !storeSubs.length) return null;
     const card = this.cardShell(t);
@@ -1634,12 +1697,15 @@ export default class RanchSession extends View {
     const addr = isMain ? s.chosen.address : sub.address;
     const entry = isMain ? this.tasks : this.subTasks.get(addr) ?? null;
     const parsed = entry?.parsed ?? null;
-    const read = isMain ? this.tasks.read : Boolean(entry?.read);
+    const read = isMain ? this.tasksReady(s) : Boolean(entry?.read);
     const card = this.cardShell(t);
     const open = this.tasksOpen.get(addr) ?? true;
 
     const head = h_flex().gap(6).items_center().min_w(0);
-    const prog = parsed?.ok ? progress(this.liveTasks(parsed.store.tasks)) : { done: 0, total: 0 };
+    const status = isMain ? s.chosen.status : this.subAgentStatus(sub);
+    // A stale done list is hidden ("No recent activity"), so no count either.
+    const stale = parsed?.ok && listLifecycle(parsed.store, status, Date.now()).hide;
+    const prog = read && parsed?.ok && !stale ? progress(this.liveTasks(parsed.store.tasks)) : { done: 0, total: 0 };
     const label = isMain
       ? "Tasks"
       : `Tasks \u00b7 ${sub.name || sub.template || sub.program?.name || sub.address}`;
@@ -1653,11 +1719,11 @@ export default class RanchSession extends View {
         .child(prog.total ? `${label} ${prog.done}/${prog.total}` : label)
     );
     head.child(div().flex_1().min_w(0));
-    const status = isMain ? s.chosen.status : this.subAgentStatus(sub);
+    if (!read) head.child(this.refreshing(t));
     if (status) head.child(this.pill(t, stateWord(status), status));
     // "no task updates" badge (fixes F13): the agent kept working but the
     // list stopped changing.
-    if (parsed?.ok && parsed.store.missed_turns > 0) {
+    if (read && parsed?.ok && parsed.store.missed_turns > 0) {
       head.child(this.pill(t, "no task updates", "blocked"));
     }
     head.child(
@@ -1679,10 +1745,7 @@ export default class RanchSession extends View {
     card.child(head);
     if (!open) return card;
 
-    if (!read) {
-      card.child(div().text_size(11.5).text_color(t.dim).child("Loading\u2026"));
-      return card;
-    }
+    if (!read) return card; // the header shows "Refreshing…"
 
     // Identity check (fixes F4): show the list only when the terminal is
     // still live and its start time matches the store's.

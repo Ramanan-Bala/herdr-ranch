@@ -6,7 +6,7 @@
 // Legacy flat stores (tasks/<terminal>.json, schema 1) are still read.
 // Writes are atomic and refuse to overwrite a newer `seq`.
 import { execFileSync } from "node:child_process";
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { STORE_VERSION, agentApp, emptyStore, parseStore, storeFileName } from "../lib/tasks.js";
@@ -262,6 +262,28 @@ export function updateStore(agent, fn, lookupStartedAt = terminalStartedAt) {
       if (legacySession && incomingSession && legacySession !== incomingSession) {
         current = emptyStore(terminal, agent);
         next = fn(current);
+      }
+      // A session resumed in a NEW terminal (no pointer file, or the terminal
+      // file is still the store): adopt the existing session-keyed store
+      // instead of starting from empty (fixes §3.3). Never adopt over real
+      // in-terminal data, and only when the session file exists on disk.
+      if (
+        sessionFile === null &&
+        typeof incomingSession === "string" && incomingSession &&
+        !current.tasks?.length && !current.prs?.length
+      ) {
+        const incomingPath = sessionPath(home, incomingSession);
+        if (incomingPath && existsSync(incomingPath)) {
+          const adopted = readStore(incomingPath, agent, terminal);
+          if (agentApp(adopted.agent) === agent) {
+            // The new terminal's start time must be looked up again: the UI
+            // identity check compares it to the live terminal start.
+            adopted.terminal = terminal;
+            adopted.terminal_started_at = null;
+            current = adopted;
+            next = fn(current);
+          }
+        }
       }
       if (!next || typeof next !== "object") return current;
 

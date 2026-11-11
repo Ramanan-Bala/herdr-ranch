@@ -202,8 +202,9 @@ test("I4: recorded PRs dedupe by URL across repositories", () => {
   const branchUrl = "https://github.com/acme/ranch/pull/12";
   const otherUrl = "https://github.com/acme/other/pull/12";
   const thirdUrl = "https://github.com/acme/third/pull/12";
-  const view = {
+  const view = Object.assign(Object.create(RecordedPrs.prototype), {
     git: { summary: { host: { kind: "github", base: "https://github.com/acme/ranch" } } },
+    tasksReady: () => true,
     tasks: { parsed: { ok: true, store: { prs: [
       { url: branchUrl, number: 12 },
       { url: otherUrl, number: 12 },
@@ -213,9 +214,12 @@ test("I4: recorded PRs dedupe by URL across repositories", () => {
       { url: thirdUrl, number: 12 },
       { url: otherUrl, number: 12 },
     ] } } }]]),
-  };
+  });
   const result = RecordedPrs.prototype.recordedPrs.call(view, {}, { number: 12 });
   assert.deepEqual(result.map((p) => p.url), [otherUrl, thirdUrl]);
+  // Until the chosen agent's own store is read, its recorded PRs don't count.
+  const loading = Object.assign(Object.create(RecordedPrs.prototype), view, { tasksReady: () => false, subTerminals: () => [] });
+  assert.deepEqual(RecordedPrs.prototype.recordedPrs.call(loading, {}, null), []);
 });
 
 // ------------------------------------------------------- I12/I10: session ids
@@ -281,6 +285,56 @@ test("I10: readStore never continues another agent's store", () => {
     const disk = parseStore(terminalStoreText(home, "t9")).store;
     assert.equal(disk.agent.app, "codex");
     assert.deepEqual(disk.tasks.map((t) => t.title), ["mine"]);
+  } finally {
+    delete process.env.RANCH_HOME;
+    delete process.env.HC_TERMINAL_ID;
+  }
+});
+
+test("I3.3: a session resumed in a new terminal adopts its existing store", () => {
+  const home = mkdtempSync(join(tmpdir(), "ranch-integrity-"));
+  const resumed = (store) => ({ ...store, session: { ...(store.session ?? {}), id: "S1" } });
+  process.env.RANCH_HOME = home;
+  process.env.HC_TERMINAL_ID = "tA";
+  try {
+    updateStore("claude-code", (store) => ({
+      ...resumed(store),
+      tasks: [{ id: "1", title: "keep me", status: "pending", active_form: null }],
+      prs: [{ url: "https://github.com/o/r/pull/7", number: 7, at: "2026-01-01T00:00:00Z" }],
+    }), () => "2026-01-01T00:00:00Z");
+
+    // Resume in a NEW terminal: no pointer file exists for tB.
+    process.env.HC_TERMINAL_ID = "tB";
+    const next = updateStore("claude-code", resumed, () => "2026-02-02T00:00:00Z");
+    assert.equal(next.terminal, "tB");
+    assert.equal(next.terminal_started_at, "2026-02-02T00:00:00Z"); // tB's start, not tA's
+    assert.equal(next.tasks[0].title, "keep me");
+    assert.deepEqual(next.prs, [{ url: "https://github.com/o/r/pull/7", number: 7, at: "2026-01-01T00:00:00Z" }]);
+    const disk = parseStore(readFileSync(join(home, ".herdr", "ranch", "tasks", "sessions", "S1.json"), "utf8")).store;
+    assert.equal(disk.terminal, "tB");
+    assert.equal(disk.tasks[0].title, "keep me");
+    assert.equal(disk.prs.length, 1);
+  } finally {
+    delete process.env.RANCH_HOME;
+    delete process.env.HC_TERMINAL_ID;
+  }
+});
+
+test("I3.3: a resume into a new terminal with a different session id starts fresh", () => {
+  const home = mkdtempSync(join(tmpdir(), "ranch-integrity-"));
+  process.env.RANCH_HOME = home;
+  process.env.HC_TERMINAL_ID = "tA";
+  try {
+    updateStore("claude-code", (store) => ({
+      ...store,
+      session: { ...(store.session ?? {}), id: "S1" },
+      tasks: [{ id: "1", title: "keep me", status: "pending", active_form: null }],
+    }), () => "2026-01-01T00:00:00Z");
+
+    process.env.HC_TERMINAL_ID = "tB";
+    const next = updateStore("claude-code", (store) => ({ ...store, session: { ...(store.session ?? {}), id: "S2" } }));
+    assert.equal(next.session.id, "S2");
+    assert.deepEqual(next.tasks, []); // S1's tasks are not adopted
   } finally {
     delete process.env.RANCH_HOME;
     delete process.env.HC_TERMINAL_ID;
