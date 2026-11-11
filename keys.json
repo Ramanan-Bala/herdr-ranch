@@ -1,0 +1,12 @@
+{
+  "layout:ranch": {
+    "cmd-alt-1": "ranch-topbar.panel:session",
+    "cmd-alt-2": "ranch-topbar.panel:files",
+    "cmd-alt-3": "ranch-topbar.panel:changes",
+    "cmd-alt-4": "ranch-topbar.panel:settings",
+    "ctrl-alt-1": "ranch-topbar.panel:session",
+    "ctrl-alt-2": "ranch-topbar.panel:files",
+    "ctrl-alt-3": "ranch-topbar.panel:changes",
+    "ctrl-alt-4": "ranch-topbar.panel:settings"
+  }
+}

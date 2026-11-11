@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+// Ranch task reporting entry point (requirements.md §7). Hook subcommands must
+// print nothing and exit 0; see adapters/cli.js.
+import { main } from "../adapters/cli.js";
+
+main(process.argv.slice(2));

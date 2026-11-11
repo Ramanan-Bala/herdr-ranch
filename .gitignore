@@ -1,0 +1,4 @@
+node_modules/
+.DS_Store
+mods/ranch-*/gpui-kit.d.ts
+mods/ranch-*/jsconfig.json

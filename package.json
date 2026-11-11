@@ -1,0 +1,13 @@
+{
+  "name": "ranch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ranch: a Herdr layout for agent-heavy work",
+  "type": "module",
+  "scripts": {
+    "test": "sh scripts/sync-lib.sh && node --test test/*.test.js",
+    "sync": "sh scripts/sync-lib.sh",
+    "check": "sh scripts/sync-lib.sh && sh scripts/check.sh",
+    "verify": "npm test && npm run check"
+  }
+}
