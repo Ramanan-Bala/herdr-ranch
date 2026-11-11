@@ -39,7 +39,7 @@ import { mostUrgent, folderLabel, statusSince } from "./lib/format.js";
  * `detached` here only means "the pane reports no branch"; real detached-HEAD
  * state comes from the git summary in main.js.
  */
-export function buildTree({ machines, spaces, agents, panes, filter, now }) {
+export function buildTree({ machines, spaces, agents, panes, filter, now, home = null }) {
   machines = machines ?? [];
   spaces = spaces ?? [];
   agents = agents ?? [];
@@ -96,7 +96,9 @@ export function buildTree({ machines, spaces, agents, panes, filter, now }) {
           active: !!space.active && !!tab.active,
           spaceActive: !!space.active,
           machine: space.machine,
-          repo: folderLabel(pane?.cwd ?? null, ""),
+          // "~" at home (R-SB-5), never the user's own folder name; only this
+          // computer's home is known, so remote cards keep the folder name.
+          repo: folderLabel(pane?.cwd ?? null, space.machine ? "" : home ?? ""),
           branch: pane?.branch ?? null,
           detached: pane ? !pane.branch : false,
           cwd: pane?.cwd ?? null,
