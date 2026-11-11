@@ -34,6 +34,7 @@ import {
 } from "./lib/git.js";
 import { TASKS_DIR, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
 import { parseStore, orderTasks, progress, storeFileName } from "./lib/tasks.js";
+import { tasksCommand, looksWindows } from "./lib/tasks-command.js";
 import {
   pickAgent,
   checksSummary,
@@ -53,6 +54,11 @@ import {
 } from "./model.js";
 
 const MAX_FILES = 20;
+
+// Windows can't exec the POSIX sh launcher: locally Herdr's platform tells the
+// OS; on a remote machine, the home dir we probed does.
+const tasksCmd = (dir, args, machine) =>
+  tasksCommand(dir, args, machine ? looksWindows(dir) : appWindow().platform === "windows");
 
 /** Friendly name for a detected editor CLI, for tooltips. */
 const EDITOR_NAMES = { cursor: "Cursor", code: "VS Code", zed: "Zed", subl: "Sublime Text" };
@@ -309,7 +315,7 @@ export default class RanchSession extends View {
       let agents = {};
       try {
         const dir = await this.homeFor(machine);
-        const r = dir ? await exec(`${dir}/.herdr/ranch/bin/ranch-tasks`, ["status", "--json"], { on: machine, timeout: 10000 }) : null;
+        const r = dir ? await exec(...tasksCmd(dir, ["status", "--json"], machine), { on: machine, timeout: 10000 }) : null;
         if (r && r.code === 0) agents = JSON.parse(r.stdout).agents ?? {};
       } catch {}
       this.adapterStatus.set(key, { agents, at: Date.now(), busy: false });
@@ -328,7 +334,7 @@ export default class RanchSession extends View {
     let result = "missing";
     if (homeDir) {
       try {
-        const r = await exec(`${homeDir}/.herdr/ranch/bin/ranch-tasks`, ["install", "--yes"], { on: s.machine });
+        const r = await exec(...tasksCmd(homeDir, ["install", "--yes"], s.machine), { on: s.machine });
         if (r.code === 127) result = "missing";
         else {
           const out = `${r.stdout.trim()}\n${r.stderr.trim()}`.trim();

@@ -45,9 +45,41 @@ function installedCliDiffers() {
   }
 }
 
+// Hooks written by a broken Windows install hold backslash paths; normalize
+// so they are still recognized as Ranch's (and cleaned up on reinstall).
+const normPath = (command) => String(command ?? "").replace(/\\/g, "/");
+
 function isRanchGroup(group) {
   return Array.isArray(group?.hooks) &&
-    group.hooks.some((h) => typeof h?.command === "string" && h.command.includes(RANCH_MARK));
+    group.hooks.some((h) => typeof h?.command === "string" && normPath(h.command).includes(RANCH_MARK));
+}
+
+/**
+ * The hook command line for one agent. Windows can't execute the sh
+ * launcher, so it calls node on the .js entry with forward-slash paths
+ * (backslashes would never match RANCH_MARK).
+ */
+export function hookCommand(agent, platform = process.platform) {
+  const bin = join(homeDir(), RANCH_MARK.slice(1));
+  if (platform === "win32") return `node "${bin.replace(/\\/g, "/")}.js" ${agent}`;
+  return `${bin} ${agent}`;
+}
+
+/** Backup label from a file path; split on / and \ (Windows drive paths). */
+export function backupLabel(file) {
+  return file.split(/[\\/]/).slice(-2).join("-");
+}
+
+/** True when a Ranch hook exists whose command cannot run on this OS. */
+function hasUnrunnableRanchHook(doc, platform) {
+  const hooks = doc?.hooks;
+  if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) return false;
+  return Object.values(hooks).some((groups) => Array.isArray(groups) && groups.some((g) =>
+    Array.isArray(g?.hooks) && g.hooks.some((h) => {
+      const command = typeof h?.command === "string" ? h.command : "";
+      if (!normPath(command).includes(RANCH_MARK)) return false;
+      return command.includes("\\") || (platform === "win32" && !command.startsWith("node "));
+    })));
 }
 
 function sameFile(src, dest) {
@@ -379,7 +411,17 @@ function writeLauncher(dest, results) {
   results.push({ path: dest, action: same ? "unchanged" : "written (launcher)" });
 }
 
-function copyRuntime(results) {
+/** Windows cmd shim so a human can type `ranch-tasks` (hooks call node directly). */
+function writeCmdShim(dest, results) {
+  const text = '@node "%~dp0ranch-tasks.js" %*\n';
+  mkdirSync(dirname(dest), { recursive: true });
+  let same = false;
+  try { same = readFileSync(dest, "utf8") === text; } catch {}
+  if (!same) writeFileSync(dest, text);
+  results.push({ path: dest, action: same ? "unchanged" : "written (win32 cmd shim)" });
+}
+
+function copyRuntime(results, platform = process.platform) {
   const root = repoRoot();
   const ranch = join(homeDir(), ".herdr", "ranch");
   // The node entry is installed as bin/ranch-tasks.js; bin/ranch-tasks becomes a
@@ -388,6 +430,7 @@ function copyRuntime(results) {
   // runs from the installed copy, its entry is already ranch-tasks.js.
   const entry = existsSync(join(root, "bin", "ranch-tasks.js")) ? join(root, "bin", "ranch-tasks.js") : join(root, "bin", "ranch-tasks");
   writeLauncher(join(ranch, "bin", "ranch-tasks"), results);
+  if (platform === "win32") writeCmdShim(join(ranch, "bin", "ranch-tasks.cmd"), results);
   // The installed files are ES modules; say so, or node warns on every hook.
   const pkg = join(ranch, "package.json");
   if (!existsSync(pkg)) writeFileSync(pkg, '{ "type": "module", "private": true }\n');
@@ -410,9 +453,9 @@ function copyRuntime(results) {
   }
 }
 
-function installClaude(results, backups) {
+function installClaude(results, backups, platform = process.platform) {
   const file = join(homeDir(), ".claude", "settings.json");
-  const command = `${join(homeDir(), RANCH_MARK.slice(1))} claude`;
+  const command = hookCommand("claude", platform);
   const { text, doc } = readConfig(file);
   const next = addRanchHooks(doc, CLAUDE_EVENTS, command, CLAUDE_MATCHERS);
   if (next == null) {
@@ -429,9 +472,9 @@ function installClaude(results, backups) {
   results.push({ path: file, action: text ? "merged ranch hooks" : "created" });
 }
 
-function installCodex(results, backups) {
+function installCodex(results, backups, platform = process.platform) {
   const file = join(homeDir(), ".codex", "hooks.json");
-  const command = `${join(homeDir(), RANCH_MARK.slice(1))} codex`;
+  const command = hookCommand("codex", platform);
   const { text, doc } = readConfig(file);
   const next = addRanchHooks(doc, CODEX_EVENTS, command, CODEX_MATCHERS);
   if (next == null) {
@@ -526,10 +569,13 @@ function selectAgents(opts) {
   return AGENTS.filter((a) => requested.includes(a));
 }
 
-function plan(agents) {
+function plan(agents, platform = process.platform) {
   const home = homeDir();
   const items = [
     { path: join(home, ".herdr", "ranch", "bin", "ranch-tasks"), action: "copy (mode 755)" },
+    ...(platform === "win32"
+      ? [{ path: join(home, ".herdr", "ranch", "bin", "ranch-tasks.cmd"), action: "write (win32 cmd shim)" }]
+      : []),
     { path: join(home, ".herdr", "ranch", "adapters", "*.js"), action: "copy" },
     { path: join(home, ".herdr", "ranch", "lib", "tasks.js"), action: "copy" },
   ];
@@ -569,7 +615,7 @@ function installInstructions(agents, results, backups) {
       results.push({ path: f.path, action: "unchanged" });
       continue;
     }
-    if (existed && !f.whole) backupFile(f.path, `instructions-${f.path.split("/").slice(-2).join("-")}`, backups);
+    if (existed && !f.whole) backupFile(f.path, `instructions-${backupLabel(f.path)}`, backups);
     mkdirSync(dirname(f.path), { recursive: true });
     writeFileSync(f.path, after);
     if (!existed) recordInstallCreated(f.path, null);
@@ -620,7 +666,8 @@ function printResults(results, backups) {
 /** Installs the runtime copies and per-agent hooks. */
 export async function install(opts = {}) {
   const agents = selectAgents(opts);
-  const items = plan(agents);
+  const platform = opts.platform ?? process.platform;
+  const items = plan(agents, platform);
   if (!opts.yes) {
     printPlan(items);
     const ok = await confirm("Proceed? [y/N] ");
@@ -631,15 +678,15 @@ export async function install(opts = {}) {
   }
   const results = [];
   const backups = [];
-  copyRuntime(results);
-  if (agents.includes("claude")) installClaude(results, backups);
+  copyRuntime(results, platform);
+  if (agents.includes("claude")) installClaude(results, backups, platform);
   let codexChanged = false;
   if (agents.includes("codex")) {
     const directory = join(homeDir(), ".codex");
     const file = join(directory, "hooks.json");
     const directoryExisted = existsSync(directory);
     const fileExisted = existsSync(file);
-    codexChanged = installCodex(results, backups);
+    codexChanged = installCodex(results, backups, platform);
     if (codexChanged && (!directoryExisted || !fileExisted)) {
       recordInstallCreated(fileExisted ? null : file, directoryExisted ? null : directory);
     }
@@ -647,6 +694,10 @@ export async function install(opts = {}) {
   if (agents.includes("opencode")) installOpencode(results, backups);
   installInstructions(agents, results, backups);
   printResults(results, backups);
+  if (platform === "win32") {
+    // Windows has no shebang support; PATH is the person's to edit.
+    console.log(`Windows: add ${join(homeDir(), ".herdr", "ranch", "bin")} to your PATH to run \`ranch-tasks\` from a terminal (Ranch never edits PATH).`);
+  }
   if (agents.includes("codex") && codexChanged) {
     console.log("Codex: approve the new hooks once with /hooks in Codex (it asks you to trust new hooks).");
   }
@@ -751,7 +802,7 @@ export async function uninstall(opts = {}) {
 }
 
 /** { node, version, agents: { claude, codex, opencode } } per §7 status. */
-export function statusSummary() {
+export function statusSummary(platform = process.platform) {
   const home = homeDir();
   const binExists = existsSync(join(home, ".herdr", "ranch", "bin", "ranch-tasks"));
   const outdated = runningFromRepo() && installedCliDiffers();
@@ -764,6 +815,7 @@ export function statusSummary() {
     }
     if (!hasRanchHandlers(doc)) return "missing";
     if (!binExists) return "missing";
+    if (hasUnrunnableRanchHook(doc, platform)) return "broken";
     return outdated ? "outdated" : "installed";
   };
   const plugin = join(home, ".config", "opencode", "plugins", "ranch-tasks.js");

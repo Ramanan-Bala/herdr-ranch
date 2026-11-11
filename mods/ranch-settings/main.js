@@ -1,11 +1,13 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { theme, shared, setShared, run, exec, home, knownAgents, nextCommand } from "herdr";
+import { theme, shared, setShared, run, exec, home, knownAgents, nextCommand, window as appWindow } from "herdr";
 import { runGh } from "./lib/git.js";
 import { SETTINGS_KEY, resolveSettings, withSetting } from "./lib/settings.js";
+import { tasksCommand } from "./lib/tasks-command.js";
 
-// ranch-tasks lives outside the Herdr folder; installed once via `ranch-tasks install`.
-const tasksBin = () => home() + "/.herdr/ranch/bin/ranch-tasks";
+// Windows can't exec the POSIX sh launcher; it calls node on the .js entry.
+const isWin = () => appWindow().platform === "windows";
+const tasksCmd = (args) => tasksCommand(home(), args, isWin());
 const TASK_KEYS = ["claude", "codex", "opencode"];
 const HERDR_MIN = [0, 1, 15];
 
@@ -61,14 +63,14 @@ export default class RanchSettings extends View {
   loadTasks(cx) {
     cx.spawn(async (cx) => {
       try {
-        const r = await exec(tasksBin(), ["status", "--json"]);
+        const r = await exec(...tasksCmd(["status", "--json"]));
         let data = null;
         try { data = JSON.parse(r.stdout || ""); } catch {}
         if (data?.agents) {
           const agents = {};
           for (const key of TASK_KEYS) {
             const v = data.agents[key];
-            agents[key] = v === "installed" || v === "outdated" ? v : "missing";
+            agents[key] = v === "installed" || v === "outdated" || v === "broken" ? v : "missing";
           }
           this.tasks = { agents };
         } else {
@@ -86,7 +88,7 @@ export default class RanchSettings extends View {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const r = await exec(tasksBin(), ["install", "--yes"]);
+        const r = await exec(...tasksCmd(["install", "--yes"]));
         const out = `${r.stdout || ""}${r.stderr || ""}`.trim();
         this.setup = out || (r.code === 0 ? "Done." : `Exit code ${r.code}.`);
         if (r.code === 0) this.loadTasks(cx);
@@ -293,11 +295,12 @@ export default class RanchSettings extends View {
           .child(div().flex_1().min_w(0).truncate().child(key))
           .child(div().text_color(color).child(status)));
       }
+      const repair = TASK_KEYS.some((key) => this.tasks.agents[key] === "broken");
       if (TASK_KEYS.some((key) => this.tasks.agents[key] !== "installed")) {
         rows.push(h_flex().flex_none().justify_end()
           .child(div().id("tasks-setup").flex_none().px(10).py(4).rounded(7).bg(t.accent).text_color(t.accent_foreground).font_semibold().cursor_pointer()
             .on_click((_e, cx) => this.runSetup(cx))
-            .child("Set up")));
+            .child(repair ? "Repair" : "Set up")));
       }
     }
     if (this.setup) {
