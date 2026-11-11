@@ -67,7 +67,7 @@ export function cardModel(states, now, providers = PROVIDERS, remaining = false)
   for (const p of providers) {
     const { report = null, lastGood = null, installed = null } = states[p.id] ?? {};
     if (installed === false) continue;
-    const g = { providerId: p.id, name: p.name, icon: p.icon, plan: null, status: "loading…", failed: false, dim: false, age: null, rows: [] };
+    const g = { providerId: p.id, name: p.name, icon: p.icon, tint: !!p.tint, plan: null, status: "loading…", failed: false, dim: false, age: null, rows: [] };
     if (report?.status === "ok") {
       g.plan = report.plan ? cap(report.plan) : null;
       g.status = `updated ${ago(report.observedAt, now)}`;
@@ -111,7 +111,7 @@ export function barModel(states, prefs, now, providers = PROVIDERS) {
       .filter((w) => isShown(prefs, p.id, w.id))
       .map((w) => segmentView(w, now, prefs.showResetTime, prefs.showRemaining));
     const dim = mark === "!" || (source != null && now - source.observedAt > STALE_AFTER);
-    groups.push({ providerId: p.id, name: p.name, icon: p.icon, mark, dim, segments });
+    groups.push({ providerId: p.id, name: p.name, icon: p.icon, tint: !!p.tint, mark, dim, segments });
   }
   return { groups, empty: groups.length === 0 };
 }

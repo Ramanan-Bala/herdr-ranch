@@ -50,6 +50,9 @@ const textColor = (level, text, t) => (level === "ok" ? (text === "—" ? t.dim 
 // The bar's limit numbers always wear their level, green included; the panel's only when amber or red.
 const limitColor = (level, text, t) => (text === "—" ? t.dim : levelColor(level, t));
 
+// One-colour glyphs (tint) take the text colour; full-colour logos draw as images.
+const providerIcon = (p, size, t) => (p.tint ? svg(p.icon).size(size).flex_none().text_color(t.foreground) : image(p.icon).size(size).flex_none());
+
 function usageBar(width, fill, tick, color, t) {
   return div().relative().w(width).h(6).rounded(3).bg(t.raised).flex_none()
     .child(div().absolute().left(0).top(0).h(6).rounded(3).w(Math.round(width * fill)).bg(color))
@@ -249,7 +252,7 @@ export default class UsageLimits extends View {
       parts.push(div().whitespace_nowrap().text_color(s.level === "ok" ? (s.text === "—" ? t.dim : t.foreground) : levelColor(s.level, t)).child(s.compact));
     });
     return h_flex().id(`ul-${g.providerId}`).gap(8).items_center().flex_none().opacity(g.dim ? 0.55 : 1)
-      .child(image(g.icon).size(14))
+      .child(providerIcon(g, 14, t))
       .when(g.mark != null, (e) => e.child(div().text_color(t.dim).child(g.mark)))
       .when(showBars && first != null, (e) => e.child(usageBar(44, first.fill, null, first.level === "ok" ? t.muted : levelColor(first.level, t), t)))
       .child(h_flex().gap(6).items_center().children(parts));
@@ -278,7 +281,7 @@ export default class UsageLimits extends View {
   cardGroup(g, t) {
     return v_flex().gap(8)
       .child(h_flex().gap(6).items_center()
-        .child(image(g.icon).size(13))
+        .child(providerIcon(g, 13, t))
         .child(div().flex_none().font_semibold().child(g.name))
         .when(g.plan != null, (e) => e.child(div().flex_none().px(5).rounded(4).bg(t.raised).text_size(10).text_color(t.accent).child(g.plan)))
         .child(div().flex_1())
@@ -328,7 +331,7 @@ export default class UsageLimits extends View {
     if (session) body.child(v_flex().pt(10).border_t(1).border_color(t.border).child(this.sessionBlock(session, t)));
     const cooling = this.cooling();
     return body.child(h_flex().gap(2).items_center()
-      .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child("Data: claude, codex and gh CLIs, numbers from session logs."))
+      .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child("Data: claude, codex, gh and opencode CLIs, numbers from session logs."))
       .child(this.iconButton("ul-refresh", "refresh", cooling ? "Refreshing…" : "Refresh now", !cooling, (cx) => this.refresh(cx), t))
       .child(this.iconButton("ul-settings", "gear", "Settings", true, (cx) => this.show("settings", cx), t)));
   }
@@ -354,7 +357,7 @@ export default class UsageLimits extends View {
       const s = st[p.id] ?? {};
       const on = isShown(prefs, p.id);
       const reason = s.installed === false ? "not installed" : s.report && s.report.status !== "ok" ? s.report.message : null;
-      rows.push(this.check(`p-${p.id}`, on, [image(p.icon).size(13), div().text_color(s.installed === false ? t.dim : t.foreground).child(p.name)],
+      rows.push(this.check(`p-${p.id}`, on, [providerIcon(p, 13, t), div().text_color(s.installed === false ? t.dim : t.foreground).child(p.name)],
         () => save(toggleProvider(this.prefs(), p.id)), t, 0, reason));
       const windows = (s.report?.status === "ok" ? s.report : s.lastGood)?.windows ?? [];
       for (const w of windows) {
@@ -383,7 +386,7 @@ export default class UsageLimits extends View {
           return this.check(`s-${row}`, isOnBar(prefs, row), [div().text_color(t.foreground).child(name)],
             () => save(toggleOnBar(this.prefs(), row)), t);
         })))
-      .child(div().text_size(10.5).text_color(t.dim).child("Data: claude, codex and gh CLIs, numbers from session logs."));
+      .child(div().text_size(10.5).text_color(t.dim).child("Data: claude, codex, gh and opencode CLIs, numbers from session logs."));
   }
 
   render(cx) {
