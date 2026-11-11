@@ -6,7 +6,7 @@ import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import {
   spaces, machines, agents, panes, setAgentOrder, exec, watchFolder, run,
-  openOverlay, theme, shared, setShared, nextCommand, window,
+  openOverlay, theme, shared, setShared, nextCommand, window, home,
 } from "herdr";
 import { buildTree, BADGE_COLORS, badgeColorIndex, initials, diffSquares } from "./model.js";
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent } from "./lib/format.js";
@@ -774,6 +774,7 @@ export default class RanchSidebar extends View {
     }
     const filter = shared(FILTER_KEY) ?? null;
     const tree = buildTree({
+      home: home(),
       machines: machines(), spaces: spaces(), agents: agents(), panes: panes(),
       filter, now: Date.now(),
     });

@@ -261,3 +261,16 @@ test("diffSquares: proportional fills, five squares always", () => {
   assert.deepEqual(diffSquares(1, 99), ["add", "del", "del", "del", "del"]);
   assert.deepEqual(diffSquares(1, 0), ["add", "add", "add", "add", "add"]);
 });
+
+test("a card at this computer's home reads ~, not the user's folder name", () => {
+  const tree = buildTree({
+    home: "/Users/someone",
+    machines: [{ name: null, layout: "ready" }],
+    spaces: [{ id: "s1", name: "~", machine: null, active: true, tabs: [{ id: "t1", name: "1", active: true }] }],
+    agents: [],
+    panes: [{ tab: "t1", pane: "p1", terminal: "t9", cwd: "/Users/someone" }],
+    filter: null,
+    now: 0,
+  });
+  assert.equal(tree.groups[0].spaces[0].cards[0].repo, "~");
+});
