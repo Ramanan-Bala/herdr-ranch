@@ -862,11 +862,11 @@ test("install/uninstall round trip restores configs byte-for-byte", async () => 
         `ranch handler for ${event}`,
       );
     }
-    assert.equal(merged.hooks.PostToolUse.at(-1).matcher, "TodoWrite|TaskCreate|TaskUpdate");
+    assert.equal(merged.hooks.PostToolUse.at(-1).matcher, "TodoWrite|TaskCreate|TaskUpdate|Bash");
 
-    // codex hooks.json created with the update_plan matcher
+    // codex hooks.json created with the update_plan + shell matcher (PR recording, I4)
     const codex = JSON.parse(readFileSync(join(home, ".codex", "hooks.json"), "utf8"));
-    assert.equal(codex.hooks.PostToolUse.at(-1).matcher, "update_plan");
+    assert.equal(codex.hooks.PostToolUse.at(-1).matcher, "update_plan|Bash|shell");
     for (const event of ["SessionStart", "UserPromptSubmit", "PostToolUse", "SubagentStart", "SubagentStop", "SessionEnd"]) {
       assert.ok(JSON.stringify(codex.hooks[event]).includes("/.herdr/ranch/bin/ranch-tasks"));
     }

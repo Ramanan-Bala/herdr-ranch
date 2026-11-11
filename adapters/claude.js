@@ -59,7 +59,25 @@ function refreshTitle(store, payload) {
   }
 }
 
+const PR_URL = /https:\/\/github\.com\/[^\s"'<>()]+\/pull\/(\d+)/;
+
+/** Records a PR URL created by `gh pr create` into store.prs (I4). */
+function recordCreatedPr(store, payload) {
+  const input = payload.tool_input;
+  const command = Array.isArray(input?.command) ? input.command.join(" ") : input?.command;
+  if (typeof command !== "string" || !/\bgh\s+pr\s+create\b/.test(command)) return;
+  const response = typeof payload.tool_response === "string"
+    ? payload.tool_response
+    : JSON.stringify(payload.tool_response ?? "");
+  const match = PR_URL.exec(response ?? "");
+  if (!match) return;
+  const url = match[0];
+  if (store.prs?.some((p) => p.url === url)) return;
+  store.prs = [...(store.prs ?? []), { url, number: Number(match[1]), at: new Date().toISOString() }].slice(-10);
+}
+
 function applyTool(store, payload) {
+  if (payload.tool_name === "Bash") recordCreatedPr(store, payload);
   const input = payload.tool_input;
   if (!input || typeof input !== "object") return;
 
@@ -81,9 +99,15 @@ function applyTool(store, payload) {
   if (payload.tool_name === "TaskCreate") {
     const subject = typeof input.subject === "string" ? input.subject.trim() : "";
     if (!subject) return;
-    // tool_response may be a string or an object; search its JSON text.
+    // Current Claude returns a structured { task: { id } }; older builds
+    // print "Task #7 created successfully" (I1).
+    const task = payload.tool_response?.task;
+    const structuredId = task && typeof task === "object" && task.id !== undefined && task.id !== null
+      ? String(task.id)
+      : null;
+    // tool_response may also be a string or an object; search its JSON text.
     const match = /Task #(\S+) created successfully/.exec(JSON.stringify(payload.tool_response ?? ""));
-    const id = match ? match[1] : String(store.tasks.length + 1);
+    const id = structuredId ?? (match ? match[1] : String(store.tasks.length + 1));
     store.tasks = [...store.tasks, {
       id,
       title: subject,
@@ -99,6 +123,7 @@ function applyTool(store, payload) {
     const index = store.tasks.findIndex((t) => t.id === id);
     if (input.status === "deleted") {
       if (index >= 0) store.tasks = store.tasks.filter((_, i) => i !== index);
+      else store.hook_error = `TaskUpdate: unknown task id ${id}`;
     } else if (index >= 0) {
       store.tasks = store.tasks.map((task, i) => {
         if (i !== index) return task;
@@ -115,6 +140,9 @@ function applyTool(store, payload) {
         status: TASK_STATUS.has(input.status) ? input.status : "pending",
         active_form: typeof input.activeForm === "string" && input.activeForm ? input.activeForm : null,
       }];
+    } else {
+      // Nothing to apply: the update targets a task we never saw (I1).
+      store.hook_error = `TaskUpdate: unknown task id ${id}`;
     }
   }
 }
@@ -164,6 +192,19 @@ function applyClaudeCore(store, payload) {
   if (!KNOWN_EVENTS.has(event)) return store;
   const next = { ...store, tasks: [...(store.tasks ?? [])], subagents: [...(store.subagents ?? [])] };
   const now = new Date().toISOString();
+
+  if (event !== "SessionStart") {
+    const sid = typeof payload.session_id === "string" && payload.session_id ? payload.session_id : null;
+    if (sid && next.session?.id && next.session.id !== sid) {
+      // Session reuse without a SessionStart event (I10): start fresh.
+      next.session = { id: sid, title: null, title_source: null, first_prompt: null, state: "running" };
+      next.tasks = [];
+      next.subagents = [];
+    } else if (sid && !next.session?.id) {
+      // Keep session.id in sync on every event (I12).
+      ensureSession(next).id = sid;
+    }
+  }
 
   if (event === "SessionStart") {
     const id = typeof payload.session_id === "string" && payload.session_id ? payload.session_id : null;

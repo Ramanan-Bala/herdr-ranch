@@ -24,19 +24,39 @@ export function storePath(home, terminal) {
 export function readStore(path, agent, terminal) {
   try {
     const parsed = parseStore(readFileSync(path, "utf8"));
-    if (parsed.ok) return parsed.store;
+    if (parsed.ok) {
+      // Terminal reuse by another agent (I10): never continue someone
+      // else's session, tasks or PR records.
+      if (parsed.store.agent && agent && parsed.store.agent !== agent) return emptyStore(terminal, agent);
+      return parsed.store;
+    }
   } catch {
     // missing or unreadable: start fresh
   }
   return emptyStore(terminal, agent);
 }
 
-/** Atomic write: temp file next to the target, then rename. */
+const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+
+/** Atomic write: temp file next to the target, then rename. The rename is
+ * retried a few times because AV/indexers (notably on Windows) hold the
+ * target open for a moment (I8). */
 export function writeStore(path, store) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, JSON.stringify(store, null, 2) + "\n");
-  renameSync(tmp, path);
+  for (let i = 0; ; i++) {
+    try {
+      renameSync(tmp, path);
+      return;
+    } catch (err) {
+      if (!RENAME_RETRY_CODES.has(err?.code) || i >= 10) {
+        try { unlinkSync(tmp); } catch {}
+        throw err;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (i + 1));
+    }
+  }
 }
 
 /** Takes the per-store lock; waiting is bounded so hooks never hang. */
@@ -72,22 +92,33 @@ function takeLock(path) {
 /**
  * Read-modify-write for the current terminal (env HC_TERMINAL_ID, home via
  * RANCH_HOME or os.homedir()). `fn` maps the store to its next state and
- * updated_at is stamped here. Returns the store, or null when HC_TERMINAL_ID
- * is unset (agent not running inside Herdr).
+ * updated_at/agent are stamped here. Returns the store, or null when
+ * HC_TERMINAL_ID is unset (agent not running inside Herdr). When the lock
+ * cannot be taken, the whole read-modify-write is retried once; failing
+ * that it throws — the caller logs and the store is left untouched rather
+ * than written without the lock (I9).
  */
 export function updateStore(agent, fn) {
   const terminal = process.env.HC_TERMINAL_ID;
   if (!terminal) return null;
   const path = storePath(homeDir(), terminal);
   if (!path) return null;
-  const release = takeLock(path);
-  try {
-    const next = fn(readStore(path, agent, terminal));
-    if (!next || typeof next !== "object") return null;
-    next.updated_at = new Date().toISOString();
-    writeStore(path, next);
-    return next;
-  } finally {
-    release?.();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const release = takeLock(path);
+    if (!release) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      continue;
+    }
+    try {
+      const next = fn(readStore(path, agent, terminal));
+      if (!next || typeof next !== "object") return null;
+      next.agent = agent;
+      next.updated_at = new Date().toISOString();
+      writeStore(path, next);
+      return next;
+    } finally {
+      release();
+    }
   }
+  throw new Error(`store lock busy: ${path}`);
 }

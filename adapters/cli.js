@@ -61,7 +61,16 @@ function runHook(agent, apply) {
     if (agent === "claude-code" && TRANSCRIPT_EVENTS.has(payload.hook_event_name)) {
       payload = { ...payload, transcript: readTranscript(payload.transcript_path) };
     }
-    const next = updateStore(agent, (store) => apply(store, payload));
+    const next = updateStore(agent, (store) => {
+      const out = apply(store, payload);
+      // Reducers surface anomalies (e.g. TaskUpdate for an unknown id, I1)
+      // as hook_error: log one line and never persist it.
+      if (typeof out?.hook_error === "string") {
+        hookError(out.hook_error);
+        delete out.hook_error;
+      }
+      return out;
+    });
     // The one deliberate output: a short task-reporting reminder that Claude
     // and Codex add to the model's context (SessionStart, and UserPromptSubmit
     // while there are no open tasks). Everything else stays silent.

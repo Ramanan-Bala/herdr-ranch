@@ -17,10 +17,10 @@ import { rulesFor, blockFor, CLAUDE_IMPORT, withBlock, stripBlock } from "./inst
 const RANCH_MARK = "/.herdr/ranch/bin/ranch-tasks";
 const PLUGIN_MARKER = "// ranch-tasks plugin";
 
-const CLAUDE_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Notification", "SubagentStart", "SubagentStop", "SessionEnd", "Stop"];
+const CLAUDE_EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse", "PermissionRequest", "Notification", "SubagentStart", "SubagentStop", "SessionEnd", "Stop"];
 const CODEX_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "SubagentStart", "SubagentStop", "SessionEnd", "Stop"];
-const CLAUDE_MATCHERS = { PostToolUse: "TodoWrite|TaskCreate|TaskUpdate" };
-const CODEX_MATCHERS = { PostToolUse: "update_plan" };
+const CLAUDE_MATCHERS = { PostToolUse: "TodoWrite|TaskCreate|TaskUpdate|Bash" };
+const CODEX_MATCHERS = { PostToolUse: "update_plan|Bash|shell" };
 
 const here = dirname(fileURLToPath(import.meta.url)); // .../adapters
 
@@ -347,6 +347,19 @@ function readConfig(file) {
 function addRanchHooks(doc, events, command, matchers) {
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) return null;
   const hooks = doc.hooks && typeof doc.hooks === "object" && !Array.isArray(doc.hooks) ? doc.hooks : {};
+  // Also drop ranch groups for events no longer in the list (I14: the old
+  // matcher-less Claude PreToolUse hook must go on reinstall).
+  const wanted = new Set(events);
+  for (const event of Object.keys(hooks)) {
+    if (wanted.has(event)) continue;
+    const groups = hooks[event];
+    if (!Array.isArray(groups)) continue;
+    const kept = groups.filter((g) => !isRanchGroup(g));
+    if (kept.length !== groups.length) {
+      if (kept.length) hooks[event] = kept;
+      else delete hooks[event];
+    }
+  }
   for (const event of events) {
     const kept = Array.isArray(hooks[event]) ? hooks[event].filter((g) => !isRanchGroup(g)) : [];
     const group = { hooks: [{ type: "command", command, timeout: 5 }] };
@@ -692,6 +705,7 @@ export async function install(opts = {}) {
     }
   }
   if (agents.includes("opencode")) installOpencode(results, backups);
+  if (agents.includes("codex")) pruneCodexTrust(results, backups);
   installInstructions(agents, results, backups);
   printResults(results, backups);
   if (platform === "win32") {
@@ -827,22 +841,175 @@ export function statusSummary(platform = process.platform) {
     }
     return outdated ? "outdated" : "installed";
   })();
+  const codexBase = hookStatus(join(home, ".codex", "hooks.json"));
+  let codexConfigText = "";
+  try {
+    codexConfigText = readFileSync(join(home, ".codex", "config.toml"), "utf8");
+  } catch {}
+  const codex = codexBase === "installed" || codexBase === "outdated"
+    ? (codexTrustState(readConfig(join(home, ".codex", "hooks.json")).doc, codexConfigText) === "needs approval"
+      ? "needs approval"
+      : codexBase)
+    : codexBase;
   return {
     node: true,
     version: 1,
     agents: {
       claude: hookStatus(join(home, ".claude", "settings.json")),
-      codex: hookStatus(join(home, ".codex", "hooks.json")),
+      codex,
       opencode,
     },
     opencodeTodo: opencodeTodoEnabled(),
   };
 }
 
+// ---- Codex hook trust (I11) -------------------------------------------------
+// Codex asks you to trust each hook position once; the decisions live as
+// `<event>:<group>:<hook>` keys under [hooks.state] in ~/.codex/config.toml.
+// Positions that no longer exist (hooks reordered or removed) are stale and
+// get pruned on install.
+
+/** The [hooks.state] entries of a config.toml text: key -> raw value, or
+ * null when the file has no such section. */
+export function codexTrustEntries(configText) {
+  const entries = new Map();
+  let inSection = false;
+  let found = false;
+  for (const line of String(configText ?? "").split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    if (t.startsWith("[")) {
+      inSection = t === "[hooks.state]";
+      if (inSection) found = true;
+      continue;
+    }
+    if (!inSection) continue;
+    const m = /^(?:"([^"]+)"|'([^']+)'|([^=\s#]+))\s*=/.exec(t);
+    if (m) entries.set(m[1] ?? m[2] ?? m[3], t.slice(t.indexOf("=") + 1).trim());
+  }
+  return found ? entries : null;
+}
+
+/** TOML event key for a hook event name ("SessionStart" -> "session_start"). */
+function snakeEvent(name) {
+  return String(name).replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+}
+
+/** "event:group:hook" for every hook registered in a hooks.json doc. */
+function codexPositions(doc) {
+  const positions = new Set();
+  const hooks = doc?.hooks;
+  if (!hooks || typeof hooks !== "object") return positions;
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) continue;
+    for (let gi = 0; gi < groups.length; gi++) {
+      const list = Array.isArray(groups[gi]?.hooks) ? groups[gi].hooks : [];
+      for (let hi = 0; hi < list.length; hi++) positions.add(`${snakeEvent(event)}:${gi}:${hi}`);
+    }
+  }
+  return positions;
+}
+
+/**
+ * null when codex has no ranch hooks or no [hooks.state] section (nothing
+ * decided yet); "trusted" when every ranch hook position is trusted; else
+ * "needs approval" (shown by `ranch-tasks status`).
+ */
+export function codexTrustState(hooksDoc, configText) {
+  if (!hasRanchHandlers(hooksDoc)) return null;
+  const entries = codexTrustEntries(configText);
+  if (entries === null) return null;
+  const hooks = hooksDoc?.hooks;
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) continue;
+    for (let gi = 0; gi < groups.length; gi++) {
+      if (!isRanchGroup(groups[gi])) continue;
+      const list = Array.isArray(groups[gi]?.hooks) ? groups[gi].hooks : [];
+      for (let hi = 0; hi < list.length; hi++) {
+        const value = entries.get(`${snakeEvent(event)}:${gi}:${hi}`);
+        if (value === undefined || value === "false") return "needs approval";
+      }
+    }
+  }
+  return "trusted";
+}
+
+function completeTomlValue(value) {
+  let quote = null;
+  let escaped = false;
+  let content = false;
+  const brackets = [];
+  for (const c of value) {
+    if (quote) {
+      content = true;
+      if (escaped) escaped = false;
+      else if (c === "\\" && quote === '"') escaped = true;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === "#") break;
+    if (!/\s/.test(c)) content = true;
+    if (c === '"' || c === "'") quote = c;
+    else if (c === "[" || c === "{") brackets.push(c);
+    else if (c === "]" || c === "}") {
+      if (brackets.pop() !== (c === "]" ? "[" : "{")) return false;
+    }
+  }
+  return content && !quote && brackets.length === 0;
+}
+
+/** config.toml text with [hooks.state] entries whose position no longer
+ * exists in the given hooks doc, or null when nothing changed. Pure. */
+export function pruneCodexTrustText(configText, hooksDoc) {
+  const live = codexPositions(hooksDoc);
+  const lines = String(configText ?? "").split(/\r?\n/);
+  let inSection = false;
+  let changed = false;
+  const out = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.startsWith("[")) {
+      inSection = t === "[hooks.state]";
+      out.push(line);
+      continue;
+    }
+    if (inSection && t && !t.startsWith("#")) {
+      const m = /^(?:"([^"]+)"|'([^']+)'|([^=\s#]+))\s*=\s*(.*)$/.exec(t);
+      if (!m || !completeTomlValue(m[4])) return null;
+      const key = m[1] ?? m[2] ?? m[3];
+      if (!live.has(key)) {
+        changed = true;
+        continue;
+      }
+    }
+    out.push(line);
+  }
+  return changed ? out.join("\n") : null;
+}
+
+/** Applies pruneCodexTrustText to ~/.codex/config.toml (install, I11). */
+function pruneCodexTrust(results, backups) {
+  const hooksFile = join(homeDir(), ".codex", "hooks.json");
+  const tomlFile = join(homeDir(), ".codex", "config.toml");
+  try {
+    const doc = JSON.parse(readFileSync(hooksFile, "utf8"));
+    const text = readFileSync(tomlFile, "utf8");
+    const next = pruneCodexTrustText(text, doc);
+    if (next !== null) {
+      backupFile(tomlFile, "codex-config", backups);
+      writeFileSync(tomlFile, next);
+      results.push({ path: tomlFile, action: "removed stale hook trust entries" });
+    }
+  } catch {
+    // no parsable hooks.json or no config.toml: nothing to prune
+  }
+}
+
 /**
  * Deletes store files for terminals that no longer exist (via `hc ls --json
  * --all`, 5 s timeout) or that are older than 7 days. Without a working `hc`,
- * only the 7-day rule applies. Returns the removed file names.
+ * only the 7-day rule applies. Also removes `*.json.tmp-*` leftovers older
+ * than a minute (I8). Returns the removed file names.
  */
 export function gcStores() {
   const dir = join(homeDir(), ".herdr", "ranch", "tasks");
@@ -864,6 +1031,16 @@ export function gcStores() {
     return removed;
   }
   for (const name of files) {
+    // Leftover temp files from a crashed write (I8): drop after a minute.
+    if (/\.json\.tmp-/.test(name)) {
+      try {
+        if (statSync(join(dir, name)).mtimeMs < Date.now() - 60 * 1000) {
+          unlinkSync(join(dir, name));
+          removed.push(name);
+        }
+      } catch {}
+      continue;
+    }
     if (!name.endsWith(".json")) continue;
     const path = join(dir, name);
     let old = false;

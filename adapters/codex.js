@@ -44,12 +44,43 @@ export function applyCodex(store, payload) {
   return { ...base, session: { ...session, activity: { state, at: Date.now() } } };
 }
 
+const PR_URL = /https:\/\/github\.com\/[^\s"'<>()]+\/pull\/(\d+)/;
+
+/** Records a PR URL created by `gh pr create` into store.prs (I4). Codex
+ * reports the shell tool as "shell" (command array) or "Bash". */
+function recordCreatedPr(store, payload) {
+  const input = payload.tool_input;
+  const command = Array.isArray(input?.command) ? input.command.join(" ") : input?.command;
+  if (typeof command !== "string" || !/\bgh\s+pr\s+create\b/.test(command)) return;
+  const response = typeof payload.tool_response === "string"
+    ? payload.tool_response
+    : JSON.stringify(payload.tool_response ?? "");
+  const match = PR_URL.exec(response ?? "");
+  if (!match) return;
+  const url = match[0];
+  if (store.prs?.some((p) => p.url === url)) return;
+  store.prs = [...(store.prs ?? []), { url, number: Number(match[1]), at: new Date().toISOString() }].slice(-10);
+}
+
 function applyCodexCore(store, payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return store;
   const event = payload.hook_event_name;
   if (!KNOWN_EVENTS.has(event)) return store;
   const next = { ...store, tasks: [...(store.tasks ?? [])], subagents: [...(store.subagents ?? [])] };
   const now = new Date().toISOString();
+
+  if (event !== "SessionStart") {
+    const sid = typeof payload.session_id === "string" && payload.session_id ? payload.session_id : null;
+    if (sid && next.session?.id && next.session.id !== sid) {
+      // Session reuse without a SessionStart event (I10): start fresh.
+      next.session = { id: sid, title: null, title_source: null, first_prompt: null, state: "running" };
+      next.tasks = [];
+      next.subagents = [];
+    } else if (sid && !next.session?.id) {
+      // Keep session.id in sync on every event (I12).
+      ensureSession(next).id = sid;
+    }
+  }
 
   if (event === "SessionStart") {
     const id = typeof payload.session_id === "string" && payload.session_id ? payload.session_id : null;
@@ -78,6 +109,7 @@ function applyCodexCore(store, payload) {
   }
 
   if (event === "PostToolUse") {
+    if (payload.tool_name === "Bash" || payload.tool_name === "shell") recordCreatedPr(next, payload);
     const plan = payload.tool_name === "update_plan" ? payload.tool_input?.plan : null;
     if (Array.isArray(plan)) {
       // Replace tasks entirely from the plan's steps.

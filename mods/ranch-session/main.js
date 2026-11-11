@@ -81,9 +81,10 @@ export default class RanchSession extends View {
     this.tasksPending = false;
     this.tasksWatchGen = 0;
     this.subTasks = new Map(); // sub address -> { parsed, read, at, busy }
-    this.git = { key: null, summary: null, details: null, top: null, busy: false, dirty: true, at: 0 };
+    this.git = { key: null, summary: null, details: null, top: null, busy: false, dirty: true, at: 0, readyKey: null };
     this.gitWatchGen = 0;
-    this.pr = { key: null, parsed: null, busy: false, dirty: true, at: 0, failed: false };
+    this.pr = { key: null, parsed: null, busy: false, dirty: true, at: 0, failed: false, error: null };
+    this.agentKey = null; // `${address}@${machine}` of the last seen chosen agent (I2)
     this.sessionKey = null;
     this.commitsOpen = localStorage.getItem("commitsOpen") === "1";
     this.filesOpen = false;
@@ -219,6 +220,9 @@ export default class RanchSession extends View {
           parsed = parseStore(text);
         } catch {}
       }
+      // Stale read (I2): the focused agent changed while the file was read.
+      const now = this.session();
+      if (now.chosen?.address !== agent.address || (now.machine ?? null) !== (s.machine ?? null)) return;
       if (this.tasks.key !== key) this.filesOpen = false;
       this.tasks = { key, parsed, read: true };
       cx.notify();
@@ -376,7 +380,7 @@ export default class RanchSession extends View {
     }
     const s = this.session();
     if (!s.cwd) {
-      this.git = { key: null, summary: null, details: null, top: null, busy: false, dirty: false, at: Date.now() };
+      this.git = { key: null, summary: null, details: null, top: null, busy: false, dirty: false, at: Date.now(), readyKey: `${s.machine ?? ""}|` };
       cx.notify();
       return;
     }
@@ -400,6 +404,7 @@ export default class RanchSession extends View {
     }
     this.git.busy = false;
     this.git.at = Date.now();
+    this.git.readyKey = key; // PR refresh waits for git to finish (I7)
     cx.notify();
     this.watchGit(cx);
   }
@@ -419,6 +424,7 @@ export default class RanchSession extends View {
         }
         if (this.gitWatchGen !== gen) return;
         this.git.dirty = true;
+        this.pr.dirty = true; // the branch may have changed too (I5)
       }
     });
   }
@@ -433,7 +439,7 @@ export default class RanchSession extends View {
     // No PR to look up on the default branch or without a known web host.
     const noPr = branch && (branch === this.git.summary?.default || !this.git.summary?.host);
     if (!s.cwd || !branch || noPr) {
-      this.pr = { key: null, parsed: null, busy: false, dirty: false, at: Date.now(), failed: false };
+      this.pr = { key: null, parsed: null, busy: false, dirty: false, at: Date.now(), failed: false, error: null };
       cx.notify();
       return;
     }
@@ -441,6 +447,8 @@ export default class RanchSession extends View {
     this.pr.key = key;
     this.pr.busy = true;
     this.pr.dirty = false;
+    // First stderr line, for the quiet error note (I6).
+    const stderrLine = (r) => (r.stderr ?? "").split("\n").map((l) => l.trim()).find(Boolean) ?? null;
     try {
       const gh = (cmd, args) => exec(cmd, args, { cwd: s.cwd, on: s.machine, timeout: 15000 });
       const r = await runGh(gh, ["pr", "view", branch, "--json", PR_JSON_FIELDS]);
@@ -448,25 +456,31 @@ export default class RanchSession extends View {
       if (r.missing) {
         this.pr.parsed = null;
         this.pr.failed = "missing";
+        this.pr.error = null;
       } else if (r.code === 0) {
         try {
           this.pr.parsed = parsePr(JSON.parse(r.stdout));
           this.pr.failed = false;
+          this.pr.error = null;
         } catch {
           this.pr.parsed = null;
           this.pr.failed = true;
+          this.pr.error = stderrLine(r) ?? "gh pr view failed";
         }
       } else if (/no pull request/i.test(r.stderr ?? "")) {
         this.pr.parsed = null; // no PR for this branch
         this.pr.failed = false;
+        this.pr.error = null;
       } else {
         this.pr.parsed = null;
         this.pr.failed = true;
+        this.pr.error = stderrLine(r) ?? "gh pr view failed";
       }
     } catch {
       if (this.pr.key !== key) return;
       this.pr.parsed = null;
       this.pr.failed = true;
+      this.pr.error = null;
     }
     this.pr.busy = false;
     this.pr.at = Date.now();
@@ -483,6 +497,11 @@ export default class RanchSession extends View {
       this.sessionKey = key;
       this.git.dirty = true;
       this.pr.dirty = true;
+      // Stale PR from the previous folder: drop it and wait for the refresh
+      // gated on git below (I7).
+      this.pr.parsed = null;
+      this.pr.failed = false;
+      this.pr.error = null;
       this.filesOpen = false;
       this.ciOpen = null;
       this.push = { busy: false, err: null };
@@ -491,6 +510,18 @@ export default class RanchSession extends View {
       if (tkey !== this.tasks.key) this.loadTasks(cx);
       else this.loadSubTasks(s, cx);
     }
+    // The focused agent can change without the folder changing (I2): reload
+    // its store and drop everything bound to the previous agent.
+    const akey = s.chosen ? `${s.chosen.address}@${s.machine ?? ""}` : null;
+    if (akey !== this.agentKey) {
+      this.agentKey = akey;
+      this.subTasks.clear();
+      this.filesOpen = false;
+      this.ciOpen = null;
+      this.push = { busy: false, err: null };
+      this.copyAt = 0;
+    }
+    if (akey !== this.tasks.key && !this.tasksBusy) this.loadTasks(cx);
     // The action bar's Editor button needs one detection per machine.
     this.maybeDetectEditor(s.machine, cx);
     // Only needed while the store is missing (to offer Set up), once a minute.
@@ -506,11 +537,17 @@ export default class RanchSession extends View {
     // gaps) and refresh.remoteGitSec on another machine.
     const gitEvery = s.machine != null ? Math.max(1, set.refresh.remoteGitSec) * 1000 : 30000;
     if (!this.git.busy && (this.git.dirty || now - this.git.at >= gitEvery)) this.refreshGit(cx);
-    // PR: every refresh.prSec, sooner when the branch changed.
-    const prKey = `${s.machine ?? ""}|${s.cwd ?? ""}|${this.git.summary?.branch ?? ""}`;
+    // PR: every refresh.prSec, sooner when the branch changed, 20 s while CI
+    // checks are pending (I5). Wait for git to finish for this folder so the
+    // branch it queries is current (I7).
+    const gitKey = `${s.machine ?? ""}|${s.cwd ?? ""}`;
+    const prKey = `${gitKey}|${this.git.summary?.branch ?? ""}`;
     if (prKey !== this.pr.key) this.pr.dirty = true;
-    const prEvery = Math.max(5, set.refresh.prSec) * 1000;
-    if (!this.pr.busy && (this.pr.dirty || now - this.pr.at >= prEvery)) this.refreshPr(cx);
+    const pending = (this.pr.parsed?.checks?.pending ?? 0) > 0;
+    const prEvery = pending ? 20000 : Math.max(5, set.refresh.prSec) * 1000;
+    if (!this.pr.busy && this.git.readyKey === gitKey && (this.pr.dirty || now - this.pr.at >= prEvery)) {
+      this.refreshPr(cx);
+    }
   }
 
   // ---- ui ---------------------------------------------------------------
@@ -540,7 +577,10 @@ export default class RanchSession extends View {
     if (!s.chosen) {
       // No agent: no tasks or sub-agents, but the tab's git state still applies.
       root.child(div().text_size(12).text_color(t.dim).px(12).py(10).child("No agent in this tab"));
-      if (set.session.git) root.child(this.gitCard(t, s, set));
+      if (set.session.git) {
+        root.child(this.gitCard(t, s, set));
+        for (const node of this.prExtras(t, s)) root.child(node);
+      }
       return root;
     }
     // Tasks first (R-SD-1): the main agent's card, then each sub-agent's.
@@ -554,14 +594,23 @@ export default class RanchSession extends View {
     }
     if (set.session.git) {
       root.child(this.gitCard(t, s, set));
-      const pr = this.prCard(t);
-      if (pr) root.child(pr);
-      // Only gh itself being absent is worth a word; other failures stay quiet.
-      if (this.pr.failed === "missing") {
-        root.child(div().text_size(12).text_color(t.dim).px(12).py(10).child("GitHub CLI not found"));
-      }
+      for (const node of this.prExtras(t, s)) root.child(node);
     }
     return root;
+  }
+
+  /** The PR card plus the quiet failure notes under it (I3, I6). */
+  prExtras(t, s) {
+    const nodes = [];
+    const pr = this.prCard(t, s);
+    if (pr) nodes.push(pr);
+    if (this.pr.failed === "missing") {
+      nodes.push(div().text_size(12).text_color(t.dim).px(12).py(10).child("GitHub CLI not found"));
+    } else if (this.pr.failed === true) {
+      // Only the first stderr line; the full output stays out of the panel.
+      nodes.push(div().text_size(12).text_color(t.dim).px(12).py(10).child(this.pr.error ?? "gh pr view failed"));
+    }
+    return nodes;
   }
 
   /** "Session Details" + task subtitle + the panel's close button. */
@@ -1104,112 +1153,163 @@ export default class RanchSession extends View {
 
   // ---- pull request card -------------------------------------------------
 
-  prCard(t) {
+  prCard(t, s) {
     const pr = this.pr.parsed;
-    if (!pr) return null;
+    const extra = this.recordedPrs(s, pr);
+    if (!pr && !extra.length) return null;
     const sum = this.git.summary;
     const lk = sum?.host ? links(sum.host) : null;
-    const url = pr.url || (lk && pr.number ? lk.pr(pr.number) : null);
+    const url = pr ? (pr.url || (lk && pr.number ? lk.pr(pr.number) : null)) : null;
     const card = this.cardShell(t);
 
     const head = h_flex().gap(6).items_center().min_w(0);
     head.child(this.cardTitle(t, "Pull request"));
     head.child(div().flex_1().min_w(0));
-    // The PR's own state as the label (the token is only its colour), in
-    // GitHub's colours: open green, draft grey, merged purple, closed red.
-    const stateToken = { open: "ansi2", draft: "dim", merged: "ansi5", closed: "blocked" }[pr.state];
-    const stateLabel = { open: "Open", draft: "Draft", merged: "Merged", closed: "Closed" }[pr.state];
-    if (stateToken) {
-      head.child(this.pill(t, stateLabel, stateToken));
-    }
-    card.child(head);
+    if (pr) {
+      // The PR's own state as the label (the token is only its colour), in
+      // GitHub's colours: open green, draft grey, merged purple, closed red.
+      const stateToken = { open: "ansi2", draft: "dim", merged: "ansi5", closed: "blocked" }[pr.state];
+      const stateLabel = { open: "Open", draft: "Draft", merged: "Merged", closed: "Closed" }[pr.state];
+      if (stateToken) {
+        head.child(this.pill(t, stateLabel, stateToken));
+      }
+      card.child(head);
 
-    // "#1285 <title>", wrapping, opens the PR.
-    const title = h_flex().id("pr-title").gap(6).items_start().min_w(0);
-    title
-      .when(Boolean(url), (el) => el.cursor_pointer().on_click(() => this.openUrl(url)))
-      // Icon centred in a box one text line tall (12px type ≈ 18px line), so
-      // it sits on the title's first line however the title wraps. Coloured
-      // by the PR's state, like the pill.
-      .child(
-        h_flex().h(18).flex_none().items_center().child(
-          svg("mods/ranch-session/git-pull-request.svg").size(13).text_color(stateToken ? t[stateToken] : t.dim)
+      // "#1285 <title>", wrapping, opens the PR.
+      const title = h_flex().id("pr-title").gap(6).items_start().min_w(0);
+      title
+        .when(Boolean(url), (el) => el.cursor_pointer().on_click(() => this.openUrl(url)))
+        // Icon centred in a box one text line tall (12px type ≈ 18px line), so
+        // it sits on the title's first line however the title wraps. Coloured
+        // by the PR's state, like the pill.
+        .child(
+          h_flex().h(18).flex_none().items_center().child(
+            svg("mods/ranch-session/git-pull-request.svg").size(13).text_color(stateToken ? t[stateToken] : t.dim)
+          )
         )
-      )
-      .child(
-        div().flex_1().min_w(0).text_size(12).line_height(1.5).text_color(t.foreground).child(`#${pr.number} ${pr.title ?? ""}`)
-      );
-    card.child(title);
+        .child(
+          div().flex_1().min_w(0).text_size(12).line_height(1.5).text_color(t.foreground).child(`#${pr.number} ${pr.title ?? ""}`)
+        );
+      card.child(title);
 
-    const now = Date.now();
-    const byline = [];
-    if (pr.author) byline.push(`by ${pr.author}`);
-    if (pr.base) byline.push(`into ${pr.base}`);
-    if (pr.updatedAt) byline.push(`updated ${relativeTime(now - pr.updatedAt)}`);
-    if (byline.length) {
-      // Wraps like the title rather than cutting "updated 14m ago" off.
-      card.child(div().text_size(11).text_color(t.dim).child(byline.join(" · ")));
-    }
+      const now = Date.now();
+      const byline = [];
+      if (pr.author) byline.push(`by ${pr.author}`);
+      if (pr.base) byline.push(`into ${pr.base}`);
+      if (pr.updatedAt) byline.push(`updated ${relativeTime(now - pr.updatedAt)}`);
+      if (byline.length) {
+        // Wraps like the title rather than cutting "updated 14m ago" off.
+        card.child(div().text_size(11).text_color(t.dim).child(byline.join(" · ")));
+      }
 
-    const pills = [];
-    const review = reviewPill(pr.review);
-    if (review) pills.push(this.pill(t, review.text, review.token));
-    if (pr.behind) pills.push(this.pill(t, "Behind base", "blocked"));
-    if (pills.length) card.child(h_flex().gap(4).flex_wrap().children(pills));
+      const pills = [];
+      const review = reviewPill(pr.review);
+      if (review) pills.push(this.pill(t, review.text, review.token));
+      if (pr.behind) pills.push(this.pill(t, "Behind base", "blocked"));
+      if (pills.length) card.child(h_flex().gap(4).flex_wrap().children(pills));
 
-    if (pr.approvedBy?.length) {
-      card.child(div().text_size(11).text_color(t.done).child(`Approved by ${pr.approvedBy.join(", ")}`));
-    }
-    if (pr.reviewers?.length) {
-      card.child(div().text_size(11).text_color(t.dim).child(`Waiting on ${pr.reviewers.join(", ")}`));
-    }
+      if (pr.approvedBy?.length) {
+        card.child(div().text_size(11).text_color(t.done).child(`Approved by ${pr.approvedBy.join(", ")}`));
+      }
+      if (pr.reviewers?.length) {
+        card.child(div().text_size(11).text_color(t.dim).child(`Waiting on ${pr.reviewers.join(", ")}`));
+      }
 
-    // CI checks, expanded by default while something failed.
-    const summary = checksSummary(pr.checks);
-    if (summary) {
-      const open = this.ciOpen ?? pr.checks.fail > 0;
-      card.child(
-        h_flex()
-          .id("ci-toggle")
-          .gap(6)
-          .items_center()
-          .cursor_pointer()
-          .on_click((_e, cx) => {
-            this.ciOpen = !open;
-            cx.notify();
-          })
-          .child(this.ciGlyph(t, checksGlyph(pr.checks)))
-          .child(div().text_size(11.5).text_color(t.muted).child(`CI checks ${summary}`))
-      );
-      if (open) {
-        for (const [i, c] of pr.checkList.entries()) {
-          card.child(
-            h_flex()
-              .id(`ci-${i}`)
-              .gap(6)
-              .items_center()
-              .min_w(0)
-              .when(Boolean(c.url), (el) =>
-                el.cursor_pointer().hover((h) => h.bg(t.hover)).on_click(() => this.openUrl(c.url))
-              )
-              .child(this.ciGlyph(t, c.state))
-              .child(div().flex_1().min_w(0).truncate().text_size(11.5).font_medium().child(c.name))
-              .when(Boolean(c.workflow), (el) =>
-                el.child(
-                  div()
-                    .flex_none()
-                    .max_w(Math.round((this.size?.width ?? 300) * 0.45))
-                    .truncate()
-                    .text_size(10.5)
-                    .text_color(t.dim)
-                    .child(c.workflow)
+      // CI checks, expanded by default while something failed.
+      const summary = checksSummary(pr.checks);
+      if (summary) {
+        const open = this.ciOpen ?? pr.checks.fail > 0;
+        card.child(
+          h_flex()
+            .id("ci-toggle")
+            .gap(6)
+            .items_center()
+            .cursor_pointer()
+            .on_click((_e, cx) => {
+              this.ciOpen = !open;
+              cx.notify();
+            })
+            .child(this.ciGlyph(t, checksGlyph(pr.checks)))
+            .child(div().text_size(11.5).text_color(t.muted).child(`CI checks ${summary}`))
+        );
+        if (open) {
+          for (const [i, c] of pr.checkList.entries()) {
+            card.child(
+              h_flex()
+                .id(`ci-${i}`)
+                .gap(6)
+                .items_center()
+                .min_w(0)
+                .when(Boolean(c.url), (el) =>
+                  el.cursor_pointer().hover((h) => h.bg(t.hover)).on_click(() => this.openUrl(c.url))
                 )
-              )
-          );
+                .child(this.ciGlyph(t, c.state))
+                .child(div().flex_1().min_w(0).truncate().text_size(11.5).font_medium().child(c.name))
+                .when(Boolean(c.workflow), (el) =>
+                  el.child(
+                    div()
+                      .flex_none()
+                      .max_w(Math.round((this.size?.width ?? 300) * 0.45))
+                      .truncate()
+                      .text_size(10.5)
+                      .text_color(t.dim)
+                      .child(c.workflow)
+                  )
+                )
+            );
+          }
         }
       }
     }
+
+    // PRs the agent created (`gh pr create`, recorded by the adapters, I4),
+    // shown in addition to the branch PR.
+    if (extra.length) {
+      card.child(div().text_size(11).text_color(t.dim).child("Created by agent:"));
+      for (const p of extra) {
+        card.child(
+          h_flex()
+            .id(`agent-pr-${p.number}`)
+            .gap(6)
+            .items_center()
+            .min_w(0)
+            .cursor_pointer()
+            .hover((h) => h.bg(t.hover))
+            .on_click(() => this.openUrl(p.url))
+            .child(h_flex().h(18).flex_none().items_center().child(
+              svg("mods/ranch-session/git-pull-request.svg").size(12).text_color(t.ansi2)
+            ))
+            .child(div().flex_none().text_size(12).text_color(t.foreground).child(`#${p.number}`))
+            .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child(p.url))
+        );
+      }
+    }
     return card;
+  }
+
+  /**
+   * PR URLs the adapters recorded in the store (`gh pr create`, I4), from the
+   * main agent's and each sub-agent's store, deduped against the branch PR.
+   */
+  recordedPrs(s, pr) {
+    const host = this.git.summary?.host;
+    const branchUrl = pr?.url || (host && pr?.number ? links(host).pr(pr.number) : null);
+    const seenUrls = new Set(branchUrl ? [branchUrl] : []);
+    const out = [];
+    const stores = [];
+    if (this.tasks.parsed?.ok) stores.push(this.tasks.parsed.store);
+    for (const k of this.subTerminals(s)) {
+      const entry = this.subTasks.get(k.address);
+      if (entry?.parsed?.ok) stores.push(entry.parsed.store);
+    }
+    for (const store of stores) {
+      for (const p of store.prs ?? []) {
+        if (!p?.url || seenUrls.has(p.url)) continue;
+        seenUrls.add(p.url);
+        out.push(p);
+      }
+    }
+    return out;
   }
 
   /** The CI glyph: ✕ failed, ○ ring running, ✓ passed, – skipped. */
