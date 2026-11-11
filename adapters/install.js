@@ -454,6 +454,7 @@ function copyRuntime(results, platform = process.platform) {
       .filter((f) => f.endsWith(".js"))
       .map((f) => ({ src: join(root, "adapters", f), dest: join(ranch, "adapters", f) })),
     { src: join(root, "lib", "tasks.js"), dest: join(ranch, "lib", "tasks.js") },
+    { src: join(root, "lib", "prs.js"), dest: join(ranch, "lib", "prs.js") },
   ];
   for (const { src, dest, mode } of files) {
     mkdirSync(dirname(dest), { recursive: true });

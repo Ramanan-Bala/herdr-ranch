@@ -2,6 +2,7 @@
 // Codex exposes no session title, so session.title stays null.
 
 import { tasksFingerprint } from "../lib/tasks.js";
+import { detectCreatedPr } from "../lib/prs.js";
 
 const TASK_STATUS = new Set(["pending", "in_progress", "completed", "cancelled"]);
 const KNOWN_EVENTS = new Set([
@@ -46,22 +47,12 @@ export function applyCodex(store, payload) {
   return { ...base, session: { ...session, activity: { state, at: Date.now() } } };
 }
 
-const PR_URL = /https:\/\/github\.com\/[^\s"'<>()]+\/pull\/(\d+)/;
-
 /** Records a PR URL created by `gh pr create` into store.prs (I4). Codex
  * reports the shell tool as "shell" (command array) or "Bash". */
 function recordCreatedPr(store, payload) {
-  const input = payload.tool_input;
-  const command = Array.isArray(input?.command) ? input.command.join(" ") : input?.command;
-  if (typeof command !== "string" || !/\bgh\s+pr\s+create\b/.test(command)) return;
-  const response = typeof payload.tool_response === "string"
-    ? payload.tool_response
-    : JSON.stringify(payload.tool_response ?? "");
-  const match = PR_URL.exec(response ?? "");
-  if (!match) return;
-  const url = match[0];
-  if (store.prs?.some((p) => p.url === url)) return;
-  store.prs = [...(store.prs ?? []), { url, number: Number(match[1]), at: new Date().toISOString() }].slice(-10);
+  const found = detectCreatedPr(payload);
+  if (!found || store.prs?.some((p) => p.url === found.url)) return;
+  store.prs = [...(store.prs ?? []), { ...found, at: new Date().toISOString() }].slice(-10);
 }
 
 function applyCodexCore(store, payload) {
