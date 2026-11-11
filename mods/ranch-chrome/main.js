@@ -61,6 +61,14 @@ export default class RanchChrome extends View {
   render() {
     const t = theme();
     const collapsed = narrow();
+    // Bottom status bar, left end: just the machine the active space runs on.
+    if (props()?.status) {
+      const space = spaces().find((s) => s.active);
+      return h_flex().size_full().px(14).gap(16).items_center().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8).text_color(t.muted)
+        .child(h_flex().gap(6).items_center().min_w(0)
+          .child(svg(`mods/ranch-chrome/${space?.machine ? "server" : "laptop"}.svg`).size(13).flex_none())
+          .child(div().truncate().child(space?.machine ?? "This computer")));
+    }
     if (props()?.footer) {
       const counts = statusCounts();
       const filter = shared(FILTER_KEY);
