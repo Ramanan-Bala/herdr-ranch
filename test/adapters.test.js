@@ -36,6 +36,23 @@ function withEnv(t, vars) {
 
 // ---------------------------------------------------------------- applyClaude
 
+test("applyClaude TodoWrite keeps a cancelled todo", () => {
+  const store = applyClaude(emptyStore("t1", "claude-code"), {
+    hook_event_name: "PostToolUse",
+    tool_name: "TodoWrite",
+    tool_input: {
+      todos: [
+        { content: "a", status: "completed", activeForm: null },
+        { content: "b", status: "cancelled", activeForm: null },
+      ],
+    },
+  });
+  assert.deepEqual(store.tasks, [
+    { id: "1", title: "a", status: "completed", active_form: null },
+    { id: "2", title: "b", status: "cancelled", active_form: null },
+  ]);
+});
+
 test("applyClaude TodoWrite replaces tasks entirely", () => {
   const store = applyClaude(emptyStore("t1", "claude-code"), {
     hook_event_name: "PostToolUse",
@@ -226,6 +243,23 @@ test("applyClaude ignores unknown events and non-object payloads", () => {
 
 // ----------------------------------------------------------------- applyCodex
 
+test("applyCodex update_plan keeps a cancelled step", () => {
+  const store = applyCodex(emptyStore("t1", "codex"), {
+    hook_event_name: "PostToolUse",
+    tool_name: "update_plan",
+    tool_input: {
+      plan: [
+        { step: "Read spec", status: "completed" },
+        { step: "Dropped", status: "cancelled" },
+      ],
+    },
+  });
+  assert.deepEqual(store.tasks, [
+    { id: "1", title: "Read spec", status: "completed", active_form: null },
+    { id: "2", title: "Dropped", status: "cancelled", active_form: null },
+  ]);
+});
+
 test("applyCodex update_plan replaces tasks", () => {
   let store = applyCodex(emptyStore("t1", "codex"), {
     hook_event_name: "SessionStart", session_id: "s1", source: "startup",
@@ -303,7 +337,7 @@ for (const [name, apply] of [["claude", applyClaude], ["codex", applyCodex]]) {
 
 // -------------------------------------------------------------- OpenCode
 
-test("reduceOpencode todo.updated replaces tasks and drops cancelled", () => {
+test("reduceOpencode todo.updated replaces tasks and keeps cancelled", () => {
   const store = reduceOpencode(emptyStore("t1", "opencode"), {
     type: "todo.updated",
     properties: {
@@ -317,6 +351,7 @@ test("reduceOpencode todo.updated replaces tasks and drops cancelled", () => {
   });
   assert.deepEqual(store.tasks, [
     { id: "1", title: "a", status: "completed", active_form: null },
+    { id: "2", title: "b", status: "cancelled", active_form: null },
     { id: "3", title: "c", status: "pending", active_form: null },
   ]);
 });

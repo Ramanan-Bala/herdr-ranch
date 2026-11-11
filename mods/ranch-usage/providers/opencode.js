@@ -1,5 +1,5 @@
 // OpenCode Go: `opencode api GET /api/experimental/usage/limits`
-// (helpers/opencode-usage.sh). The CLI asks OpenCode's own local server;
+// (helpers/opencode-usage.mjs). The CLI asks OpenCode's own local server;
 // nothing here sees a token.
 import { makeWindow, okReport, errorReport, unavailableReport } from "../usage/report.js";
 
@@ -80,6 +80,6 @@ export default {
   name: "OpenCode Go",
   icon: "icons/opencode.svg",
   tint: true, // one-colour glyph (fill="currentColor"): draw with svg() in the text colour
-  helper: "helpers/opencode-usage.sh",
+  helper: "helpers/opencode-usage.mjs",
   parse,
 };

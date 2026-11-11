@@ -24,6 +24,17 @@ test("parseStore normalizes tasks, subagents and session", () => {
   assert.deepEqual(r.store.session, { id: "s1", title: "Fix login", title_source: "agent", first_prompt: "fix it", state: "running", activity: null });
 });
 
+test("parseStore keeps cancelled tasks (F7)", () => {
+  const r = parseStore(JSON.stringify({
+    version: 1, terminal: "t6", agent: "claude-code",
+    tasks: [{ title: "A", status: "cancelled" }, { title: "B", status: "pending" }],
+  }));
+  assert.deepEqual(r.store.tasks, [
+    { id: "1", title: "A", status: "cancelled", active_form: null },
+    { id: "2", title: "B", status: "pending", active_form: null },
+  ]);
+});
+
 test("orderTasks and progress", () => {
   const t = [
     { id: "1", status: "completed" }, { id: "2", status: "pending" },
@@ -49,4 +60,14 @@ test("activity is normalized and set immutably", () => {
   assert.deepEqual(next.session.activity, { state: "blocked", at: 9 });
   const r = parseStore(JSON.stringify(next));
   assert.deepEqual(r.store.session.activity, { state: "blocked", at: 9 });
+});
+
+test("progress and orderTasks leave cancelled tasks out of the count and last in order", () => {
+  const tasks = [
+    { id: "1", title: "a", status: "cancelled", active_form: null },
+    { id: "2", title: "b", status: "completed", active_form: null },
+    { id: "3", title: "c", status: "pending", active_form: null },
+  ];
+  assert.deepEqual(progress(tasks), { done: 1, total: 2 });
+  assert.deepEqual(orderTasks(tasks).map((t) => t.id), ["3", "2", "1"]);
 });

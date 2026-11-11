@@ -4,7 +4,7 @@
 /** Store schema version this build understands. */
 export const STORE_VERSION = 1;
 
-const TASK_STATUS = new Set(["pending", "in_progress", "completed"]);
+const TASK_STATUS = new Set(["pending", "in_progress", "completed", "cancelled"]);
 const SUB_STATUS = new Set(["running", "done", "failed"]);
 
 function str(v) {
@@ -109,13 +109,15 @@ export function parseStore(text) {
 
 /** Display order (R-SD-1): in_progress, then pending, then completed; stable within each group. */
 export function orderTasks(tasks) {
-  const rank = { in_progress: 0, pending: 1, completed: 2 };
+  const rank = { in_progress: 0, pending: 1, completed: 2, cancelled: 3 };
   return tasks.map((t, i) => [t, i]).sort((a, b) => rank[a[0].status] - rank[b[0].status] || a[1] - b[1]).map(([t]) => t);
 }
 
 /** { done, total } for the progress header. */
 export function progress(tasks) {
-  return { done: tasks.filter((t) => t.status === "completed").length, total: tasks.length };
+  // Cancelled tasks are shown but never counted (fixes doc F7).
+  const live = tasks.filter((t) => t.status !== "cancelled");
+  return { done: live.filter((t) => t.status === "completed").length, total: live.length };
 }
 
 /** Store file name for a terminal address ("t6" -> "t6.json"); strips anything unsafe. */

@@ -3,7 +3,7 @@
 // needed, is passed in as payload.transcript by the CLI — this module never
 // touches the filesystem.
 
-const TASK_STATUS = new Set(["pending", "in_progress", "completed"]);
+const TASK_STATUS = new Set(["pending", "in_progress", "completed", "cancelled"]);
 const KNOWN_EVENTS = new Set([
   "SessionStart", "UserPromptSubmit", "PostToolUse", "SubagentStart", "SubagentStop", "SessionEnd", "Stop",
 ]);

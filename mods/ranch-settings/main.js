@@ -6,7 +6,7 @@ import { SETTINGS_KEY, resolveSettings, withSetting } from "./lib/settings.js";
 import { tasksCommand } from "./lib/tasks-command.js";
 
 // Windows can't exec the POSIX sh launcher; it calls node on the .js entry.
-const isWin = () => appWindow().platform === "windows";
+const isWin = () => appWindow()?.platform === "windows";
 const tasksCmd = (args) => tasksCommand(home(), args, isWin());
 const TASK_KEYS = ["claude", "codex", "opencode"];
 const HERDR_MIN = [0, 1, 15];

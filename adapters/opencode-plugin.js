@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 
 const STORE_VERSION = 1;
 const TASKS_DIR = ".herdr/ranch/tasks";
-const TASK_STATUS = new Set(["pending", "in_progress", "completed"]);
+const TASK_STATUS = new Set(["pending", "in_progress", "completed", "cancelled"]);
 
 function homeDir() {
   return process.env.RANCH_HOME || homedir();
@@ -156,10 +156,10 @@ function reduceOpencodeCore(store, event) {
 
   if (type === "todo.updated") {
     if (props.sessionID && store.session?.id && props.sessionID !== store.session.id) return store;
-    // Replace tasks; cancelled ones are dropped.
+    // Replace tasks; cancelled ones are kept and struck through by the mod.
     const todos = Array.isArray(props.todos) ? props.todos : [];
     next.tasks = todos.flatMap((todo) => {
-      if (!todo || todo.status === "cancelled") return [];
+      if (!todo) return [];
       const title = typeof todo.content === "string" ? todo.content.trim() : "";
       if (!title) return [];
       return [{

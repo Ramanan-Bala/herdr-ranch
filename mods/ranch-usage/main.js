@@ -97,7 +97,13 @@ export default class UsageLimits extends View {
       let next;
       const prev = states()[p.id] ?? { report: null, lastGood: null, installed: null };
       try {
-        const r = await exec("sh", [`${appHome()}/mods/${MOD}/${p.helper}`]);
+        // Node port of helpers/*.sh (fixes doc F11); falls back to the sh
+        // original when node is not on PATH (Unix installs without node).
+        // node may be missing from Herdr's PATH (nvm/volta): exec then throws
+        // or exits 127, so fall back in both cases.
+        let r = null;
+        try { r = await exec("node", [`${appHome()}/mods/${MOD}/${p.helper}`]); } catch {}
+        if (!r || r.code === 127) r = await exec("sh", [`${appHome()}/mods/${MOD}/${p.helper.replace(/\.mjs$/, ".sh")}`]);
         next = r.code === 127 ? nextState(prev, null, false) : nextState(prev, p.parse(r.stdout, now()), true);
       } catch (e) {
         next = { ...prev, report: { status: "error", message: String(e?.message ?? e), plan: null, observedAt: now(), source: p.helper, windows: [] } };
@@ -145,7 +151,10 @@ export default class UsageLimits extends View {
         const app = AGENTS[info.status?.app];
         const pid = info.foreground?.pid;
         if (app && pid) {
-          const r = await exec("sh", [`${appHome()}/mods/${MOD}/helpers/session.sh`, app, String(pid)]);
+          // Node helper (fixes doc F11); sh fallback when node is not on PATH.
+          let r = null;
+          try { r = await exec("node", [`${appHome()}/mods/${MOD}/helpers/session.mjs`, app, String(pid)]); } catch {}
+          if (!r || r.code === 127) r = await exec("sh", [`${appHome()}/mods/${MOD}/helpers/session.sh`, app, String(pid)]);
           const data = r.code === 0 ? parseSession(r.stdout, app) : null;
           if (data) next = { data, title: (info.cwd ?? "").split("/").pop() };
         }
