@@ -12,6 +12,7 @@ import { buildTree, BADGE_COLORS, badgeColorIndex, initials, diffSquares } from 
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent } from "./lib/format.js";
 import { repoSummary, parsePr, createTtlCache, runGh, PR_JSON_FIELDS } from "./lib/git.js";
 import { SETTINGS_KEY, FILTER_KEY, resolveSettings } from "./lib/settings.js";
+import { progress } from "./lib/tasks.js";
 import { TabNamer, ACTIVITY_KEY } from "./namer.js";
 
 const ICON = (name) => `mods/ranch-sidebar/${name}.svg`;
@@ -22,6 +23,7 @@ export default class RanchSidebar extends View {
     this.handle = cx.focus_handle();
     this.size = null; // root size, null until first layout
     this.highlight = null; // keyboard-highlighted tab id
+    this.hovered = null; // pointer-hovered tab id (drives the card action strip)
     this.order = []; // visible card tab ids, display order
     this.cardById = new Map();
     this.settings = resolveSettings(shared(SETTINGS_KEY));
@@ -221,12 +223,13 @@ export default class RanchSidebar extends View {
   // ---- keyboard ----
 
   onKey(e, cx) {
-    if (e.key === "down" || e.key === "up") {
+    if (e.key === "down" || e.key === "up" || e.key === "j" || e.key === "k") {
       if (!this.order.length) return;
+      const down = e.key === "down" || e.key === "j";
       const i = this.order.indexOf(this.highlight);
       const next = i === -1
-        ? (e.key === "down" ? 0 : this.order.length - 1)
-        : e.key === "down"
+        ? (down ? 0 : this.order.length - 1)
+        : down
           ? Math.min(this.order.length - 1, i + 1)
           : Math.max(0, i - 1);
       this.highlight = this.order[next];
@@ -240,7 +243,28 @@ export default class RanchSidebar extends View {
     } else if (e.key === "right") {
       run("pane.go", { direction: "right" });
       cx.stop_propagation();
+    } else if (e.key === "x" || e.key === "p" || e.key === "c") {
+      const c = this.cardById.get(this.highlight);
+      if (!c) return;
+      if (e.key === "x") {
+        run(c.settled ? "tab.unsettle" : "tab.settle", { id: c.tabId });
+      } else if (e.key === "p") {
+        if (!c.primaryAgent) return;
+        run("terminal.peek", { terminal: c.primaryAgent });
+      } else {
+        const branch = this.branchOf(c);
+        if (!branch) return;
+        cx.write_to_clipboard(branch);
+      }
+      cx.stop_propagation();
     }
+  }
+
+  /** The branch a card shows on line 2 (git summary wins over the pane's). */
+  branchOf(c) {
+    return c.summary
+      ? (c.summary.detached ? `detached @${c.summary.head ?? ""}` : c.summary.branch ?? c.branch)
+      : null;
   }
 
   selectCard(c) {
@@ -321,6 +345,7 @@ export default class RanchSidebar extends View {
 
   spaceRow(sp) {
     const t = theme();
+    const folded = !!this.collapsed.s[sp.space];
     const plus = div().id(`plus-${sp.space}`).flex_none().size(16).flex().items_center().justify_center()
       .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -330,12 +355,31 @@ export default class RanchSidebar extends View {
         openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 });
       })
       .child(svg(ICON("plus")).size(11));
+    const spark = div().id(`spark-${sp.space}`).flex_none().size(16).flex().items_center().justify_center()
+      .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip("Start agent with a task")
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        run("space.select", { id: sp.space });
+        openOverlay({ mod: "ranch-launch", kind: "dialog", width: 520, height: 256, props: { space: sp.space } });
+      })
+      .child(svg(ICON("sparkle")).size(11));
+    const fold = div().id(`fold-${sp.space}`).flex_none().size(16).flex().items_center().justify_center()
+      .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip(folded ? "Expand" : "Collapse")
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        this.toggleFold("s", sp.space);
+      })
+      .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
     const custom = shared("space.colors")?.[sp.space];
     const tint = custom ?? t[BADGE_COLORS[badgeColorIndex(sp.space)]] ?? t.muted;
     const badge = div().flex_none().size(17).rounded(4).flex().items_center().justify_center()
       .bg(`${tint}38`).text_size(8.5).font_bold().text_color(tint)
       .child(initials(sp.name) || "·");
-    return h_flex().id(`space-${sp.space}`).h(28).mt(6).flex_none().pl(10).pr(8).gap(8).items_center()
+    return h_flex().id(`space-${sp.space}`).h(28).mt(10).flex_none().pl(10).pr(8).gap(8).items_center()
       .cursor_pointer().hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click(() => run("space.select", { id: sp.space }))
@@ -343,7 +387,11 @@ export default class RanchSidebar extends View {
       .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold()
         .text_color(sp.active ? t.foreground : t.muted).child(sp.name))
       .when(Boolean(sp.status), (e) => e.child(this.ring(sp.status, 9)))
-      .child(plus);
+      .child(plus)
+      .child(spark)
+      .when(folded, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
+        .child(String(sp.cards.length + sp.settled.length))))
+      .child(fold);
   }
 
   /** Tab name; an unnamed tab shows its agent's program name (like the top bar). */
@@ -382,15 +430,24 @@ export default class RanchSidebar extends View {
   card(c, { settled = false } = {}) {
     const t = theme();
     const active = c.active && !settled;
+    const hovered = this.hovered === c.tabId;
+    // Hover actions sit on line 1 (after the status chip); line 3 never swaps.
+    const acts = hovered ? this.cardActions(c) : [];
     const line1 = h_flex().flex_none().items_center().justify_between().gap(6)
       .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold()
         .text_color(settled ? t.dim : active ? t.foreground : t.muted)
         .child(this.cardTitle(c)))
-      .when(c.status, (e) => e.child(this.statusChip(c, settled)));
+      .when(c.status, (e) => e.child(this.statusChip(c, settled)))
+      .when(acts.length, (e) => e.child(
+        h_flex().flex_none().items_center().gap(2)
+          .children(acts.map((a) => this.actionBtn(c, a)))));
 
-    const branch = c.summary
-      ? (c.summary.detached ? `detached @${c.summary.head ?? ""}` : c.summary.branch ?? c.branch)
-      : null;
+    const branch = this.branchOf(c);
+    // Task progress from the primary agent's store (the namer's tick keeps it
+    // fresh): "done/total" on line 2, and the active task in the tooltip.
+    const tasks = c.primaryAgent ? (this.namer.cachedStore(c.primaryAgent)?.tasks ?? []) : [];
+    const prog = tasks.length ? progress(tasks) : null;
+    const activeTask = tasks.find((task) => task.status === "in_progress") ?? null;
     const parts2 = [];
     if (branch) {
       parts2.push(h_flex().flex_1().min_w(0).items_center().gap(4)
@@ -404,6 +461,11 @@ export default class RanchSidebar extends View {
         .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(c.repo ?? c.cwd)));
     }
     const icon = c.agentIcon?.icon;
+    if (prog) {
+      // Task progress "done/total" sits just before the agent icon on line 2.
+      parts2.push(div().flex_none().text_size(10).text_color(t.dim)
+        .child(`${prog.done}/${prog.total}`));
+    }
     if (icon) {
       parts2.push(c.agentIcon.tint
         ? svg(icon).size(14).flex_none().text_color(t.muted)
@@ -448,15 +510,18 @@ export default class RanchSidebar extends View {
             .child(`#${c.pr.number}`)));
       }
     }
+    // Line 3 renders only when there is something to show (diff stats, PR);
+    // the card's height follows, so there is no empty slot any more.
     const line3 = parts3.length
-      ? h_flex().flex_none().items_center().gap(5).children([...parts3.slice(0, -1), div().flex_1(), parts3.at(-1)])
+      ? h_flex().flex_none().h(16).items_center().gap(5).children([...parts3.slice(0, -1), div().flex_1(), parts3.at(-1)])
       : null;
 
     const tip = [
+      activeTask ? `Now: ${activeTask.active_form ?? activeTask.title}` : null,
       c.summary ? c.repo : c.cwd,
       branch,
       c.label,
-    ].filter(Boolean).join(" · ");
+    ].filter(Boolean).join("\n");
 
     // Left bar = status: idle grey, working yellow, needs you red, done blue.
     // An agent pane whose status report was cleared still counts as idle.
@@ -464,13 +529,21 @@ export default class RanchSidebar extends View {
     const isAgent = c.agentIcon?.agent || agentKeys.includes(c.agentIcon?.key);
     const barStatus = c.status ?? (isAgent ? "idle" : null);
     const bar = { idle: t.muted, working: t.ansi3, blocked: t.ansi1, done: t.ansi4 }[barStatus] ?? null;
-    return v_flex().id(`card-${c.tabId}`).relative().mx(6).h(58).rounded(6).pl(10).pr(8).py(6).gap(3).justify_center().text_size(11)
+    // my(3): a 6px gap between cards so each session reads as its own block.
+    return v_flex().id(`card-${c.tabId}`).relative().mx(6).my(3).h(parts3.length ? 58 : 44).rounded(6).pl(10).pr(8).py(6).gap(3).justify_center().text_size(11)
       .when(active, (e) => e.bg(t.selected))
       .when(Boolean(bar), (e) => e.child(
         div().absolute().left(0).top(8).bottom(8).w(2).rounded(1).bg(bar)))
       .when(!active, (e) => e.hover((s) => s.bg(t.hover)))
       .when(this.highlight === c.tabId, (e) => e.border(1).border_color(t.accent))
       .cursor_pointer().tooltip(tip)
+      .on_hover((isIn, cx) => {
+        const next = isIn ? c.tabId : null;
+        if (this.hovered !== next) {
+          this.hovered = next;
+          cx.notify();
+        }
+      })
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click(() => this.selectCard(c))
       .on_mouse_down("right", (_e, cx) => {
@@ -478,6 +551,54 @@ export default class RanchSidebar extends View {
         openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: c.tabId, space: c.spaceId } } });
       })
       .children([line1, line2, line3].filter(Boolean));
+  }
+
+  /** One 18x18 icon button in a card's line-1 hover group. */
+  actionBtn(c, a) {
+    const t = theme();
+    return div().id(`act-${a.id}-${c.tabId}`).flex_none().size(18).rounded(4).flex()
+      .items_center().justify_center()
+      .text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip(a.label)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        a.go(cx);
+      })
+      .child(svg(ICON(a.icon)).size(11));
+  }
+
+  /** Hover actions for a card's line 1 (PR stays reachable via line 3's link). */
+  cardActions(c) {
+    const acts = [];
+    if (c.primaryAgent && !c.active) {
+      acts.push({ id: "peek", icon: "eye", label: "Peek agent", go: () => run("terminal.peek", { terminal: c.primaryAgent }) });
+    }
+    if (this.branchOf(c)) {
+      acts.push({ id: "copy", icon: "copy", label: "Copy branch name", go: (cx) => cx.write_to_clipboard(this.branchOf(c)) });
+    }
+    acts.push(c.settled
+      ? { id: "unsettle", icon: "archive-restore", label: "Unsettle", go: () => run("tab.unsettle", { id: c.tabId }) }
+      : { id: "settle", icon: "archive", label: "Settle", go: () => run("tab.settle", { id: c.tabId }) });
+    acts.push({ id: "close", icon: "x", label: "Close", go: () => this.closeTab(c) });
+    return acts;
+  }
+
+  /** Same close rule as the top bar: confirm before killing a busy agent. */
+  closeTab(c) {
+    const busy = agents().some((a) => a.tab === c.tabId && (a.status === "working" || a.status === "blocked"));
+    if (!busy) { run("tab.close", { id: c.tabId }); return; }
+    const sp = spaces().find((s) => s.id === c.spaceId);
+    openOverlay({
+      mod: "confirm", kind: "dialog", width: 400, height: 170,
+      props: {
+        title: "Close this tab?",
+        detail: sp?.tabs.length === 1
+          ? "An agent here is still working, and this is the space's last tab: the space closes with it."
+          : "An agent here is still working. Its terminal closes with the tab.",
+        command: { name: "tab.close", args: { id: c.tabId, confirmed: true } },
+      },
+    });
   }
 
   rail(tree) {
@@ -556,6 +677,7 @@ export default class RanchSidebar extends View {
         const eff = effectiveStatus(tabs.get(c.tabId), activity[c.tabId], now);
         c.status = eff.status;
         c.since = eff.since;
+        c.settled = settled;
         this.cardById.set(c.tabId, c);
         if (c.cwd) {
           const m = c.machine ?? "";
@@ -654,6 +776,7 @@ export default class RanchSidebar extends View {
         }
         for (const sp of g.spaces) {
           rows.push(this.spaceRow(sp));
+          if (this.collapsed.s[sp.space]) continue; // folded: count shows on the row
           for (const c of sp.cards) {
             rows.push(this.card(c, {}));
             this.order.push(c.tabId);

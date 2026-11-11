@@ -71,6 +71,8 @@ function capToLen(s, maxLen) {
   return s.slice(0, wordStart).trimEnd();
 }
 
+const TERMINAL_ADDRESS_RE = /^(?:[\w.-]+\/)?t(?=[0-9a-z]*\d)[0-9a-z]{1,4}$/;
+
 /** Clean a raw terminal/agent title; null when empty or generic. */
 export function cleanTitle(raw, { repo = null } = {}) {
   if (raw == null) return null;
@@ -86,6 +88,9 @@ export function cleanTitle(raw, { repo = null } = {}) {
   if (!s || !/\p{L}/u.test(s)) return null;
   const low = s.toLowerCase();
   if (GENERIC_TITLES.includes(low)) return null;
+  // A bare Herdr terminal address ("t11", "t1b", "mac/t7") is no name: some
+  // TUIs (OpenCode) put it in the terminal title.
+  if (TERMINAL_ADDRESS_RE.test(low)) return null;
   if (repo != null && low === String(repo).trim().toLowerCase()) return null;
   return s;
 }

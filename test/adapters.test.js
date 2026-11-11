@@ -8,9 +8,9 @@ import { fileURLToPath } from "node:url";
 import { emptyStore, parseStore } from "../lib/tasks.js";
 import { applyClaude } from "../adapters/claude.js";
 import { applyCodex } from "../adapters/codex.js";
-import { RanchTasks, reduceOpencode } from "../adapters/opencode-plugin.js";
+import opencodePlugin, { RanchTasks, reduceOpencode } from "../adapters/opencode-plugin.js";
 import { storePath, updateStore } from "../adapters/store.js";
-import { install, statusSummary, uninstall } from "../adapters/install.js";
+import { enableOpencodeTodo, install, statusSummary, uninstall } from "../adapters/install.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -493,6 +493,147 @@ test("opencode plugin does nothing without HC_TERMINAL_ID", async () => {
   delete process.env.RANCH_HOME;
 });
 
+// ------------------------------------------------------ OpenCode 2.x plugin
+
+/** Fake v2 host: records hook registrations, exposes a controllable bus. */
+function fakeV2Ctx() {
+  const hooks = { tool: {}, session: {} };
+  const queue = [];
+  let waiter = null;
+  const ctx = {
+    tool: { hook: (name, fn) => { hooks.tool[name] = fn; } },
+    session: { hook: (name, fn) => { hooks.session[name] = fn; } },
+    event: {
+      subscribe: ({ signal }) => ({
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+        next: () => new Promise((resolve) => {
+          if (queue.length) return resolve({ value: queue.shift(), done: false });
+          waiter = (event) => {
+            waiter = null;
+            resolve({ value: event, done: false });
+          };
+          signal?.addEventListener("abort", () => {
+            waiter = null;
+            resolve({ done: true });
+          }, { once: true });
+        }),
+      }),
+    },
+    emit: (event) => {
+      if (waiter) waiter(event);
+      else queue.push(event);
+    },
+  };
+  return { ctx, hooks };
+}
+
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+test("opencode 2.x default export is the schema-valid object", () => {
+  assert.equal(typeof opencodePlugin, "object");
+  assert.notEqual(opencodePlugin, null);
+  assert.equal(opencodePlugin.id, "ranch-tasks");
+  assert.equal(typeof opencodePlugin.setup, "function");
+  assert.equal(typeof opencodePlugin.server, "function");
+});
+
+test("opencode 2.x setup registers hooks and records todowrite + prompt", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t99" });
+  const { ctx, hooks } = fakeV2Ctx();
+  const cleanup = await opencodePlugin.setup(ctx);
+  assert.equal(typeof cleanup, "function");
+  assert.equal(typeof hooks.tool["execute.after"], "function");
+  assert.equal(typeof hooks.session.prompt, "function");
+  assert.equal(typeof hooks.session.context, "function");
+
+  await hooks.tool["execute.after"]({
+    tool: "todowrite",
+    sessionID: "s1",
+    status: "completed",
+    input: {
+      todos: [
+        { id: "1", content: "read", status: "completed" },
+        { id: "2", content: "write", status: "in_progress" },
+        { id: "3", content: "ship", status: "pending" },
+      ],
+    },
+  });
+  const file = join(home, ".herdr", "ranch", "tasks", "t99.json");
+  const disk = parseStore(readFileSync(file, "utf8"));
+  assert.equal(disk.ok, true);
+  assert.deepEqual(disk.store.tasks.map((task) => [task.id, task.status]), [
+    ["1", "completed"],
+    ["2", "in_progress"],
+    ["3", "pending"],
+  ]);
+
+  // The prompt hook records the first user message (text parts only).
+  await hooks.session.prompt({
+    sessionID: "s1",
+    parts: [{ type: "text", text: "fix the " }, { type: "file", path: "x" }, { type: "text", text: "bug" }],
+  });
+  const after = parseStore(readFileSync(file, "utf8"));
+  assert.equal(after.store.session.id, "s1");
+  assert.equal(after.store.session.first_prompt, "fix the bug");
+
+  cleanup();
+});
+
+test("opencode 2.x bus events drive session activity", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t99" });
+  const { ctx, hooks } = fakeV2Ctx();
+  const cleanup = await opencodePlugin.setup(ctx);
+  const file = join(home, ".herdr", "ranch", "tasks", "t99.json");
+
+  ctx.emit({ type: "session.execution.started", properties: { sessionID: "s1" } });
+  await flush();
+  await flush();
+  let disk = parseStore(readFileSync(file, "utf8"));
+  assert.equal(disk.store.session.id, "s1");
+  assert.equal(disk.store.session.activity.state, "working");
+
+  ctx.emit({ type: "session.execution.succeeded", properties: { sessionID: "s1" } });
+  await flush();
+  await flush();
+  disk = parseStore(readFileSync(file, "utf8"));
+  assert.equal(disk.store.session.activity.state, "done");
+
+  cleanup();
+});
+
+test("opencode 2.x context hook adds the task rule exactly once", async (t) => {
+  withEnv(t, { RANCH_HOME: tempHome(), HC_TERMINAL_ID: "t99" });
+  const { ctx, hooks } = fakeV2Ctx();
+  await opencodePlugin.setup(ctx);
+  const out = { system: [{ type: "text", text: "base" }] };
+  await hooks.session.context(out);
+  await hooks.session.context(out);
+  assert.equal(out.system.length, 2);
+  assert.equal(out.system[1].type, "text");
+  assert.match(out.system[1].text, /mandatory/);
+});
+
+test("opencode 2.x hooks survive garbage input", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t99" });
+  const { ctx, hooks } = fakeV2Ctx();
+  const cleanup = await opencodePlugin.setup(ctx);
+  for (const garbage of [null, {}, { tool: "todowrite" }, { tool: "todowrite", input: { todos: "no" } }]) {
+    await hooks.tool["execute.after"](garbage);
+    await hooks.session.prompt(garbage);
+    await hooks.session.context(garbage);
+    ctx.emit(garbage);
+    ctx.emit({ type: "unknown.event", data: 42 });
+  }
+  await flush();
+  assert.equal(existsSync(join(home, ".herdr", "ranch", "tasks")), false);
+  assert.doesNotThrow(cleanup);
+});
+
 // ---------------------------------------------------------------- store / CLI
 
 test("updateStore writes atomically under RANCH_HOME", () => {
@@ -612,9 +753,57 @@ test("hook subcommands print nothing and exit 0", () => {
 
 // ---------------------------------------------------------------- install
 
+// Real-world shape: comments, trailing commas.
+const OPENCODE_JSONC = `{
+  "$schema": "https://opencode.ai/config.json",
+  // "disabled_providers": ["opencode"],
+  "shell": "zsh",
+  "plugins": [
+    "@tarquinen/opencode-dcp@latest",
+  ],
+  "lsp": true,
+}`;
+
+test("enableOpencodeTodo inserts the experimental block into JSONC, keeps comments, is idempotent", () => {
+  const first = enableOpencodeTodo(OPENCODE_JSONC);
+  assert.equal(first.inserted, '\n  "experimental": { "todo": true },');
+  assert.ok(first.text.startsWith('{\n  "experimental": { "todo": true },'));
+  // comments and trailing commas survive
+  assert.ok(first.text.includes('// "disabled_providers": ["opencode"],'));
+  assert.ok(first.text.includes('"@tarquinen/opencode-dcp@latest",'));
+  assert.ok(first.text.includes('"lsp": true,'));
+
+  const second = enableOpencodeTodo(first.text);
+  assert.deepEqual(second, { text: first.text, inserted: null });
+});
+
+test("enableOpencodeTodo inserts todo inside an existing experimental object", () => {
+  const r = enableOpencodeTodo('{\n  "experimental": {\n    "background_compaction": true\n  }\n}');
+  assert.equal(r.inserted, '"todo": true, ');
+  assert.ok(r.text.includes('"experimental": {"todo": true, \n    "background_compaction": true'));
+});
+
+test("enableOpencodeTodo leaves todo off when the person set it", () => {
+  const text = '{ "experimental": { "todo": false } }';
+  const r = enableOpencodeTodo(text);
+  assert.equal(r.inserted, null);
+  assert.equal(r.text, text);
+  assert.equal(r.action, "left todo off (set by you)");
+});
+
+test("enableOpencodeTodo ignores experimental words in comments and strings", () => {
+  const comment = '{\n  // "experimental": { "todo": true }\n  "shell": "zsh",\n}';
+  assert.equal(enableOpencodeTodo(comment).inserted, '\n  "experimental": { "todo": true },');
+  const string = '{ "note": "turn on experimental todo here", "shell": "zsh" }';
+  assert.equal(enableOpencodeTodo(string).inserted, '\n  "experimental": { "todo": true },');
+});
+
 test("install/uninstall round trip restores configs byte-for-byte", async () => {
   const home = mkdtempSync(join(tmpdir(), "ranch-adapters-"));
   mkdirSync(join(home, ".claude"), { recursive: true });
+  mkdirSync(join(home, ".config", "opencode"), { recursive: true });
+  const opencodeConfig = join(home, ".config", "opencode", "opencode.jsonc");
+  writeFileSync(opencodeConfig, OPENCODE_JSONC);
   const settings = join(home, ".claude", "settings.json");
   const original = JSON.stringify({
     model: "opus",
@@ -652,6 +841,12 @@ test("install/uninstall round trip restores configs byte-for-byte", async () => 
     assert.ok(existsSync(join(home, ".herdr", "ranch", "bin", "ranch-tasks")));
     assert.ok(existsSync(join(home, ".herdr", "ranch", "lib", "tasks.js")));
 
+    // JSONC config got the todo flag without losing comments
+    const enabled = readFileSync(opencodeConfig, "utf8");
+    assert.ok(enabled.includes('"todo": true'));
+    assert.ok(enabled.includes('// "disabled_providers": ["opencode"],'));
+    assert.equal(statusSummary().opencodeTodo, true);
+
     // status: all installed while running from the repo
     assert.deepEqual(statusSummary().agents, { claude: "installed", codex: "installed", opencode: "installed" });
 
@@ -662,21 +857,51 @@ test("install/uninstall round trip restores configs byte-for-byte", async () => 
 
     // idempotent: a second install changes nothing
     const before = readFileSync(settings, "utf8");
+    const configBefore = readFileSync(opencodeConfig, "utf8");
     await install({ yes: true, agents: ["claude", "codex", "opencode"] });
     assert.equal(readFileSync(settings, "utf8"), before);
+    assert.equal(readFileSync(opencodeConfig, "utf8"), configBefore);
     // ...and the fresh runtime copy repairs the tampered one
     assert.deepEqual(statusSummary().agents, { claude: "installed", codex: "installed", opencode: "installed" });
 
     // uninstall restores everything
     await uninstall({ yes: true, agents: ["claude", "codex", "opencode"] });
     assert.equal(readFileSync(settings, "utf8"), original);
+    assert.equal(readFileSync(opencodeConfig, "utf8"), OPENCODE_JSONC);
     assert.equal(existsSync(join(home, ".codex", "hooks.json")), false);
     assert.equal(existsSync(join(home, ".codex")), false);
     assert.equal(existsSync(join(home, ".config", "opencode", "plugins", "ranch-tasks.js")), false);
+    assert.equal(statusSummary().opencodeTodo, false);
     assert.deepEqual(statusSummary().agents, { claude: "missing", codex: "missing", opencode: "missing" });
   } finally {
     delete process.env.RANCH_HOME;
   }
+});
+
+test("install creates a missing OpenCode config and uninstall deletes it", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  await install({ yes: true, agents: ["opencode"] });
+  const file = join(home, ".config", "opencode", "opencode.json");
+  assert.equal(readFileSync(file, "utf8"), '{\n  "experimental": { "todo": true }\n}\n');
+  assert.equal(statusSummary().opencodeTodo, true);
+  await uninstall({ yes: true, agents: ["opencode"] });
+  assert.equal(existsSync(file), false);
+  assert.equal(statusSummary().opencodeTodo, false);
+});
+
+test("uninstall keeps a Ranch-created OpenCode config the person has since edited", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  await install({ yes: true, agents: ["opencode"] });
+  const file = join(home, ".config", "opencode", "opencode.json");
+  writeFileSync(file, '{\n  "experimental": { "todo": true },\n  "shell": "zsh"\n}\n');
+  await uninstall({ yes: true, agents: ["opencode"] });
+  assert.equal(existsSync(file), true);
+  const left = readFileSync(file, "utf8");
+  assert.match(left, /"shell": "zsh"/);
+  assert.doesNotMatch(left, /"todo"/);
+  assert.equal(left, '{\n  "shell": "zsh"\n}\n');
 });
 
 test("hook events map to activity (status when Herdr shows none)", async () => {
@@ -754,4 +979,24 @@ test("mandatory task reporting: hook reminder, instruction files, OpenCode syste
   await hooks["experimental.chat.system.transform"]({}, out);
   assert.equal(out.system.length, 2);
   assert.match(out.system[1], /mandatory/);
+});
+
+test("opencode 2.2 real payloads: prompt.text and session.renamed fill the session", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t98" });
+  const { ctx, hooks } = fakeV2Ctx();
+  const cleanup = await opencodePlugin.setup(ctx);
+  const push = async (event) => { ctx.emit(event); await flush(); await flush(); };
+  const sid = "ses_real1";
+  // Shapes captured from OpenCode 2.2.6.
+  await hooks.session.prompt({ sessionID: sid, messageID: "msg_1", prompt: { text: "Fix the login redirect loop", files: [] }, delivery: "steer" });
+  await push({ id: "evt_1", type: "session.execution.started", data: { sessionID: sid } });
+  await push({ id: "evt_2", type: "session.renamed", data: { sessionID: sid, title: "Login redirect fix" } });
+  await flush();
+  const store = JSON.parse(readFileSync(join(home, ".herdr", "ranch", "tasks", "t98.json"), "utf8"));
+  assert.equal(store.session.id, sid);
+  assert.equal(store.session.first_prompt, "Fix the login redirect loop");
+  assert.equal(store.session.title, "Login redirect fix");
+  assert.equal(store.session.activity.state, "working");
+  if (typeof cleanup === "function") cleanup();
 });

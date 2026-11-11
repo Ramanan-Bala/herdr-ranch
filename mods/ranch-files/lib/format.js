@@ -145,6 +145,32 @@ export function folderLabel(path, home) {
 export const ACTIVITY_STALE_MS = 30 * 60 * 1000;
 
 /**
+ * Tabs across all spaces that need the person right now: effectiveStatus is
+ * "blocked" or "done", and the tab isn't settled. Entries are
+ * { tabId, spaceId, status, since }, blocked before done, then the one
+ * waiting longest (largest since) first; unknown since sorts last.
+ * @param {Array<{id: string, tabs: Array<object>}>} spaceList spaces() result
+ * @param {Record<string, {state: string, at: number}>|null|undefined} activity
+ * @param {number} now ms epoch
+ * @returns {Array<{tabId: string, spaceId: string, status: string, since: number|null}>}
+ */
+export function attentionQueue(spaceList, activity, now) {
+  const queue = [];
+  for (const space of spaceList) {
+    for (const tab of space.tabs) {
+      if (tab.settled) continue;
+      const { status, since } = effectiveStatus(tab, activity?.[tab.id], now);
+      if (status !== "blocked" && status !== "done") continue;
+      queue.push({ tabId: tab.id, spaceId: space.id, status, since });
+    }
+  }
+  const rank = (status) => (status === "blocked" ? 0 : 1);
+  return queue.sort(
+    (a, b) => rank(a.status) - rank(b.status) || (b.since ?? -1) - (a.since ?? -1),
+  );
+}
+
+/**
  * The status to show for a tab: Herdr's own status when it has one, else the
  * activity Ranch's hooks recorded ({ state, at }), else null.
  * Returns { status, since } where since is ms elapsed (or null).

@@ -323,3 +323,11 @@ test("summarizePrompt never overruns maxLen by a long word", () => {
   const out = summarizePrompt("refactor the authentication middleware internationalization handlers");
   assert.ok(out.length <= 32 + 8, out);
 });
+
+test("cleanTitle ignores bare Herdr terminal addresses", () => {
+  assert.equal(cleanTitle("t11"), null);
+  assert.equal(cleanTitle("t1b"), null);
+  assert.equal(cleanTitle("mac-mini/t7"), null);
+  assert.equal(cleanTitle("test"), "test");
+  assert.equal(cleanTitle("t11 fix login"), "t11 fix login");
+});

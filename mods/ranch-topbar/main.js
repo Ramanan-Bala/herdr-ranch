@@ -9,7 +9,7 @@ import {
   settings, knownAgents, nextCommand, setShared, home,
 } from "herdr";
 import { AUTONAMES_KEY, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
-import { effectiveStatus } from "./lib/format.js";
+import { effectiveStatus, attentionQueue } from "./lib/format.js";
 
 // The right-panel stack ids this bar can toggle, in layout "panel-body".
 const PANELS = ["session", "files", "changes", "settings"];
@@ -46,10 +46,41 @@ export default class RanchTopbar extends View {
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
-        const m = /^panel:(session|files|changes|settings)$/.exec(c);
-        if (m) this.togglePanel(m[1]);
+        if (c === "attention:next") this.attentionNext();
+        else if (c === "launch") this.launch();
+        else {
+          const m = /^panel:(session|files|changes|settings)$/.exec(c);
+          if (m) this.togglePanel(m[1]);
+        }
         cx.notify();
       }
+    });
+  }
+
+  // Jump to the next tab that needs the person: the entry after the active one
+  // in the queue (wrapping), or the queue's first entry. Never a no-op when
+  // there's a queue: the active tab may be settling, so falling back to q[0].
+  attentionTarget(q, spaceList) {
+    if (!q.length) return null;
+    const activeTab = spaceList.find(p => p.active)?.tabs.find(c => c.active);
+    const i = q.findIndex(e => e.tabId === activeTab?.id);
+    return i === -1 ? q[0] : q[(i + 1) % q.length];
+  }
+
+  attentionNext() {
+    const spaceList = spaces();
+    const next = this.attentionTarget(attentionQueue(spaceList, shared("ranch.activity") ?? {}, Date.now()), spaceList);
+    if (!next) return;
+    if (next.spaceId !== spaceList.find(p => p.active)?.id) run("space.select", { id: next.spaceId });
+    run("tab.select", { id: next.tabId });
+  }
+
+  // The Start agent dialog (ranch-launch), scoped to the active space.
+  launch() {
+    const activeSpace = spaces().find(p => p.active);
+    openOverlay({
+      mod: "ranch-launch", kind: "dialog", width: 520, height: 256,
+      props: { space: activeSpace?.id },
     });
   }
 
@@ -134,6 +165,34 @@ export default class RanchTopbar extends View {
       }
       return launch(`launch-${key}`, icon, `New ${name} tab`, () => run("tab.new", space ? { space: space.id, argv: agent.run } : { argv: agent.run }));
     });
+
+    // Attention pill: tabs that need the person right now (see attentionNext).
+    // "⌘⌥J"-style suffix for tooltips, per platform.
+    const keySuffix = (letter) => w?.platform === "macos" ? `(⌘⌥${letter})` : `(Ctrl+Alt+${letter})`;
+    const queue = attentionQueue(spaces(), shared("ranch.activity") ?? {}, Date.now());
+    const blockedCount = queue.filter(e => e.status === "blocked").length;
+    const doneCount = queue.length - blockedCount;
+    const attentionPill = queue.length ? (() => {
+      // The tooltip names the tab a click would actually go to.
+      const entry = this.attentionTarget(queue, spaces());
+      const entrySpace = spaces().find(p => p.id === entry.spaceId);
+      const entryTab = entrySpace?.tabs.find(c => c.id === entry.tabId);
+      const entryPanes = panes().filter(p => p.tab === entry.tabId);
+      const entryProgram = (entryPanes.find(p => p.program?.agent) ?? entryPanes.find(p => p.focused) ?? entryPanes[0])?.program;
+      const unnamed = entryTab && (/^tb\d+$/.test(entryTab.name) || (!entryTab.named && /^\d+$/.test(entryTab.name)));
+      const name = unnamed ? entryProgram?.name ?? "Terminal" : entryTab?.name ?? "?";
+      return div().id("attention-pill").h(24).px(8).gap(6).flex_none().flex().items_center().rounded(6)
+        .bg(t.raised).border(1).border_color(t.border).text_size(11.5).text_color(t.muted)
+        .hover(s => s.bg(t.hover))
+        .on_mouse_down("left", stop).on_click(() => this.attentionNext())
+        .tooltip(`Next: ${entrySpace?.name ?? "?"} / ${name} ${keySuffix("J")}`)
+        .child(blockedCount
+          ? div().id("attention-dot").size(6).rounded_full().bg(t.blocked).flex_none().loop("opacity", { from: 0.35, to: 1, period: 1200 })
+          : div().id("attention-dot").size(6).rounded_full().bg(t.done).flex_none())
+        .child(div().max_w(180).truncate().child(blockedCount
+          ? doneCount ? `${blockedCount} needs you · ${doneCount} done` : `${blockedCount} needs you`
+          : `${doneCount} done`));
+    })() : null;
 
     // Group 2: right-panel toggles, icon only, one panel at a time; the open one hides it.
     const panelButton = (id, label, icon) => {
@@ -227,12 +286,15 @@ export default class RanchTopbar extends View {
         ...(left ? [left] : []),
         button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })),
         h_flex().id("spacer").flex_1().min_w(0),
+        ...(attentionPill ? [attentionPill] : []),
+        launch("launch-sparkle", svg("mods/ranch-topbar/sparkle.svg").size(14),
+          `Start agent with a task ${keySuffix("N")}`, () => this.launch()),
         ...launchers,
         div().id("panel-divider").w(1).h(18).flex_none().mx(6).bg(t.border),
-        panelButton("session", "Session details", "mods/ranch-topbar/session.svg"),
-        panelButton("files", "Files", "mods/ranch-files/file.svg"),
-        panelButton("changes", "Changes", "mods/ranch-changes/changes.svg"),
-        panelButton("settings", "Ranch settings", "mods/ranch-topbar/settings.svg"),
+        panelButton("session", `Session details ${keySuffix("1")}`, "mods/ranch-topbar/session.svg"),
+        panelButton("files", `Files ${keySuffix("2")}`, "mods/ranch-files/file.svg"),
+        panelButton("changes", `Changes ${keySuffix("3")}`, "mods/ranch-changes/changes.svg"),
+        panelButton("settings", `Ranch settings ${keySuffix("4")}`, "mods/ranch-topbar/settings.svg"),
         ...w?.buttons ? [
           button("minimize", w.platform === "windows" ? svg("mods/ranch-topbar/win-min.svg").size(16) : "−", () => run("window.minimize")),
           button("maximize", w.platform === "windows" ? svg(`mods/ranch-topbar/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")),

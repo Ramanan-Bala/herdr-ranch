@@ -3,6 +3,9 @@
 // copied alone into ~/.config/opencode/plugins/, so it must not import ../lib:
 // it inlines a minimal store read/normalise/atomic-write. It runs inside the
 // OpenCode process and only ever writes the store file — nothing else.
+// One file, both hosts: OpenCode 2.x schema-validates the default export as
+// an object ({ id, setup, server }) and calls setup(ctx); v1 calls server(),
+// which returns the classic hooks object.
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -66,6 +69,10 @@ function normalizeStore(raw, terminal) {
         title_source: raw.session.title_source === "user" ? "user" : raw.session.title ? "agent" : null,
         first_prompt: typeof raw.session.first_prompt === "string" ? raw.session.first_prompt : null,
         state: raw.session.state === "ended" ? "ended" : "running",
+        // Keep the recorded activity: dropping it here erased it on every later event.
+        ...(raw.session.activity && typeof raw.session.activity.state === "string" && typeof raw.session.activity.at === "number"
+          ? { activity: { state: raw.session.activity.state, at: raw.session.activity.at } }
+          : {}),
       }
     : null;
   return {
@@ -96,11 +103,6 @@ function saveStore(path, store) {
 }
 
 /**
- * Pure reducer for OpenCode events (and the "chat.message" hook, expressed as
- * { type: "chat.message", properties: { sessionID, text } }). Returns the next
- * store, or the same store when the event changes nothing.
- */
-/**
  * Activity for an OpenCode event, for the main session only:
  * busy/retry -> working, idle -> done, permission asked -> blocked,
  * permission replied -> working. Null when the event says nothing.
@@ -127,6 +129,11 @@ export function opencodeActivity(store, event) {
   }
 }
 
+/**
+ * Pure reducer for OpenCode events (and the "chat.message" hook, expressed as
+ * { type: "chat.message", properties: { sessionID, text } }). Returns the next
+ * store, or the same store when the event changes nothing.
+ */
 export function reduceOpencode(store, event) {
   const next = reduceOpencodeCore(store, event);
   const state = opencodeActivity(next ?? store, event);
@@ -249,6 +256,134 @@ function reduceOpencodeCore(store, event) {
 // the system prompt of every request so the model sees it each turn.
 const TASK_RULE = "Task reporting is mandatory (Ranch): for EVERY user message, before anything else record the work as tasks with the todowrite tool (at least one task per message, one per step when there are several), mark each in_progress when you start it and completed the moment it is done, and complete all of them before you end your reply.";
 
+// ---- OpenCode 2.x -----------------------------------------------------------
+// v2's bus-event payload shapes are undocumented, so every read is defensive
+// and anything unusable is dropped rather than thrown.
+
+/** The event's payload: documented as .properties, seen as .data or bare. */
+function pickRaw(event) {
+  if (!event || typeof event !== "object") return {};
+  if (event.properties && typeof event.properties === "object") return event.properties;
+  if (event.data && typeof event.data === "object") return event.data;
+  return event;
+}
+
+function pickInfo(raw) {
+  return [raw.info, raw.session].find((v) => v && typeof v === "object") ?? {};
+}
+
+function pickSessionID(event) {
+  const raw = pickRaw(event);
+  const info = pickInfo(raw);
+  for (const id of [raw.sessionID, info.id, info.sessionID]) {
+    if (typeof id === "string" && id) return id;
+  }
+  return null;
+}
+
+function pickParentID(event) {
+  const raw = pickRaw(event);
+  const info = pickInfo(raw);
+  for (const id of [info.parentID, raw.parentID]) {
+    if (typeof id === "string" && id) return id;
+  }
+  return null;
+}
+
+/**
+ * Adopts the first session seen as the main session, so tasks are not dropped
+ * when session.created was missed (or does not exist, as on v2). Sub-agent
+ * sessions (with a parentID) never become the main session.
+ */
+function adoptSession(store, event) {
+  if (!store || store.session?.id) return store;
+  const id = pickSessionID(event);
+  if (!id || pickParentID(event)) return store;
+  const session = { id: null, title: null, title_source: null, first_prompt: null, state: "running", ...(store.session ?? {}), id };
+  return { ...store, session };
+}
+
+/** One store read → reduce → conditional atomic write, shared by both hosts. */
+function recordEvent(event) {
+  try {
+    const path = storePath();
+    if (!path) return;
+    const loaded = loadStore(path);
+    const adopted = adoptSession(loaded, event);
+    const next = reduceOpencode(adopted, event);
+    if (next !== adopted || adopted !== loaded) saveStore(path, next);
+  } catch {
+    // Never break the host: task reporting fails silently.
+  }
+}
+
+/**
+ * Maps a v2 bus event onto the v1 event shapes reduceOpencode already
+ * understands. Returns null when the event says nothing worth recording.
+ */
+function normalizeV2(event) {
+  const type = typeof event?.type === "string" ? event.type
+    : typeof event?.name === "string" ? event.name : null;
+  if (!type) return null;
+  const raw = pickRaw(event);
+  const sid = pickSessionID(event);
+  switch (type) {
+    case "session.created":
+    case "session.updated": {
+      const info = pickInfo(raw);
+      const id = typeof info.id === "string" && info.id ? info.id : sid;
+      if (!id) return null;
+      const mapped = { id };
+      if (typeof info.parentID === "string" && info.parentID) mapped.parentID = info.parentID;
+      if (typeof info.title === "string" && info.title) mapped.title = info.title;
+      return { type, properties: { info: mapped } };
+    }
+    case "session.renamed": {
+      // v2.2: { data: { sessionID, title } } — OpenCode's own session title.
+      const title = typeof raw.title === "string" ? raw.title.trim() : "";
+      if (!sid || !title) return null;
+      return { type: "session.updated", properties: { info: { id: sid, title } } };
+    }
+    case "session.deleted": {
+      const info = pickInfo(raw);
+      const id = typeof info.id === "string" && info.id ? info.id : sid;
+      if (!id) return null;
+      return { type, properties: { info: { id } } };
+    }
+    case "session.execution.started":
+      return { type: "session.status", properties: { sessionID: sid, status: { type: "busy" } } };
+    case "session.execution.succeeded":
+    case "session.execution.failed":
+    case "session.execution.interrupted":
+      return { type: "session.idle", properties: { sessionID: sid } };
+    case "permission.asked":
+    case "permission.replied":
+    case "session.idle":
+      return { type, properties: { sessionID: sid } };
+    case "session.status":
+      return { type, properties: { sessionID: sid, status: raw.status } };
+    default:
+      return null;
+  }
+}
+
+/** Prompt text from a v2 prompt hook event: .prompt or text parts. */
+function pickPromptText(event) {
+  const raw = pickRaw(event);
+  if (typeof raw.prompt === "string" && raw.prompt.trim()) return raw.prompt;
+  // v2.2: the prompt hook carries { prompt: { text, files, ... } }.
+  if (typeof raw.prompt?.text === "string" && raw.prompt.text.trim()) return raw.prompt.text;
+  const parts = Array.isArray(raw.parts) ? raw.parts
+    : raw.message && typeof raw.message === "object" && Array.isArray(raw.message.parts)
+      ? raw.message.parts
+      : [];
+  return parts
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+}
+
+
 export const RanchTasks = async () => ({
   "experimental.chat.system.transform": async (_input, output) => {
     try {
@@ -292,4 +427,103 @@ export const RanchTasks = async () => ({
   },
 });
 
-export default RanchTasks;
+/** Hook registration returns a promise on v2: swallow its rejection. */
+function quiet(result) {
+  if (result && typeof result.catch === "function") result.catch(() => {});
+  return result;
+}
+
+/** Sync callback wrapper: a failing hook must never break OpenCode. */
+function safeCall(fn) {
+  return (...args) => {
+    try {
+      return fn(...args);
+    } catch {
+      // Task reporting fails silently.
+    }
+  };
+}
+
+/**
+ * Ranch task reporting for OpenCode 1.x and 2.x. A plain object, because the
+ * 2.x loader schema-validates `default` as an object ({ id, setup, server });
+ * v2 calls setup(ctx), v1 (>= 1.18.29) calls server().
+ */
+const RanchTasksPlugin = {
+  id: "ranch-tasks",
+
+  async setup(ctx) {
+    const controller = new AbortController();
+    try {
+      // Tool results: todowrite replaces the task list. The todo tool carries
+      // its session id on the event; a sub-agent's todowrite is dropped by the
+      // reducer once the main session is known.
+      quiet(ctx?.tool?.hook?.("execute.after", safeCall((event) => {
+        if (event?.tool !== "todowrite") return;
+        const todos = event?.input && typeof event.input === "object" ? event.input.todos : null;
+        if (!Array.isArray(todos)) return;
+        recordEvent({
+          type: "todo.updated",
+          properties: {
+            sessionID: typeof event.sessionID === "string" ? event.sessionID : null,
+            todos,
+          },
+        });
+      })));
+
+      // Prompts: the first user message names the session.
+      quiet(ctx?.session?.hook?.("prompt", safeCall((event) => {
+        const text = pickPromptText(event);
+        if (!text) return;
+        const raw = pickRaw(event);
+        const sid = typeof event.sessionID === "string" && event.sessionID
+          ? event.sessionID
+          : typeof raw.sessionID === "string" ? raw.sessionID : null;
+        recordEvent({ type: "chat.message", properties: { sessionID: sid, text } });
+      })));
+
+      // System prompt: the mandatory task rule, exactly once. v2 system parts
+      // are objects ({ type: "text", text }), never bare strings.
+      quiet(ctx?.session?.hook?.("context", safeCall((event) => {
+        if (!Array.isArray(event?.system)) return;
+        const has = event.system.some((part) => part === TASK_RULE || part?.text === TASK_RULE);
+        if (!has) event.system.push({ type: "text", text: TASK_RULE });
+      })));
+
+      // Bus events: session lifecycle and activity, mapped onto v1 shapes.
+      void (async () => {
+        try {
+          for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+            try {
+              const mapped = normalizeV2(event);
+              if (mapped) recordEvent(mapped);
+            } catch {
+              // Task reporting fails silently.
+            }
+          }
+        } catch {
+          // Aborted or the bus went away; nothing to record.
+        }
+      })();
+    } catch {
+      // Task reporting fails silently.
+    }
+    return () => {
+      try {
+        controller.abort();
+      } catch {
+        // Task reporting fails silently.
+      }
+    };
+  },
+
+  async server() {
+    try {
+      return await RanchTasks({});
+    } catch {
+      return {};
+    }
+  },
+};
+
+export default RanchTasksPlugin;

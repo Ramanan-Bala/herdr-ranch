@@ -1,7 +1,7 @@
 // Pure helpers for the Ranch session panel (requirements.md §6).
 // Imports only ./lib/* so Node tests can run it without Herdr.
 
-import { statusRank, STATUS_LABEL } from "./lib/format.js";
+import { statusRank, STATUS_LABEL, effectiveStatus } from "./lib/format.js";
 
 /** Agent apps whose task store Ranch reads (requirements.md §7.4). */
 export const TASK_AGENTS = new Set(["claude-code", "claude", "codex", "opencode"]);
@@ -37,7 +37,8 @@ export function pickAgent(agentsInTab, rememberedAddress) {
 export function herdrSubStatus(t) {
   const s = String(t?.status ?? "").toLowerCase();
   if (s === "error") return "blocked";
-  if (s === "done") return "idle";
+  // "done" is an agent's own report (hc ls / terminals() use the same words as
+  // Herdr's status order), so it stays "done", not idle.
   if (s === "running") return "working";
   return STATUS_LABEL[s] ? s : null;
 }
@@ -59,10 +60,23 @@ export function unfinishedCount(tasks) {
   return (tasks ?? []).filter((t) => t.status === "pending" || t.status === "in_progress").length;
 }
 
-/** The panel title subtitle: "2 of 6 done", or "Nothing tracked" with no tasks. */
+/** The panel title subtitle: "2 of 6 done", or null with no tasks (quieter header). */
 export function subtitle(totals) {
-  if (!totals || !totals.total) return "Nothing tracked";
+  if (!totals || !totals.total) return null;
   return `${totals.done} of ${totals.total} done`;
+}
+
+/**
+ * A sub-agent's status from the activity its adapter recorded in the store
+ * (store.session.activity = { state, at }), same rule as effectiveStatus():
+ * a "working" older than ACTIVITY_STALE_MS reads as idle (a missed Stop event).
+ * @param {{state?: string, at?: number}|null|undefined} activity
+ * @param {number} now ms since the epoch
+ * @returns {string|null} null when nothing is recorded.
+ */
+export function activityStatus(activity, now) {
+  if (!activity?.state) return null;
+  return effectiveStatus(null, activity, now).status;
 }
 
 /**

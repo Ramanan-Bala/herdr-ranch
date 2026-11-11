@@ -365,3 +365,17 @@ test("runGh falls back through candidate paths", async () => {
   const none = await runGh(async () => { throw new Error("x"); }, []);
   assert.equal(none.missing, true);
 });
+
+test("parsePr lists who approved from latestReviews", async () => {
+  const { parsePr } = await import("../lib/git.js");
+  const pr = parsePr({
+    number: 7, state: "OPEN",
+    latestReviews: [
+      { author: { login: "ana" }, state: "APPROVED" },
+      { author: { login: "bo" }, state: "CHANGES_REQUESTED" },
+      { author: { login: "ana" }, state: "APPROVED" },
+    ],
+  });
+  assert.deepEqual(pr.approvedBy, ["ana"]);
+  assert.deepEqual(parsePr({ number: 8, state: "OPEN" }).approvedBy, []);
+});

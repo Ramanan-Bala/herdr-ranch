@@ -21,7 +21,9 @@ export const ACTIVITY_KEY = "ranch.activity";
 
 /** A pane in `tabId` running an agent program, shaped like an agents() entry. */
 function paneAgent(panesAll, tabId) {
-  const p = panesAll.find((x) => x.tab === tabId && x.terminal && (x.app || x.program?.agent));
+  // The running program wins: a pane whose agent exited back to a shell keeps
+  // a stale `app`, and must not be named "<shell> · <repo>".
+  const p = panesAll.find((x) => x.tab === tabId && x.terminal && (x.program ? x.program.agent : x.app));
   return p ? { address: p.terminal, pane: p.pane, tab: tabId, app: p.app, program: p.program, status: p.status } : null;
 }
 
@@ -209,6 +211,16 @@ export class TabNamer {
         setShared(AUTONAMES_KEY, rest);
       }
     } else if (action.action === "rename") {
+      // A record from before a title became generic (e.g. a bare "t11"
+      // terminal address) must not be restored: drop it and stay unnamed.
+      if (!cleanTitle(action.name)) {
+        const current = shared(AUTONAMES_KEY) ?? {};
+        if (tab.id in current) {
+          const { [tab.id]: _gone, ...rest } = current;
+          setShared(AUTONAMES_KEY, rest);
+        }
+        return;
+      }
       this.applyRename(space, tab, { name: action.name, source: record?.source ?? "agent_auto" }, null);
     }
   }
@@ -252,6 +264,11 @@ export class TabNamer {
     }
     const title = this.modelTitles.get(sid);
     return title ? { name: title, source: candidate.source } : candidate;
+  }
+
+  /** Render-time access: the last loaded store for an agent, no I/O. */
+  cachedStore(address) {
+    return this.stores.get(address)?.store ?? null;
   }
 
   async loadStore(address, machine) {

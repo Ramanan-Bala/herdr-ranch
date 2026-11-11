@@ -11,6 +11,7 @@ import {
   diffSummary,
   relativeTime,
   folderLabel,
+  attentionQueue,
 } from "../lib/format.js";
 
 const MIN = 60_000;
@@ -119,6 +120,43 @@ test("folderLabel", () => {
   assert.equal(folderLabel("/home/me/projects/ranch/", "/home/me"), "ranch");
   assert.equal(folderLabel("C:\\Users\\me\\ranch\\", "C:\\Users\\me"), "ranch");
   assert.equal(folderLabel("ranch", "/home/me"), "ranch");
+});
+
+test("attentionQueue", () => {
+  const now = 1_000_000;
+  const mk = (id, tab) => ({ id, tabs: Array.isArray(tab) ? tab : [tab] });
+  // Empty input.
+  assert.deepEqual(attentionQueue([], null, now), []);
+  assert.deepEqual(attentionQueue([mk("s1", { id: "t1" })], null, now), []);
+  // Blocked before done, longest wait (largest since) first.
+  const q = attentionQueue(
+    [
+      mk("s1", [
+        { id: "t-working", status: "working", working_since: now - 5 * MIN },
+        { id: "t-blocked-old", status: "blocked", changed_at: now - 9 * MIN },
+        { id: "t-blocked-new", status: "blocked", changed_at: now - 2 * MIN },
+        { id: "t-done", status: "done", changed_at: now - 4 * MIN },
+        { id: "t-settled", status: "blocked", changed_at: now, settled: true },
+        { id: "t-idle", status: "idle" },
+      ]),
+      mk("s2", { id: "t-hook", changed_at: null }),
+    ],
+    { "t-hook": { state: "done", at: now - MIN } },
+    now,
+  );
+  assert.deepEqual(
+    q.map(e => e.tabId),
+    ["t-blocked-old", "t-blocked-new", "t-done", "t-hook"],
+  );
+  assert.deepEqual(q[0], { tabId: "t-blocked-old", spaceId: "s1", status: "blocked", since: 9 * MIN });
+  assert.equal(q[3].status, "done");
+  // Unknown since (no timestamp) sorts last within its status group.
+  const q2 = attentionQueue(
+    [mk("s1", [{ id: "a", status: "done", changed_at: null }, { id: "b", status: "done", changed_at: now }])],
+    null,
+    now,
+  );
+  assert.deepEqual(q2.map(e => e.tabId), ["b", "a"]);
 });
 
 test("effectiveStatus prefers Herdr, falls back to hook activity", async () => {
