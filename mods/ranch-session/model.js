@@ -220,3 +220,28 @@ export function subDuration(started_at, ended_at, now) {
   if (Number.isNaN(end)) return null;
   return Math.max(0, end - start);
 }
+
+/** PR state -> colour token (t.<token>) for the icon and pill, or null. */
+export function prStateToken(state) {
+  return { open: "ansi2", draft: "dim", merged: "ansi5", closed: "blocked" }[state] ?? null;
+}
+
+/** PR state -> pill label ("Open", "Draft", …), or null. */
+export function prStateLabel(state) {
+  return { open: "Open", draft: "Draft", merged: "Merged", closed: "Closed" }[state] ?? null;
+}
+
+/**
+ * A PR URL -> "owner/repo" (the path's first two segments), for the fallback
+ * row text while the title is unknown, or null when it can't be parsed.
+ * @param {string} url
+ * @returns {string|null}
+ */
+export function prRepoText(url) {
+  try {
+    const parts = new URL(url).pathname.split("/").filter(Boolean);
+    return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : null;
+  } catch {
+    return null;
+  }
+}

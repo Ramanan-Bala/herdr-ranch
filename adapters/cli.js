@@ -6,9 +6,11 @@
 //   status [--json]                   what's installed where
 //   gc                                delete store files for dead terminals
 import { readFileSync, statSync } from "node:fs";
-import { hookError, updateStore } from "./store.js";
+import { execFileSync } from "node:child_process";
+import { hookError, recordSharedPr, updateStore } from "./store.js";
 import { applyClaude } from "./claude.js";
 import { applyCodex } from "./codex.js";
+import { detectCreatedPr } from "../lib/prs.js";
 import { gcStores, install, statusSummary, uninstall } from "./install.js";
 import { reminderFor } from "./instructions.js";
 import { doctor } from "./doctor.js";
@@ -65,9 +67,48 @@ function runHook(agent, apply) {
       const text = reminderFor(key, payload.hook_event_name, next);
       if (text) process.stdout.write(text + "\n");
     }
+    // Shared PR registry, after the store update: same payload, best effort.
+    recordSharedPrFromPayload(payload);
   } catch (err) {
     hookError(err);
   }
+}
+
+/**
+ * Repo facts of a `gh pr create` run: its top-level dir and current branch,
+ * resolved in the payload's cwd (else the hook's cwd). execFileSync with a
+ * short timeout; stderr ignored, output never printed. Null when the cwd is
+ * not a checkout or HEAD is detached.
+ */
+function repoFacts(cwd) {
+  const dir = typeof cwd === "string" && cwd ? cwd : process.cwd();
+  const git = (args) => {
+    try {
+      return execFileSync("git", args, {
+        cwd: dir, timeout: 2000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      return null;
+    }
+  };
+  const top = git(["rev-parse", "--show-toplevel"]);
+  if (!top) return null; // not a checkout
+  const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]);
+  return branch && branch !== "HEAD" ? { top, branch } : null;
+}
+
+/**
+ * Shares a created PR in ~/.herdr/ranch/prs.json (keyed repoTop|branch), so
+ * every terminal on that checkout lists it — not just this one's store (I4).
+ * Best effort: any failure is one hookError line, nothing on stdout.
+ */
+function recordSharedPrFromPayload(payload) {
+  if (payload?.hook_event_name !== "PostToolUse") return;
+  const found = detectCreatedPr(payload);
+  if (!found) return;
+  const facts = repoFacts(payload.cwd);
+  if (!facts) return;
+  recordSharedPr(facts.top, facts.branch, { ...found, at: new Date().toISOString() });
 }
 
 function parseArgs(rest) {

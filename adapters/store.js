@@ -10,6 +10,7 @@ import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, renameSyn
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { STORE_VERSION, agentApp, emptyStore, parseStore, storeFileName } from "../lib/tasks.js";
+import { PRS_FILE, addPr, parsePrRegistry } from "../lib/prs.js";
 
 // Mirrors lib/settings.js TASKS_DIR; lib/settings.js is not copied to the
 // installed layout, so the adapters keep their own copy of the path.
@@ -187,6 +188,29 @@ function takeLock(path) {
     }
   }
   return null;
+}
+
+/**
+ * Adds one PR record to the shared registry (~/.herdr/ranch/prs.json, keyed
+ * repoTop|branch) under the registry lock, with the same atomic write as the
+ * stores. Throws on a busy lock: the caller logs and nothing is written
+ * rather than written without the lock (same rule as updateStore, I9).
+ */
+export function recordSharedPr(top, branch, record) {
+  const path = join(homeDir(), PRS_FILE);
+  const release = takeLock(path);
+  if (!release) throw new Error(`prs lock busy: ${path}`);
+  try {
+    let text = null;
+    try {
+      text = readFileSync(path, "utf8");
+    } catch {
+      // missing or unreadable: start an empty registry
+    }
+    writeStore(path, addPr(parsePrRegistry(text), top, branch, record));
+  } finally {
+    release();
+  }
 }
 
 /**

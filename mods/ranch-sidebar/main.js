@@ -6,12 +6,13 @@ import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import {
   spaces, machines, agents, panes, setAgentOrder, exec, watchFolder, run,
-  openOverlay, theme, shared, setShared, nextCommand, window, home,
+  openOverlay, theme, shared, setShared, nextCommand, window, home, readTextFile,
 } from "herdr";
 import { buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials, diffSquares } from "./model.js";
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent } from "./lib/format.js";
 import { repoSummary, parsePr, createTtlCache, runGh, PR_JSON_FIELDS } from "./lib/git.js";
 import { SETTINGS_KEY, FILTER_KEY, resolveSettings } from "./lib/settings.js";
+import { PRS_FILE, parsePrRegistry, prsFor } from "./lib/prs.js";
 import { progress } from "./lib/tasks.js";
 import { TabNamer, ACTIVITY_KEY } from "./namer.js";
 
@@ -50,6 +51,13 @@ export default class RanchSidebar extends View {
     this.prPumping = false;
     this.prBusy = new Set();
     this.healthAt = 0;
+    // Recorded PRs (shared registry, …): `~/.herdr/ranch/prs.json` read per
+    // machine (cached, refreshed on the sweep tick), plus the per-machine
+    // home dirs the read needs on a remote machine.
+    this.homes = new Map(); // machine (null excepted) -> home dir
+    this.prRegistries = new Map(); // machineKey -> { parsed, at }
+    this.prRegistryBusy = new Set();
+    this.pendingRegistries = new Map(); // machineKey -> machine, drained off-render
 
     // Smart tab names (requirements §8): agent session -> tab name, one way.
     this.namer = new TabNamer();
@@ -174,7 +182,7 @@ export default class RanchSidebar extends View {
     try {
       const r = await runGh(
         (bin, args) => exec(bin, args, { cwd: job.cwd, on: job.machine, timeout: 15_000 }),
-        ["pr", "view", job.branch, "--json", PR_JSON_FIELDS],
+        ["pr", "view", job.ref ?? job.branch, "--json", PR_JSON_FIELDS],
       ).catch(() => ({ code: 127, stderr: "", missing: true }));
       let pr = null;
       let health = null;
@@ -199,7 +207,73 @@ export default class RanchSidebar extends View {
     setShared("ranch.health.gh", state);
   }
 
-  // Pump pending repos and PRs. Runs on a timer: render() only enqueues.
+  // ---- recorded PRs (shared registry) ----
+
+  /** Home dir on a machine: home() locally; asked once per remote machine. */
+  async homeFor(machine) {
+    if (!machine) return home();
+    if (this.homes.has(machine)) return this.homes.get(machine);
+    let out = null;
+    try {
+      const r = await exec("sh", ["-c", 'printf %s "$HOME"'], { on: machine });
+      if (r.code === 0) out = r.stdout.trim() || null;
+    } catch {}
+    if (out) this.homes.set(machine, out); // failures retry on the next tick
+    return out;
+  }
+
+  /** One registry read per machine (cached in prRegistries, best effort). */
+  async refreshRegistry(machine, cx) {
+    const mk = machine ?? "";
+    if (this.prRegistryBusy.has(mk)) return;
+    this.prRegistryBusy.add(mk);
+    try {
+      const homeDir = await this.homeFor(machine);
+      let parsed = null;
+      if (homeDir) {
+        try {
+          const text = await readTextFile(`${homeDir}/${PRS_FILE}`, { on: machine });
+          parsed = parsePrRegistry(text);
+        } catch {}
+      }
+      this.prRegistries.set(mk, { parsed, at: Date.now() });
+    } finally {
+      this.prRegistryBusy.delete(mk);
+    }
+    cx.notify();
+  }
+
+  /**
+   * The checkout's recorded PRs (registry records + cached gh state),
+   * filtered like the branch badge shows them: open/draft always, merged or
+   * closed only when updated in the last 24 h. Missing lookups are enqueued
+   * (prCache keyed by url); the branch PR itself never duplicates a badge.
+   */
+  recordedResolved(registry, machine, top, branch, cwd, active, now, jobs, jobKeys, branchPr) {
+    if (!top || !branch) return [];
+    const out = [];
+    for (const r of prsFor(registry, top, branch)) {
+      if (!r?.url) continue;
+      if (branchPr && (branchPr.number === r.number || branchPr.url === r.url)) continue;
+      let parsed = this.prCache.get(r.url, now);
+      if (parsed === undefined && !this.prBusy.has(r.url) && !jobKeys.has(r.url)) {
+        jobKeys.add(r.url);
+        jobs.push({ key: r.url, ref: r.url, machine, cwd, top, branch, active });
+        parsed = null;
+      }
+      if (!parsed) continue;
+      if (parsed.state === "open" || parsed.state === "draft") {
+        out.push(parsed);
+      } else if ((parsed.state === "merged" || parsed.state === "closed")
+        && parsed.updatedAt && now - parsed.updatedAt <= 24 * 60 * 60 * 1000) {
+        out.push(parsed);
+      }
+    }
+    return out;
+  }
+
+  // Pump pending repos, registries and PRs. Runs on a timer: render() only
+  // enqueues.
   drain(cx) {
     const pending = this.pendingRepos;
     if (pending.size) {
@@ -207,6 +281,15 @@ export default class RanchSidebar extends View {
       for (const job of pending.values()) {
         cx.spawn(async (cx) => {
           await this.refreshRepo(job.machine, job.cwd, cx);
+        });
+      }
+    }
+    if (this.pendingRegistries.size) {
+      const regs = this.pendingRegistries;
+      this.pendingRegistries = new Map();
+      for (const [mk, machine] of regs) {
+        cx.spawn(async (cx) => {
+          await this.refreshRegistry(machine, cx);
         });
       }
     }
@@ -483,6 +566,8 @@ export default class RanchSidebar extends View {
         .child(div().flex_none().text_size(10).text_color(t.ansi2).child(`+${stat.add}`))
         .when(stat.del > 0, (el) => el.child(div().flex_none().text_size(10).text_color(t.ansi1).child(`\u2212${stat.del}`))))
       .when(Boolean(this.settings.card.pr && wt.pr), (e) => e.child(this.prBadge(`pr-wt-${foldKey}`, wt.pr)))
+      .when(Boolean(this.settings.card.pr && wt.recorded?.length), (e) => e.child(
+        h_flex().flex_none().gap(3).children(this.recordedBadges(`rec-wt-${foldKey}`, wt.recorded))))
       .when(this.hoveredSpace === foldKey, (e) => e.child(this.plusBtn(wt.space, foldKey)).child(this.sparkBtn(wt.space, foldKey)))
       .when(folded && Boolean(wt.status), (e) => e.child(this.ring(wt.status, 9)))
       .when(folded && wt.blocked > 0, (e) => e.child(div().flex_none().text_size(10).text_color(t.blocked).child("Needs you")))
@@ -529,6 +614,16 @@ export default class RanchSidebar extends View {
       .child(div().flex_none().text_size(11).text_color(t.dim).child(String(count)))
       .child(div().flex_none().size(16).flex().items_center().justify_center()
         .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(10).flex_none().text_color(t.dim)));
+  }
+
+  /** Recorded-PR badges (drawn after the branch PR badge): at most 2, then a
+   * dim "+N". */
+  recordedBadges(prefix, recs) {
+    const els = recs.slice(0, 2).map((pr, i) => this.prBadge(`${prefix}-${i}`, pr));
+    if (recs.length > 2) {
+      els.push(div().flex_none().text_size(10).text_color(theme().dim).child(`+${recs.length - 2}`));
+    }
+    return els;
   }
 
   /** The PR link badge (git-compare icon + "#N"), coloured by PR state. */
@@ -637,6 +732,10 @@ export default class RanchSidebar extends View {
       }
       if (this.settings.card.pr && c.pr) {
         parts3.push(this.prBadge(`pr-${c.tabId}`, c.pr));
+      }
+      // Recorded PRs the agent opened (…), after the branch PR badge.
+      if (this.settings.card.pr && c.recorded?.length) {
+        parts3.push(h_flex().flex_none().gap(3).children(this.recordedBadges(`rec-${c.tabId}`, c.recorded)));
       }
     }
     // Line 3 renders only when there is something to show (diff stats, PR);
@@ -803,6 +902,14 @@ export default class RanchSidebar extends View {
     // Herdr's status first; else what Ranch's own hooks recorded for the tab.
     const activity = shared(ACTIVITY_KEY) ?? {};
     const tabs = new Map(spaces().flatMap((sp) => sp.tabs.map((tb) => [tb.id, tb])));
+    // The shared registry is read per machine, cached, refreshed on this tick
+    // (sweep cadence); drain() does the actual reads.
+    const wantRegistry = (machine) => {
+      const mk = machine ?? "";
+      const hit = this.prRegistries.get(mk);
+      if (!hit || now - hit.at >= 5000) this.pendingRegistries.set(mk, machine);
+      return hit?.parsed ?? null;
+    };
     const walk = (cards, settled) => {
       for (const c of cards) {
         const eff = effectiveStatus(tabs.get(c.tabId), activity[c.tabId], now);
@@ -826,6 +933,7 @@ export default class RanchSidebar extends View {
         // Settled tabs too: the PR badge now lives on the space/worktree row.
         if (s.card.line3 && s.card.pr && c.top && c.summary && !c.summary.detached) {
           const branch = c.branch ?? c.summary.branch;
+          // The branch's own PR: never looked up on the default branch.
           if (branch && branch !== c.summary.default) {
             const pk = `${c.machine ?? ""}|${c.top}|${branch}`;
             const cached = this.prCache.get(pk, now);
@@ -834,6 +942,13 @@ export default class RanchSidebar extends View {
               jobKeys.add(pk);
               jobs.push({ key: pk, machine: c.machine, top: c.top, branch, cwd: c.cwd, active: c.spaceActive });
             }
+          }
+          // PRs an agent opened from this repo top + branch (shared registry),
+          // on any branch including the default one: resolved by url through
+          // prCache, drawn after the branch badge, never duplicating it.
+          if (branch) {
+            c.recorded = this.recordedResolved(wantRegistry(c.machine), c.machine,
+              c.top, branch, c.cwd, c.spaceActive, now, jobs, jobKeys, c.pr ?? null);
           }
         }
       }
@@ -849,6 +964,13 @@ export default class RanchSidebar extends View {
         // the first card's git summary and the first matching PR.
         sp.checkout = all.find((c) => c.summary)?.summary ?? null;
         sp.pr = all.find((c) => c.pr && c.top === sp.checkout?.top)?.pr ?? null;
+        // The checkout row (worktreeRow) shows its recorded PRs too (…).
+        if (s.card.line3 && s.card.pr && sp.checkout?.top && sp.checkout.branch && !sp.checkout.detached) {
+          const pk = `${g.machine ?? ""}|${sp.checkout.top}|${sp.checkout.branch}`;
+          const branchPr = sp.pr ?? this.prCache.get(pk, now) ?? null;
+          sp.recorded = this.recordedResolved(wantRegistry(g.machine), g.machine,
+            sp.checkout.top, sp.checkout.branch, sp.cards[0]?.cwd ?? null, sp.active, now, jobs, jobKeys, branchPr);
+        }
         this.checkoutBySpace.set(sp.space, sp.checkout);
       }
       g.blocked = g.spaces.reduce((n, sp) => n + sp.blocked, 0);

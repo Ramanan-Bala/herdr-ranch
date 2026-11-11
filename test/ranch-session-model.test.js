@@ -25,6 +25,9 @@ const {
   subDuration,
   herdrSubStatus,
   activityStatus,
+  prStateToken,
+  prStateLabel,
+  prRepoText,
 } = await import(join(root, "mods/ranch-session/model.js"));
 const { ACTIVITY_STALE_MS } = await import(join(root, "mods/ranch-session/lib/format.js"));
 
@@ -192,4 +195,27 @@ test("taskEmptyState points at /hooks when Codex hooks need approval", () => {
   const missing = { ok: false, reason: "missing" };
   assert.deepEqual(taskEmptyState(missing, "codex", "needs approval"), { text: "Approve the Ranch hooks with /hooks in Codex." });
   assert.equal(taskEmptyState(missing, "codex", "missing").setup, true);
+});
+
+test("prStateToken and prStateLabel map GitHub's states", () => {
+  assert.equal(prStateToken("open"), "ansi2");
+  assert.equal(prStateToken("draft"), "dim");
+  assert.equal(prStateToken("merged"), "ansi5");
+  assert.equal(prStateToken("closed"), "blocked");
+  assert.equal(prStateToken("weird"), null);
+  assert.equal(prStateToken(null), null);
+  assert.equal(prStateLabel("open"), "Open");
+  assert.equal(prStateLabel("draft"), "Draft");
+  assert.equal(prStateLabel("merged"), "Merged");
+  assert.equal(prStateLabel("closed"), "Closed");
+  assert.equal(prStateLabel("weird"), null);
+});
+
+test("prRepoText pulls owner/repo out of a PR URL", () => {
+  assert.equal(prRepoText("https://github.com/owner/repo/pull/1285"), "owner/repo");
+  assert.equal(prRepoText("https://github.com/owner/repo/pull/1285/"), "owner/repo");
+  assert.equal(prRepoText("https://git.sr.ht/~owner/repo/pulls/3"), "~owner/repo");
+  assert.equal(prRepoText("https://github.com/only"), null);
+  assert.equal(prRepoText("not a url"), null);
+  assert.equal(prRepoText(null), null);
 });
