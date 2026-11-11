@@ -33,7 +33,14 @@ import {
   PR_JSON_FIELDS,
 } from "./lib/git.js";
 import { TASKS_DIR, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
-import { parseStore, orderTasks, progress, storeFileName } from "./lib/tasks.js";
+import {
+  listLifecycle,
+  listVisible,
+  parseStore,
+  orderTasks,
+  progress,
+  storeCandidates,
+} from "./lib/tasks.js";
 import { tasksCommand, looksWindows } from "./lib/tasks-command.js";
 import {
   pickAgent,
@@ -64,6 +71,11 @@ const tasksCmd = (dir, args, machine) =>
 // This computer is Windows (fixes doc F14: "This PC").
 const isWin = () => appWindow()?.platform === "windows";
 
+// Store files gc'd once per app start per machine (fixes F5): the mod runs
+// `ranch-tasks gc` in the background; install also gc's. Module-level so
+// re-instantiating the view mid-session does not repeat the sweep.
+const gcDone = new Set(); // machine key ("", machine name)
+
 /** Friendly name for a detected editor CLI, for tooltips. */
 const EDITOR_NAMES = { cursor: "Cursor", code: "VS Code", zed: "Zed", subl: "Sublime Text" };
 
@@ -76,11 +88,12 @@ export default class RanchSession extends View {
   init(_props, cx) {
     this.remembered = new Map(); // tabId -> chosen agent address
     this.homes = new Map(); // machine (null excepted) -> its home dir
-    this.tasks = { key: null, parsed: null, read: false };
+    this.tasks = { key: null, parsed: null, read: false, startedAt: null };
     this.tasksBusy = false;
     this.tasksPending = false;
     this.tasksWatchGen = 0;
-    this.subTasks = new Map(); // sub address -> { parsed, read, at, busy }
+    this.terminals = new Map(); // "addr@machine" -> { state, startedAt, at, busy }
+    this.subTasks = new Map(); // sub address -> { parsed, read, at, busy, due }
     this.git = { key: null, summary: null, details: null, top: null, busy: false, dirty: true, at: 0, readyKey: null };
     this.gitWatchGen = 0;
     this.pr = { key: null, parsed: null, busy: false, dirty: true, at: 0, failed: false, error: null };
@@ -105,6 +118,8 @@ export default class RanchSession extends View {
     });
     this.watchTasks(cx);
     this.pump(cx);
+    // Sweep stale store files once per app start (fixes F5).
+    this.gcTasks(null, cx);
   }
 
   // ---- session ----------------------------------------------------------
@@ -190,9 +205,41 @@ export default class RanchSession extends View {
           continue;
         }
         if (this.tasksWatchGen !== gen) return;
+        // Debounce: adapters write pointer + session file back to back.
+        await cx.sleep(150);
+        if (this.tasksWatchGen !== gen) return;
         this.loadTasks(cx);
       }
     });
+  }
+
+  /**
+   * Reads one agent's store file through the schema-2 layout (fixes 3.3):
+   * terminals/<address>.json (possibly a pointer) → sessions/<session>.json,
+   * falling back to the legacy flat <address>.json. Returns { parsed, text }.
+   */
+  async readStoreText(machine, homeDir, address) {
+    const [terminal, legacy] = storeCandidates(address);
+    if (!homeDir || !terminal) return { parsed: { ok: false, reason: "missing" }, text: null };
+    try {
+      const text = await readTextFile(`${homeDir}/${TASKS_DIR}/${terminal}`, { on: machine });
+      if (text != null) {
+        const [session] = storeCandidates(address, text);
+        if (session) {
+          try {
+            const sessionText = await readTextFile(`${homeDir}/${TASKS_DIR}/${session}`, { on: machine });
+            if (sessionText != null) return { parsed: parseStore(sessionText), text: sessionText };
+          } catch {}
+          return { parsed: { ok: false, reason: "missing" }, text: null };
+        }
+        return { parsed: parseStore(text), text };
+      }
+      // No terminal file: try the legacy flat store.
+      const legacyText = await readTextFile(`${homeDir}/${TASKS_DIR}/${legacy}`, { on: machine });
+      return { parsed: parseStore(legacyText), text: legacyText };
+    } catch {
+      return { parsed: { ok: false, reason: "missing" }, text: null };
+    }
   }
 
   /** Reads the chosen agent's store file (one read in flight). */
@@ -212,22 +259,18 @@ export default class RanchSession extends View {
       }
       const key = `${agent.address}@${s.machine ?? ""}`;
       const homeDir = await this.homeFor(s.machine);
-      const name = storeFileName(agent.address);
-      let parsed = { ok: false, reason: "missing" };
-      if (homeDir && name) {
-        try {
-          const text = await readTextFile(`${homeDir}/${TASKS_DIR}/${name}`, { on: s.machine });
-          parsed = parseStore(text);
-        } catch {}
-      }
+      const { parsed } = await this.readStoreText(s.machine, homeDir, agent.address);
       // Stale read (I2): the focused agent changed while the file was read.
       const now = this.session();
       if (now.chosen?.address !== agent.address || (now.machine ?? null) !== (s.machine ?? null)) return;
       if (this.tasks.key !== key) this.filesOpen = false;
       this.tasks = { key, parsed, read: true };
+      // The terminal's own start time, for the identity check (fixes F4).
+      this.terminalInfo(key, agent.address, s.machine, cx);
       cx.notify();
       this.publishTaskCount(s);
       this.loadSubTasks(s, cx);
+      return;
     } finally {
       this.tasksBusy = false;
       if (this.tasksPending) {
@@ -235,6 +278,64 @@ export default class RanchSession extends View {
         this.loadTasks(cx);
       }
     }
+  }
+
+  /**
+   * Terminal identity info (fixes F4): state and start time from
+   * `hc get --json`, cached for a minute per address@machine; seeded from the
+   * terminals() snapshot so the first render already knows liveness.
+   */
+  terminalInfo(key, addr, machine, cx) {
+    if (!this.terminals) this.terminals = new Map();
+    let info = this.terminals.get(key);
+    if (!info) {
+      info = { state: terminals().find((k) => k.address === addr)?.state ?? null, startedAt: null, at: 0, busy: false };
+      this.terminals.set(key, info);
+    }
+    if (info.busy || Date.now() - info.at < 60000) return info;
+    info.busy = true;
+    cx?.spawn(async (cx) => {
+      let state = info.state;
+      let startedAt = info.startedAt;
+      try {
+        const r = await exec("hc", ["get", "--json", addr], { on: machine, timeout: 5000 });
+        if (r.code === 0) {
+          const raw = JSON.parse(r.stdout);
+          state = typeof raw?.state === "string" ? raw.state : state;
+          if (typeof raw?.created_ms === "number" && raw.created_ms > 0) startedAt = raw.created_ms;
+        }
+      } catch {}
+      info.state = state;
+      info.startedAt = startedAt;
+      info.at = Date.now();
+      info.busy = false;
+      cx.notify();
+    });
+    return info;
+  }
+
+  /** The F4 identity triple for one agent's terminal: { state, app, startedAt }. */
+  liveFor(agent, machine) {
+    if (!agent) return null;
+    const key = `${agent.address}@${machine ?? ""}`;
+    const info = this.terminals?.get(key)
+      ?? { state: terminals().find((k) => k.address === agent.address)?.state ?? null, startedAt: null };
+    return { state: info.state, app: adapterKey(agent.app), startedAt: info.startedAt };
+  }
+
+  /** Sweep stale store files on this machine (or a remote one), once per start. */
+  gcTasks(machine, cx) {
+    const key = machine ?? "";
+    if (gcDone.has(key)) return;
+    gcDone.add(key);
+    cx.spawn(async (cx) => {
+      try {
+        const dir = await this.homeFor(machine);
+        if (dir) await exec(...tasksCmd(dir, ["gc"], machine), { on: machine, timeout: 30000 });
+      } catch {
+        gcDone.delete(key); // binary may not be installed yet; retry later
+      }
+    });
   }
 
   /** Terminals the chosen agent started (its Herdr sub-agents). */
@@ -257,7 +358,8 @@ export default class RanchSession extends View {
 
   /**
    * Reads each Herdr sub-agent's store file the same way as the main one,
-   * at most every 3 s per address; feeds its Tasks card and the totals.
+   * at most every 3 s per address with a trailing-edge read so the last
+   * change in a burst is not dropped; feeds its Tasks card and the totals.
    */
   async loadSubTasks(s, cx) {
     const subs = this.subTerminals(s);
@@ -266,20 +368,25 @@ export default class RanchSession extends View {
     const homeDir = await this.homeFor(s.machine);
     const now = Date.now();
     for (const k of subs) {
-      const entry = this.subTasks.get(k.address) ?? { parsed: null, read: false, at: 0, busy: false };
+      const entry = this.subTasks.get(k.address) ?? { parsed: null, read: false, at: 0, busy: false, due: false };
       this.subTasks.set(k.address, entry);
-      if (entry.busy || now - entry.at < 3000) continue;
+      if (entry.busy || now - entry.at < 3000) {
+        // Trailing edge: schedule one more read after the throttle window.
+        if (!entry.due) {
+          entry.due = true;
+          cx.timer.after(3000 - (now - entry.at) + 50, (cx) => {
+            const e = this.subTasks.get(k.address);
+            if (e) e.due = false;
+            this.loadSubTasks(this.session(), cx);
+          });
+        }
+        continue;
+      }
       entry.busy = true;
+      entry.due = false;
       entry.at = now;
       cx.spawn(async (cx) => {
-        const name = storeFileName(k.address);
-        let parsed = { ok: false, reason: "missing" };
-        if (homeDir && name) {
-          try {
-            const text = await readTextFile(`${homeDir}/${TASKS_DIR}/${name}`, { on: s.machine });
-            parsed = parseStore(text);
-          } catch {}
-        }
+        const { parsed } = await this.readStoreText(s.machine, homeDir, k.address);
         const e = this.subTasks.get(k.address);
         if (e) {
           e.parsed = parsed;
@@ -293,13 +400,17 @@ export default class RanchSession extends View {
     }
   }
 
-  /** The main agent's and each sub-agent's task list (only parsed stores). */
+  /** The main agent's and each sub-agent's task list (only visible stores). */
   taskLists(s) {
     const lists = [];
-    if (this.tasks.parsed?.ok) lists.push(this.tasks.parsed.store.tasks);
+    if (this.tasks.parsed?.ok && listVisible(this.tasks.parsed, this.liveFor(s.chosen, s.machine))) {
+      lists.push(this.tasks.parsed.store.tasks);
+    }
     for (const k of this.subTerminals(s)) {
       const entry = this.subTasks.get(k.address);
-      if (entry?.parsed?.ok) lists.push(entry.parsed.store.tasks);
+      if (entry?.parsed?.ok && listVisible(entry.parsed, this.liveFor(k, s.machine))) {
+        lists.push(entry.parsed.store.tasks);
+      }
     }
     return lists;
   }
@@ -527,6 +638,12 @@ export default class RanchSession extends View {
     // Only needed while the store is missing (to offer Set up), once a minute.
     if (s.chosen && this.tasks.parsed && !this.tasks.parsed.ok && this.tasks.parsed.reason === "missing") {
       this.maybeCheckAdapters(s.machine, cx);
+    }
+    // Keep the terminal's identity info (fixes F4) fresh, and gc remote
+    // machines' stale store files once per app start (fixes F5).
+    if (s.chosen) {
+      this.terminalInfo(`${s.chosen.address}@${s.machine ?? ""}`, s.chosen.address, s.machine, cx);
+      if (s.machine) this.gcTasks(s.machine, cx);
     }
     // The tasks folder is only watched locally; poll a remote machine's store.
     if (s.machine != null && s.chosen && now - (this.tasksReadAt ?? 0) >= 5000) {
@@ -1330,7 +1447,11 @@ export default class RanchSession extends View {
 
   subsCard(t, s) {
     const herdrSubs = terminals().filter((k) => k.parent === s.chosen.address && k.state === "live");
-    const storeSubs = this.tasks.parsed?.ok ? this.tasks.parsed.store.subagents : [];
+    // Nesting (fixes 3.6): a store sub-agent that belongs to one of the
+    // Herdr sub terminals shows in that terminal's card, not twice here.
+    const nested = new Set(herdrSubs.map((k) => k.address));
+    const storeSubs = (this.tasks.parsed?.ok ? this.tasks.parsed.store.subagents : [])
+      .filter((sub) => !sub.parent_terminal || !nested.has(sub.parent_terminal));
     if (!herdrSubs.length && !storeSubs.length) return null;
     const card = this.cardShell(t);
     // Header counts from the display status (subStatus), not the raw word.
@@ -1430,6 +1551,11 @@ export default class RanchSession extends View {
     head.child(div().flex_1().min_w(0));
     const status = isMain ? s.chosen.status : this.subAgentStatus(sub);
     if (status) head.child(this.pill(t, stateWord(status), status));
+    // "no task updates" badge (fixes F13): the agent kept working but the
+    // list stopped changing.
+    if (parsed?.ok && parsed.store.missed_turns > 0) {
+      head.child(this.pill(t, "no task updates", "blocked"));
+    }
     head.child(
       h_flex()
         .id(`tasks-fold-${addr}`)
@@ -1454,6 +1580,13 @@ export default class RanchSession extends View {
       return card;
     }
 
+    // Identity check (fixes F4): show the list only when the terminal is
+    // still live and its start time matches the store's.
+    if (parsed?.ok && !listVisible(parsed, this.liveFor(isMain ? s.chosen : sub, s.machine))) {
+      if (isMain) card.child(div().text_size(12).text_color(t.muted).child("No tasks for this terminal."));
+      return isMain ? card : null;
+    }
+
     if (isMain) {
       // Empty and setup states live in the main agent's card.
       const adapters = this.adapterState(s);
@@ -1469,6 +1602,14 @@ export default class RanchSession extends View {
     } else if (!parsed.store.tasks.length) {
       // A sub-agent with a parsed store but no plan still gets its card.
       card.child(div().text_size(12).text_color(t.muted).child("No plan yet."));
+      return card;
+    }
+
+    // Lifecycle (fixes 3.5): fade out stale done lists, flag idle-with-work.
+    const lc = listLifecycle(parsed.store, status, Date.now());
+    if (lc.hide) {
+      if (!isMain) return null;
+      card.child(div().text_size(12).text_color(t.muted).child("No recent activity."));
       return card;
     }
 
@@ -1489,6 +1630,19 @@ export default class RanchSession extends View {
           )
         )
     );
+    // Freshness (fixes 3.6): "updated N ago", greyed out when stale.
+    const age = Date.now() - Date.parse(parsed.store.updated_at);
+    if (Number.isFinite(age) && age >= 0) {
+      card.child(
+        div()
+          .text_size(10.5)
+          .text_color(lc.fresh ? t.muted : t.dim)
+          .child(`Updated ${relativeTime(age)}`)
+      );
+    }
+    if (lc.flag) {
+      card.child(div().text_size(10.5).text_color(t.muted).child("Agent stopped while working on this"));
+    }
     // Cancelled tasks render struck through, after the live ones.
     const cancelled = tasks.filter((x) => x.status === "cancelled");
     for (const task of [...orderTasks(this.liveTasks(tasks)), ...cancelled]) card.child(this.taskRow(t, task, addr));

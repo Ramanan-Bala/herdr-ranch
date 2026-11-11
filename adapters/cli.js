@@ -5,30 +5,16 @@
 //   uninstall [--yes]                 take them back out
 //   status [--json]                   what's installed where
 //   gc                                delete store files for dead terminals
-import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
-import { homeDir, updateStore } from "./store.js";
+import { readFileSync, statSync } from "node:fs";
+import { hookError, updateStore } from "./store.js";
 import { applyClaude } from "./claude.js";
 import { applyCodex } from "./codex.js";
 import { gcStores, install, statusSummary, uninstall } from "./install.js";
 import { reminderFor } from "./instructions.js";
+import { doctor } from "./doctor.js";
 
 const TRANSCRIPT_EVENTS = new Set(["UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"]);
 const MAX_TRANSCRIPT = 20 * 1024 * 1024;
-
-/**
- * One line per error to ~/.herdr/ranch/logs/errors.log — never to stdout,
- * which the agent would read as context.
- */
-function hookError(err) {
-  try {
-    const dir = join(homeDir(), ".herdr", "ranch", "logs");
-    mkdirSync(dir, { recursive: true });
-    appendFileSync(join(dir, "errors.log"), `${new Date().toISOString()} ${err?.stack ?? String(err)}\n`);
-  } catch {
-    // out of options; stay silent
-  }
-}
 
 /** Transcript JSONL, only when it exists and is under 20 MB. */
 function readTranscript(path) {
@@ -44,7 +30,7 @@ function readTranscript(path) {
 
 /**
  * Hook entry point. Everything is wrapped: on any error we log one line to
- * errors.log and exit 0 with no output. Printing here would inject text into
+ * logs/adapter.log and exit 0 with no output. Printing here would inject text into
  * the agent (Claude/Codex read hook stdout as context).
  */
 function runHook(agent, apply) {
@@ -90,6 +76,7 @@ function parseArgs(rest) {
     const arg = rest[i];
     if (arg === "--yes") flags.yes = true;
     else if (arg === "--json") flags.json = true;
+    else if (arg === "--no-instructions") flags.noInstructions = true;
     else if (arg === "--agents") flags.agents = (rest[++i] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   }
   return flags;
@@ -102,7 +89,7 @@ function humanStatus(summary) {
 }
 
 const USAGE =
-  "usage: ranch-tasks <claude|codex|install [--yes] [--agents claude,codex,opencode]|uninstall [--yes]|status [--json]|gc>";
+  "usage: ranch-tasks <claude|codex|doctor [--json]|install [--yes] [--no-instructions] [--agents claude,codex,opencode]|uninstall [--yes]|status [--json]|gc>";
 
 export async function main(argv) {
   const [command = "", ...rest] = argv ?? [];
@@ -132,6 +119,20 @@ export async function main(argv) {
     console.log(`ranch-tasks gc: removed ${removed.length} store file${removed.length === 1 ? "" : "s"}`);
     return;
   }
+  if (command === "doctor") {
+    const report = await doctor();
+    console.log(parseArgs(rest).json ? JSON.stringify(report, null, 2) : humanDoctor(report));
+    if (!report.ok) process.exitCode = 1;
+    return;
+  }
   console.error(USAGE);
   process.exitCode = 1;
+}
+
+function humanDoctor(report) {
+  const lines = [report.ok ? "ranch-tasks doctor: ok" : "ranch-tasks doctor: problems found"];
+  for (const check of report.checks) {
+    lines.push(`${check.ok ? "ok  " : "FAIL"}  ${check.name}${check.detail ? ` — ${check.detail}` : ""}`);
+  }
+  return lines.join("\n");
 }

@@ -10,6 +10,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
+import { STALE } from "../lib/tasks.js";
 
 const AGENTS = ["claude", "codex", "opencode"];
 import { rulesFor, blockFor, CLAUDE_IMPORT, withBlock, stripBlock } from "./instructions.js";
@@ -582,7 +583,8 @@ function selectAgents(opts) {
   return AGENTS.filter((a) => requested.includes(a));
 }
 
-function plan(agents, platform = process.platform) {
+function plan(agents, opts = {}) {
+  const platform = opts.platform ?? process.platform;
   const home = homeDir();
   const items = [
     { path: join(home, ".herdr", "ranch", "bin", "ranch-tasks"), action: "copy (mode 755)" },
@@ -598,7 +600,9 @@ function plan(agents, platform = process.platform) {
     items.push({ path: join(home, ".config", "opencode", "plugins", "ranch-tasks.js"), action: "copy plugin" });
     items.push({ path: opencodeConfigFile(), action: "enable experimental todo tool" });
   }
-  for (const f of instructionFiles(agents)) items.push({ path: f.path, action: f.planAction });
+  if (!opts.noInstructions) {
+    for (const f of instructionFiles(agents)) items.push({ path: f.path, action: f.planAction });
+  }
   return items;
 }
 
@@ -680,7 +684,7 @@ function printResults(results, backups) {
 export async function install(opts = {}) {
   const agents = selectAgents(opts);
   const platform = opts.platform ?? process.platform;
-  const items = plan(agents, platform);
+  const items = plan(agents, opts);
   if (!opts.yes) {
     printPlan(items);
     const ok = await confirm("Proceed? [y/N] ");
@@ -706,7 +710,7 @@ export async function install(opts = {}) {
   }
   if (agents.includes("opencode")) installOpencode(results, backups);
   if (agents.includes("codex")) pruneCodexTrust(results, backups);
-  installInstructions(agents, results, backups);
+  if (!opts.noInstructions) installInstructions(agents, results, backups);
   printResults(results, backups);
   if (platform === "win32") {
     // Windows has no shebang support; PATH is the person's to edit.
@@ -714,6 +718,13 @@ export async function install(opts = {}) {
   }
   if (agents.includes("codex") && codexChanged) {
     console.log("Codex: approve the new hooks once with /hooks in Codex (it asks you to trust new hooks).");
+  }
+  // Housekeeping (fixes §3.5/F5): prune dead stores right after installing.
+  try {
+    const removed = gcStores();
+    if (removed.length) console.log(`gc: removed ${removed.length} store file${removed.length === 1 ? "" : "s"}`);
+  } catch {
+    // gc is best effort.
   }
 }
 
@@ -853,7 +864,7 @@ export function statusSummary(platform = process.platform) {
     : codexBase;
   return {
     node: true,
-    version: 1,
+    version: 2,
     agents: {
       claude: hookStatus(join(home, ".claude", "settings.json")),
       codex,
@@ -1007,57 +1018,85 @@ function pruneCodexTrust(results, backups) {
 
 /**
  * Deletes store files for terminals that no longer exist (via `hc ls --json
- * --all`, 5 s timeout) or that are older than 7 days. Without a working `hc`,
- * only the 7-day rule applies. Also removes `*.json.tmp-*` leftovers older
- * than a minute (I8). Returns the removed file names.
+ * --all`, 5 s timeout): a gone terminal is cleaned after 2 minutes, a finished
+ * one once its store has been idle that long; session files untouched for
+ * 14 days are pruned (fixes §3.5). Without a working `hc`, only the 14-day
+ * rule applies. Reads both the session-keyed layout (terminals/, sessions/)
+ * and legacy flat stores, and removes `*.json.tmp-*` leftovers older than a
+ * minute in each (I8). Returns the removed file paths.
  */
 export function gcStores() {
   const dir = join(homeDir(), ".herdr", "ranch", "tasks");
-  let live = null;
+  const pruneCutoff = Date.now() - STALE.PRUNE_MS;
+  const goneCutoff = Date.now() - STALE.GONE_MS;
+  let states = null; // terminal address -> state, when hc works
   try {
     const out = execFileSync("hc", ["ls", "--json", "--all"], { timeout: 5000, encoding: "utf8" });
     const data = JSON.parse(out);
     const terminals = Array.isArray(data?.terminals) ? data.terminals : [];
-    live = new Set(terminals.filter((t) => t?.address && t.state !== "finished").map((t) => t.address));
+    states = new Map(terminals.filter((t) => t?.address).map((t) => [t.address, t.state]));
   } catch {
-    live = null;
+    states = null;
   }
-  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
   const removed = [];
-  let files = [];
-  try {
-    files = readdirSync(dir);
-  } catch {
-    return removed;
-  }
-  for (const name of files) {
-    // Leftover temp files from a crashed write (I8): drop after a minute.
-    if (/\.json\.tmp-/.test(name)) {
-      try {
-        if (statSync(join(dir, name)).mtimeMs < Date.now() - 60 * 1000) {
-          unlinkSync(join(dir, name));
-          removed.push(name);
-        }
-      } catch {}
-      continue;
-    }
-    if (!name.endsWith(".json")) continue;
-    const path = join(dir, name);
-    let old = false;
+  const sweep = (subdir, kind) => {
+    let names = [];
+    const sub = join(dir, subdir);
     try {
-      old = statSync(path).mtimeMs < cutoff;
+      names = readdirSync(sub);
     } catch {
-      continue;
+      return;
     }
-    const dead = live !== null && !live.has(name.slice(0, -".json".length));
-    if (dead || old) {
+    for (const name of names) {
+      // Leftover temp files from a crashed write (I8): drop after a minute.
+      if (/\.json\.tmp-/.test(name)) {
+        try {
+          if (statSync(join(sub, name)).mtimeMs < Date.now() - 60 * 1000) {
+            unlinkSync(join(sub, name));
+            removed.push(subdir ? `${subdir}/${name}` : name);
+          }
+        } catch {}
+        continue;
+      }
+      if (!name.endsWith(".json")) continue;
+      const path = join(sub, name);
+      let old = false;
       try {
-        unlinkSync(path);
-        removed.push(name);
+        old = statSync(path).mtimeMs < pruneCutoff;
       } catch {
-        // leave it; the next gc can try again
+        continue;
+      }
+      let dead = false;
+      if (kind === "session") {
+        dead = old; // 14-day prune
+      } else {
+        const address = name.slice(0, -".json".length);
+        const state = states?.get(address);
+        if (states !== null && state === undefined) dead = statMtime(path) < goneCutoff; // terminal gone
+        else if (state === "finished") dead = statMtime(path) < goneCutoff; // finished for over 2 min
+        else if (kind === "legacy") dead = old || existsSync(join(dir, "terminals", name)); // migrated or stale
+        else dead = old;
+      }
+      if (dead) {
+        try {
+          unlinkSync(path);
+          removed.push(subdir ? `${subdir}/${name}` : name);
+        } catch {
+          // leave it; the next gc can try again
+        }
       }
     }
-  }
+  };
+  sweep("terminals", "terminal");
+  sweep("sessions", "session");
+  sweep("", "legacy");
   return removed;
+}
+
+function statMtime(path) {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return 0;
+  }
 }

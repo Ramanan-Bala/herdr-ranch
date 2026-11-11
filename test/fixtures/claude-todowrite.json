@@ -1,0 +1,11 @@
+{
+  "hook_event_name": "PostToolUse",
+  "tool_name": "TodoWrite",
+  "tool_input": {
+    "todos": [
+      { "content": "Read the spec", "status": "completed", "activeForm": "reading the spec" },
+      { "content": "Implement the fix", "status": "in_progress", "activeForm": "implementing the fix" },
+      { "content": "Write the tests", "status": "pending", "activeForm": "writing the tests" }
+    ]
+  }
+}

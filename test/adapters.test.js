@@ -9,7 +9,7 @@ import { emptyStore, parseStore } from "../lib/tasks.js";
 import { applyClaude } from "../adapters/claude.js";
 import { applyCodex } from "../adapters/codex.js";
 import opencodePlugin, { RanchTasks, reduceOpencode } from "../adapters/opencode-plugin.js";
-import { storePath, updateStore } from "../adapters/store.js";
+import { terminalPath, updateStore } from "../adapters/store.js";
 import { enableOpencodeTodo, install, statusSummary, uninstall } from "../adapters/install.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -498,11 +498,16 @@ test("opencode plugin writes the store from events and chat.message", async () =
     await plugin.event({
       event: { type: "todo.updated", properties: { sessionID: "s1", todos: [{ id: "1", content: "a", status: "in_progress" }] } },
     });
-    const file = join(home, ".herdr", "ranch", "tasks", "top.json");
+    // Session-keyed layout (fixes 3.3): a terminal pointer plus the store.
+    const pointer = join(home, ".herdr", "ranch", "tasks", "terminals", "top.json");
+    const file = join(home, ".herdr", "ranch", "tasks", "sessions", "s1.json");
+    assert.equal(JSON.parse(readFileSync(pointer, "utf8")).session, "s1");
     let disk = parseStore(readFileSync(file, "utf8"));
     assert.equal(disk.ok, true);
     assert.equal(disk.store.tasks[0].title, "a");
     assert.ok(disk.store.updated_at);
+    assert.deepEqual(disk.store.agent, { app: "opencode", session: "s1", pid: process.pid });
+    assert.ok(disk.store.seq >= 1);
 
     await plugin["chat.message"](
       { sessionID: "s1" },
@@ -510,9 +515,42 @@ test("opencode plugin writes the store from events and chat.message", async () =
     );
     disk = parseStore(readFileSync(file, "utf8"));
     assert.equal(disk.store.session.first_prompt, "hello world");
+    // Every prompt starts a new turn for missed-turn detection (fixes 3.7).
+    assert.equal(disk.store.session.turn.tools, false);
   } finally {
     delete process.env.RANCH_HOME;
     delete process.env.HC_TERMINAL_ID;
+  }
+});
+
+test("opencode plugin adopts legacy stores only for the same agent and session", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "unused", HOME: home });
+  const cases = [
+    ["oc-matching", "opencode", "s1", "s1", true],
+    ["oc-legacy-without-session", "opencode", null, "s2", true],
+    ["oc-other-agent", "claude", "s3", "s3", false],
+    ["oc-other-session", "opencode", "old", "s4", false],
+  ];
+  for (const [terminal, legacyAgent, legacySession, incomingSession, adopt] of cases) {
+    process.env.HC_TERMINAL_ID = terminal;
+    const dir = join(home, ".herdr", "ranch", "tasks");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${terminal}.json`), JSON.stringify({
+      version: 1,
+      agent: legacyAgent,
+      session: legacySession ? { id: legacySession } : null,
+      tasks: [{ id: "1", title: "legacy", status: "pending" }],
+    }));
+    const plugin = await RanchTasks({});
+    await plugin["chat.message"](
+      { sessionID: incomingSession },
+      { parts: [{ type: "text", text: "fresh" }] },
+    );
+    const disk = parseStore(readFileSync(join(dir, "sessions", `${incomingSession}.json`), "utf8"));
+    assert.equal(disk.ok, true, terminal);
+    assert.deepEqual(disk.store.tasks.map((task) => task.title), adopt ? ["legacy"] : [], terminal);
+    assert.equal(disk.store.session.first_prompt, "fresh", terminal);
   }
 });
 
@@ -596,7 +634,8 @@ test("opencode 2.x setup registers hooks and records todowrite + prompt", async 
       ],
     },
   });
-  const file = join(home, ".herdr", "ranch", "tasks", "t99.json");
+  const file = join(home, ".herdr", "ranch", "tasks", "sessions", "s1.json");
+  assert.equal(JSON.parse(readFileSync(join(home, ".herdr", "ranch", "tasks", "terminals", "t99.json"), "utf8")).session, "s1");
   const disk = parseStore(readFileSync(file, "utf8"));
   assert.equal(disk.ok, true);
   assert.deepEqual(disk.store.tasks.map((task) => [task.id, task.status]), [
@@ -622,7 +661,7 @@ test("opencode 2.x bus events drive session activity", async (t) => {
   withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t99" });
   const { ctx, hooks } = fakeV2Ctx();
   const cleanup = await opencodePlugin.setup(ctx);
-  const file = join(home, ".herdr", "ranch", "tasks", "t99.json");
+  const file = join(home, ".herdr", "ranch", "tasks", "sessions", "s1.json");
 
   ctx.emit({ type: "session.execution.started", properties: { sessionID: "s1" } });
   await flush();
@@ -641,7 +680,8 @@ test("opencode 2.x bus events drive session activity", async (t) => {
 });
 
 test("opencode 2.x context hook adds the task rule exactly once", async (t) => {
-  withEnv(t, { RANCH_HOME: tempHome(), HC_TERMINAL_ID: "t99" });
+  // HOME points at a bare temp dir so no installer AGENTS.md block exists.
+  withEnv(t, { RANCH_HOME: tempHome(), HC_TERMINAL_ID: "t99", HOME: tempHome() });
   const { ctx, hooks } = fakeV2Ctx();
   await opencodePlugin.setup(ctx);
   const out = { system: [{ type: "text", text: "base" }] };
@@ -650,6 +690,26 @@ test("opencode 2.x context hook adds the task rule exactly once", async (t) => {
   assert.equal(out.system.length, 2);
   assert.equal(out.system[1].type, "text");
   assert.match(out.system[1].text, /mandatory/);
+});
+
+test("opencode skips its rule when the installer block is in AGENTS.md (fixes F13)", async (t) => {
+  const home = tempHome();
+  mkdirSync(join(home, ".config", "opencode"), { recursive: true });
+  writeFileSync(
+    join(home, ".config", "opencode", "AGENTS.md"),
+    "# rules\n\n<!-- ranch-tasks:begin -->\nranch block\n<!-- ranch-tasks:end -->\n",
+  );
+  withEnv(t, { RANCH_HOME: tempHome(), HC_TERMINAL_ID: "t99", HOME: home });
+  const { ctx, hooks } = fakeV2Ctx();
+  await opencodePlugin.setup(ctx);
+  const out = { system: [{ type: "text", text: "base" }] };
+  await hooks.session.context(out);
+  assert.equal(out.system.length, 1);
+  // Same for the v1 host.
+  const v1 = await RanchTasks({});
+  const system = ["base"];
+  await v1["experimental.chat.system.transform"]({}, { system });
+  assert.deepEqual(system, ["base"]);
 });
 
 test("opencode 2.x hooks survive garbage input", async (t) => {
@@ -676,23 +736,29 @@ test("updateStore writes atomically under RANCH_HOME", () => {
   process.env.RANCH_HOME = home;
   process.env.HC_TERMINAL_ID = "t9";
   try {
-    const path = storePath(home, "t9");
-    assert.equal(path, join(home, ".herdr", "ranch", "tasks", "t9.json"));
+    const path = terminalPath(home, "t9");
+    assert.equal(path, join(home, ".herdr", "ranch", "tasks", "terminals", "t9.json"));
 
     updateStore("codex", (store) => applyCodex(store, {
       hook_event_name: "SessionStart", session_id: "s1", source: "startup",
     }));
-    const disk = parseStore(readFileSync(path, "utf8"));
+    // A session id moves the store to sessions/ and leaves a pointer behind.
+    const pointer = JSON.parse(readFileSync(path, "utf8"));
+    assert.equal(pointer.session, "s1");
+    const disk = parseStore(readFileSync(join(home, ".herdr", "ranch", "tasks", "sessions", "s1.json"), "utf8"));
     assert.equal(disk.ok, true);
-    assert.equal(disk.store.agent, "codex");
+    assert.deepEqual(disk.store.agent, { app: "codex", session: "s1", pid: process.pid });
     assert.equal(disk.store.session.id, "s1");
     assert.ok(disk.store.updated_at);
-    assert.deepEqual(
-      readdirSync(join(home, ".herdr", "ranch", "tasks")).filter((f) => f.includes(".tmp-")),
-      [],
-    );
+    assert.ok(disk.store.seq >= 1);
+    for (const sub of ["terminals", "sessions"]) {
+      assert.deepEqual(
+        readdirSync(join(home, ".herdr", "ranch", "tasks", sub)).filter((f) => f.includes(".tmp-")),
+        [],
+      );
+    }
 
-    // corrupt file: start from an empty store
+    // corrupt pointer: start from an empty store
     writeFileSync(path, "{corrupt");
     updateStore("codex", (store) => {
       assert.deepEqual(store, emptyStore("t9", "codex"));
@@ -701,6 +767,49 @@ test("updateStore writes atomically under RANCH_HOME", () => {
   } finally {
     delete process.env.RANCH_HOME;
     delete process.env.HC_TERMINAL_ID;
+  }
+});
+
+test("updateStore looks up terminal start time only when it is missing", (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t-start" });
+  const started = "2026-01-01T00:00:00.000Z";
+  let calls = 0;
+  const lookup = () => {
+    calls += 1;
+    return calls === 1 ? started : "2026-02-01T00:00:00.000Z";
+  };
+  updateStore("codex", (store) => ({ ...store }), lookup);
+  updateStore("codex", (store) => ({ ...store }), lookup);
+  assert.equal(calls, 1, "the stored start time is reused on the second event");
+  const disk = parseStore(readFileSync(terminalPath(home, "t-start"), "utf8"));
+  assert.equal(disk.store.terminal_started_at, started);
+});
+
+test("updateStore adopts legacy stores only for the same agent and session", (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "unused" });
+  const cases = [
+    ["matching", "claude", "s1", "s1", true],
+    ["legacy-without-session", "claude", null, "s2", true],
+    ["other-agent", "codex", "s3", "s3", false],
+    ["other-session", "claude", "old", "s4", false],
+  ];
+  for (const [terminal, legacyAgent, legacySession, incomingSession, adopt] of cases) {
+    process.env.HC_TERMINAL_ID = terminal;
+    const dir = join(home, ".herdr", "ranch", "tasks");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${terminal}.json`), JSON.stringify({
+      version: 1,
+      agent: legacyAgent,
+      session: legacySession ? { id: legacySession } : null,
+      tasks: [{ id: "1", title: "legacy", status: "pending" }],
+    }));
+    const next = updateStore("claude", (store) => ({
+      ...store,
+      session: { id: incomingSession, title: null, title_source: null, first_prompt: null, state: "running" },
+    }));
+    assert.deepEqual(next.tasks.map((task) => task.title), adopt ? ["legacy"] : [], terminal);
   }
 });
 
@@ -727,7 +836,7 @@ test("concurrent Claude TaskCreate hooks keep every task", async () => {
   }));
   const results = await Promise.all(runs);
   for (const result of results) assert.deepEqual(result, { code: 0, stdout: "", stderr: "" });
-  const disk = parseStore(readFileSync(join(home, ".herdr", "ranch", "tasks", "parallel.json"), "utf8"));
+  const disk = parseStore(readFileSync(join(home, ".herdr", "ranch", "tasks", "terminals", "parallel.json"), "utf8"));
   assert.equal(disk.ok, true);
   assert.deepEqual(disk.store.tasks.map((task) => task.id).sort(), ["1", "2", "3", "4", "5", "6", "7", "8"]);
 });
@@ -766,7 +875,7 @@ test("hook subcommands print nothing and exit 0", () => {
   assert.equal(good.status, 0);
   assert.equal(good.stdout, "");
   assert.equal(good.stderr, "");
-  const disk = parseStore(readFileSync(join(home, ".herdr", "ranch", "tasks", "tcli.json"), "utf8"));
+  const disk = parseStore(readFileSync(join(home, ".herdr", "ranch", "tasks", "terminals", "tcli.json"), "utf8"));
   assert.equal(disk.store.tasks[0].title, "X");
 
   // garbage stdin: silent, exit 0, no crash
@@ -983,11 +1092,29 @@ test("mandatory task reporting: hook reminder, instruction files, OpenCode syste
   const env = { ...process.env, RANCH_HOME: home, HC_TERMINAL_ID: "t1" };
   const run = (args, input) => spawnSync(process.execPath, ["bin/ranch-tasks", ...args], { env, input, encoding: "utf8" });
 
-  // Every prompt gets the reminder; other events stay silent.
+  // A prompt still gets the reminder while there is no list; other events
+  // stay silent. Once a list exists and was updated this turn, it goes quiet.
   const prompt = run(["claude"], JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "hi" }));
   assert.match(prompt.stdout, /Ranch \(mandatory\)/);
   assert.equal(run(["claude"], JSON.stringify({ hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: {} })).stdout, "");
   assert.match(run(["codex"], JSON.stringify({ hook_event_name: "SessionStart", source: "startup" })).stdout, /update_plan/);
+  fs.writeFileSync(
+    path.join(home, ".herdr", "ranch", "tasks", "terminals", "t1.json"),
+    JSON.stringify({ version: 2, terminal: "t1", agent: { app: "claude-code", session: null, pid: 1 }, seq: 1, missed_turns: 0, updated_at: "now", tasks: [{ id: "1", title: "X", status: "pending", active_form: null }], subagents: [] }) + "\n",
+  );
+  assert.equal(run(["claude"], JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "hi" }), undefined).stdout, "");
+  // A missed turn brings the nudge back even with a list.
+  fs.writeFileSync(
+    path.join(home, ".herdr", "ranch", "tasks", "terminals", "t1.json"),
+    JSON.stringify({ version: 2, terminal: "t1", agent: { app: "claude-code", session: null, pid: 1 }, seq: 2, missed_turns: 1, updated_at: "now", tasks: [{ id: "1", title: "X", status: "pending", active_form: null }], subagents: [] }) + "\n",
+  );
+  assert.match(run(["claude"], JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "hi" })).stdout, /Ranch \(mandatory\)/);
+  // Silence it again by clearing the missed count.
+  fs.writeFileSync(
+    path.join(home, ".herdr", "ranch", "tasks", "terminals", "t1.json"),
+    JSON.stringify({ version: 2, terminal: "t1", agent: { app: "claude-code", session: null, pid: 1 }, seq: 3, missed_turns: 0, updated_at: "now", tasks: [{ id: "1", title: "X", status: "pending", active_form: null }], subagents: [] }) + "\n",
+  );
+  assert.equal(run(["claude"], JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "hi" })).stdout, "");
 
   // Install adds rules; uninstall restores CLAUDE.md byte for byte and deletes created files.
   fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
@@ -1006,14 +1133,22 @@ test("mandatory task reporting: hook reminder, instruction files, OpenCode syste
   assert.equal(fs.existsSync(path.join(home, ".claude", "RANCH.md")), false);
   assert.equal(fs.existsSync(path.join(home, ".config", "opencode", "AGENTS.md")), false);
 
-  // OpenCode plugin adds the rule to the system prompt once.
-  const { RanchTasks } = await import("../adapters/opencode-plugin.js");
-  const hooks = await RanchTasks({});
-  const out = { system: ["base"] };
-  await hooks["experimental.chat.system.transform"]({}, out);
-  await hooks["experimental.chat.system.transform"]({}, out);
-  assert.equal(out.system.length, 2);
-  assert.match(out.system[1], /mandatory/);
+  // OpenCode plugin adds the rule to the system prompt once — with HOME
+  // redirected so the real AGENTS.md block (if any) is out of the picture.
+  const savedHome = process.env.HOME;
+  process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), "ranch-home-"));
+  try {
+    const { RanchTasks } = await import("../adapters/opencode-plugin.js");
+    const hooks = await RanchTasks({});
+    const out = { system: ["base"] };
+    await hooks["experimental.chat.system.transform"]({}, out);
+    await hooks["experimental.chat.system.transform"]({}, out);
+    assert.equal(out.system.length, 2);
+    assert.match(out.system[1], /mandatory/);
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+  }
 });
 
 test("opencode 2.2 real payloads: prompt.text and session.renamed fill the session", async (t) => {
@@ -1028,7 +1163,7 @@ test("opencode 2.2 real payloads: prompt.text and session.renamed fill the sessi
   await push({ id: "evt_1", type: "session.execution.started", data: { sessionID: sid } });
   await push({ id: "evt_2", type: "session.renamed", data: { sessionID: sid, title: "Login redirect fix" } });
   await flush();
-  const store = JSON.parse(readFileSync(join(home, ".herdr", "ranch", "tasks", "t98.json"), "utf8"));
+  const store = JSON.parse(readFileSync(join(home, ".herdr", "ranch", "tasks", "sessions", `${sid}.json`), "utf8"));
   assert.equal(store.session.id, sid);
   assert.equal(store.session.first_prompt, "Fix the login redirect loop");
   assert.equal(store.session.title, "Login redirect fix");

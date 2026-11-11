@@ -8,7 +8,7 @@ import {
 import {
   decide, exitAction, rememberSession, recallSession, ownership, cleanTitle,
 } from "./lib/naming.js";
-import { parseStore, storeFileName } from "./lib/tasks.js";
+import { listVisible, parseStore, storeCandidates } from "./lib/tasks.js";
 import {
   SETTINGS_KEY, AUTONAMES_KEY, SESSIONS_KEY, TASKS_DIR, resolveSettings,
 } from "./lib/settings.js";
@@ -86,7 +86,7 @@ export class TabNamer {
           // Activity from Ranch's hooks, for tabs where Herdr shows no status.
           const agent = agentsNow.find((a) => a.tab === tab.id) ?? paneAgent(panesNow, tab.id);
           if (agent) {
-            const store = await this.loadStore(agent.address, space.machine);
+            const store = await this.loadStore(agent.address, space.machine, agent.app);
             const act = store?.session?.activity;
             if (act) activity[tab.id] = act;
           }
@@ -116,7 +116,7 @@ export class TabNamer {
     let pane = null;
     if (agent) {
       pane = panesAll.find((p) => p.pane === agent.pane) ?? null;
-      store = await this.loadStore(agent.address, space.machine);
+      store = await this.loadStore(agent.address, space.machine, agent.app);
     }
     const state = store?.session?.state ?? null;
 
@@ -271,18 +271,23 @@ export class TabNamer {
     return this.stores.get(address)?.store ?? null;
   }
 
-  async loadStore(address, machine) {
-    const file = storeFileName(address);
-    if (!file) return null;
+  async loadStore(address, machine, app) {
+    const [terminal, legacy] = storeCandidates(address);
+    if (!terminal) return null;
     const cached = this.stores.get(address);
     if (cached && Date.now() - cached.at < STORE_TTL) return cached.store;
     let store = null;
     try {
       const dir = await this.homeFor(machine);
       if (dir) {
-        const text = await readTextFile(`${dir}/${TASKS_DIR}/${file}`, { on: machine });
+        const terminalText = await readTextFile(`${dir}/${TASKS_DIR}/${terminal}`, { on: machine });
+        const [session] = terminalText == null ? [] : storeCandidates(address, terminalText);
+        const file = session ?? (terminalText == null ? legacy : terminal);
+        const text = terminalText == null || session
+          ? await readTextFile(`${dir}/${TASKS_DIR}/${file}`, { on: machine })
+          : terminalText;
         const parsed = parseStore(text);
-        if (parsed.ok) store = parsed.store;
+        if (listVisible(parsed, { app })) store = parsed.store;
       }
     } catch (err) {
       this.logOnce(err);

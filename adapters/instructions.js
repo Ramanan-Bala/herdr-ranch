@@ -60,16 +60,19 @@ function escape(s) {
 
 /**
  * Hook reminder injected into the agent's context (Claude and Codex add a
- * SessionStart / UserPromptSubmit hook's stdout as context). Sent on every
- * prompt: task reporting is mandatory for every user message.
+ * SessionStart / UserPromptSubmit hook's stdout as context). Conditional
+ * (fixes §3.7): nudged on session start and on prompts until a list exists;
+ * once there is one, only when the previous turn did not update it
+ * (missed_turns > 0).
  */
 export function reminderFor(agent, event, store) {
   const tool = agent === "codex" ? "update_plan" : agent === "opencode" ? "todowrite" : "TaskCreate/TaskUpdate";
+  if (event !== "SessionStart" && event !== "UserPromptSubmit") return null;
+  const hasList = Array.isArray(store?.tasks) && store.tasks.length > 0;
+  const missed = Number.isInteger(store?.missed_turns) && store.missed_turns > 0;
+  if (hasList && !missed) return null;
   if (event === "SessionStart") {
     return `Ranch task reporting is mandatory: for EVERY user message, first record the work as tasks with ${tool}, mark each in_progress then completed, and finish all of them before ending your reply.`;
   }
-  if (event === "UserPromptSubmit") {
-    return `Ranch (mandatory): before anything else, add task(s) for this message with ${tool}; mark in_progress, then completed before you finish.`;
-  }
-  return null;
+  return `Ranch (mandatory): before anything else, add task(s) for this message with ${tool}; mark in_progress, then completed before you finish.`;
 }

@@ -1,0 +1,11 @@
+{
+  "hook_event_name": "PostToolUse",
+  "tool_name": "update_plan",
+  "tool_input": {
+    "plan": [
+      { "step": "Survey the repo", "status": "completed" },
+      { "step": "Patch the reducer", "status": "in_progress" },
+      { "step": "Run the tests", "status": "pending" }
+    ]
+  }
+}
