@@ -76,9 +76,12 @@ export default class RanchSidebar extends View {
     }
   }
 
-  toggleFold(map, key) {
+  toggleFold(map, key, cx) {
     this.collapsed = { ...this.collapsed, [map]: { ...this.collapsed[map], [key]: !this.collapsed[map][key] } };
     localStorage.setItem(COLLAPSE_KEY, JSON.stringify(this.collapsed));
+    // Redraw now: without it the fold only showed on the next unrelated
+    // render (a timer tick or a hover), which felt slow.
+    cx?.notify();
   }
 
   // ---- git ----
@@ -330,7 +333,7 @@ export default class RanchSidebar extends View {
       .when(!first, (e) => e.mt(10).border_t(1).border_color(t.border).pt(1))
       .cursor_pointer().hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click(() => this.toggleFold("m", key))
+      .on_click((_e, cx) => this.toggleFold("m", key, cx))
       .child(div().flex_none().size(17).flex().items_center().justify_center()
         .child(svg(ICON(g.machine ? "server" : "laptop")).size(13).flex_none().text_color(t.muted)))
       .child(div().flex_1().min_w(0).truncate().text_size(11.5).font_semibold().text_color(t.muted).child(g.label))
@@ -381,13 +384,18 @@ export default class RanchSidebar extends View {
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
-        this.toggleFold("s", sp.space);
+        this.toggleFold("s", sp.space, cx);
       })
       .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
+    // A space colour may be saved as hex ("#9333ea") or as a theme name
+    // ("ansi6"): resolve names through the theme. Only a plain #rrggbb can
+    // take the "38" alpha suffix for the badge's tint.
     const custom = shared("space.colors")?.[sp.space];
-    const tint = custom ?? t[BADGE_COLORS[badgeColorIndex(sp.space)]] ?? t.muted;
+    const resolved = typeof custom === "string" ? (custom.startsWith("#") ? custom : t[custom]) : null;
+    const tint = resolved ?? t[BADGE_COLORS[badgeColorIndex(sp.space)]] ?? t.muted;
+    const tintBg = /^#[0-9a-f]{6}$/i.test(tint) ? `${tint}38` : t.hover;
     const badge = div().flex_none().size(17).rounded(4).flex().items_center().justify_center()
-      .bg(`${tint}38`).text_size(8.5).font_bold().text_color(tint)
+      .bg(tintBg).text_size(8.5).font_bold().text_color(tint)
       .child(initials(sp.name) || "·");
     return h_flex().id(`space-${sp.space}`).h(28).mt(10).flex_none().pl(10).pr(8).gap(8).items_center()
       .cursor_pointer().hover((s) => s.bg(t.hover))
@@ -434,15 +442,21 @@ export default class RanchSidebar extends View {
   settledRow(sp) {
     const t = theme();
     const folded = !!this.collapsed.settled[sp.space];
-    return h_flex().id(`settled-${sp.space}`).h(22).flex_none().pl(28).pr(6).gap(3).items_center()
-      .cursor_pointer().hover((s) => s.bg(t.hover))
+    // Aligned with the cards: mx(6) + pl(10) puts the icon on the cards' text
+    // column, and mx(6) + pr(2) puts the chevron in the space/machine chevron
+    // column at the right.
+    return h_flex().id(`settled-${sp.space}`).h(26).my(3).mx(6).flex_none().pl(10).pr(2).gap(6).items_center()
+      .rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
-        this.toggleFold("settled", sp.space);
+        this.toggleFold("settled", sp.space, cx);
       })
-      .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(9).flex_none().text_color(t.dim))
-      .child(div().text_size(10).text_color(t.dim).child(`Settled (${sp.settled.length})`));
+      .child(svg(ICON("archive")).size(11).flex_none().text_color(t.dim))
+      .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child("Settled"))
+      .child(div().flex_none().text_size(11).text_color(t.dim).child(String(sp.settled.length)))
+      .child(div().flex_none().size(16).flex().items_center().justify_center()
+        .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(10).flex_none().text_color(t.dim)));
   }
 
   card(c, { settled = false } = {}) {
