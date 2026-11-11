@@ -72,9 +72,18 @@ export function normalizeSession(s) {
   };
 }
 
+/** Normalizes one recorded pull request ({url, number, at}); null when unusable. */
+export function normalizePrRecord(p) {
+  if (!p || typeof p !== "object") return null;
+  const url = str(p.url);
+  const number = Number.isInteger(p.number) ? p.number : null;
+  if (!url || !url.startsWith("https://") || number === null) return null;
+  return { url, number, at: str(p.at) };
+}
+
 /** An empty store document for a terminal. */
 export function emptyStore(terminal, agent) {
-  return { version: STORE_VERSION, terminal, agent, updated_at: null, session: null, tasks: [], subagents: [] };
+  return { version: STORE_VERSION, terminal, agent, updated_at: null, session: null, tasks: [], subagents: [], prs: [] };
 }
 
 /**
@@ -93,6 +102,7 @@ export function parseStore(text) {
   if (typeof raw.version === "number" && raw.version > STORE_VERSION) return { ok: false, reason: "newer" };
   const tasks = (Array.isArray(raw.tasks) ? raw.tasks : []).map(normalizeTask).filter(Boolean);
   const subagents = (Array.isArray(raw.subagents) ? raw.subagents : []).map(normalizeSubagent).filter(Boolean);
+  const prs = (Array.isArray(raw.prs) ? raw.prs : []).map(normalizePrRecord).filter(Boolean);
   return {
     ok: true,
     store: {
@@ -103,6 +113,7 @@ export function parseStore(text) {
       session: normalizeSession(raw.session),
       tasks,
       subagents,
+      prs,
     },
   };
 }

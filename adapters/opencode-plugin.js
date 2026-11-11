@@ -6,7 +6,7 @@
 // One file, both hosts: OpenCode 2.x schema-validates the default export as
 // an object ({ id, setup, server }) and calls setup(ctx); v1 calls server(),
 // which returns the classic hooks object.
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -45,6 +45,9 @@ function normalizeStore(raw, terminal) {
   if (!raw || typeof raw !== "object" || (typeof raw.version === "number" && raw.version > STORE_VERSION)) {
     return emptyStore(terminal);
   }
+  // The store belongs to another agent (terminal reuse, I10): never continue
+  // its session, tasks or sub-agents.
+  if (typeof raw.agent === "string" && raw.agent !== "opencode") return emptyStore(terminal);
   const tasks = (Array.isArray(raw.tasks) ? raw.tasks : [])
     .filter((t) => t && typeof t.title === "string" && t.title.trim())
     .map((t) => ({
@@ -78,7 +81,7 @@ function normalizeStore(raw, terminal) {
   return {
     version: STORE_VERSION,
     terminal: typeof raw.terminal === "string" ? raw.terminal : terminal,
-    agent: typeof raw.agent === "string" ? raw.agent : "opencode",
+    agent: "opencode",
     updated_at: typeof raw.updated_at === "string" ? raw.updated_at : null,
     session,
     tasks,
@@ -94,12 +97,83 @@ function loadStore(path) {
   }
 }
 
+const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+
 function saveStore(path, store) {
   store.updated_at = new Date().toISOString();
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, JSON.stringify(store, null, 2) + "\n");
-  renameSync(tmp, path);
+  // The rename is retried a few times: AV/indexers (notably on Windows) hold
+  // the target open for a moment (I8).
+  for (let i = 0; ; i++) {
+    try {
+      renameSync(tmp, path);
+      return;
+    } catch (err) {
+      if (!RENAME_RETRY_CODES.has(err?.code) || i >= 10) {
+        try { unlinkSync(tmp); } catch {}
+        throw err;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (i + 1));
+    }
+  }
+}
+
+/** Per-store lock: bounded wait, stale break, release fn or null. */
+function takeLock(path) {
+  const lock = `${path}.lock`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+  } catch {
+    return null;
+  }
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    try {
+      const fd = openSync(lock, "wx");
+      return () => {
+        try { closeSync(fd); } catch {}
+        try { unlinkSync(lock); } catch {}
+      };
+    } catch (err) {
+      if (err?.code !== "EEXIST") return null;
+      try {
+        if (Date.now() - statSync(lock).mtimeMs > 5000) {
+          unlinkSync(lock);
+          continue;
+        }
+      } catch {}
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+  return null;
+}
+
+/**
+ * One locked read → fn → conditional write. When the lock cannot be taken
+ * the whole read-modify-write is retried once; failing that the write is
+ * skipped — the store is never written without the lock (I9). Throws only
+ * for genuine write errors (the callers catch everything).
+ */
+function updateStore(fn) {
+  const path = storePath();
+  if (!path) return;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const release = takeLock(path);
+    if (!release) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      continue;
+    }
+    try {
+      const loaded = loadStore(path);
+      const next = fn(loaded);
+      if (next && next !== loaded) saveStore(path, next);
+      return;
+    } finally {
+      release();
+    }
+  }
 }
 
 /**
@@ -147,6 +221,13 @@ export function reduceOpencode(store, event) {
   return { ...base, session: { ...session, activity: { state, at: Date.now() } } };
 }
 
+/** Stable short id for tasks the host leaves without one (I13). */
+function hashId(text) {
+  let hash = 5381;
+  for (let i = 0; i < text.length; i++) hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+  return Math.abs(hash).toString(36);
+}
+
 function reduceOpencodeCore(store, event) {
   if (!event || typeof event !== "object") return store;
   const type = event.type;
@@ -157,13 +238,16 @@ function reduceOpencodeCore(store, event) {
   if (type === "todo.updated") {
     if (props.sessionID && store.session?.id && props.sessionID !== store.session.id) return store;
     // Replace tasks; cancelled ones are kept and struck through by the mod.
+    // Tasks without an id get a stable position+title-hash id (I13).
     const todos = Array.isArray(props.todos) ? props.todos : [];
-    next.tasks = todos.flatMap((todo) => {
+    next.tasks = todos.flatMap((todo, index) => {
       if (!todo) return [];
       const title = typeof todo.content === "string" ? todo.content.trim() : "";
       if (!title) return [];
       return [{
-        id: todo.id === undefined || todo.id === null ? "" : String(todo.id),
+        id: todo.id === undefined || todo.id === null || todo.id === ""
+          ? `${index + 1}-${hashId(title)}`
+          : String(todo.id),
         title,
         status: TASK_STATUS.has(todo.status) ? todo.status : "pending",
         active_form: null,
@@ -306,12 +390,7 @@ function adoptSession(store, event) {
 /** One store read → reduce → conditional atomic write, shared by both hosts. */
 function recordEvent(event) {
   try {
-    const path = storePath();
-    if (!path) return;
-    const loaded = loadStore(path);
-    const adopted = adoptSession(loaded, event);
-    const next = reduceOpencode(adopted, event);
-    if (next !== adopted || adopted !== loaded) saveStore(path, next);
+    updateStore((loaded) => reduceOpencode(adoptSession(loaded, event), event));
   } catch {
     // Never break the host: task reporting fails silently.
   }
@@ -395,11 +474,7 @@ export const RanchTasks = async () => ({
 
   event: async ({ event }) => {
     try {
-      const path = storePath();
-      if (!path) return;
-      const store = loadStore(path);
-      const next = reduceOpencode(store, event);
-      if (next !== store) saveStore(path, next);
+      updateStore((store) => reduceOpencode(store, event));
     } catch {
       // Never break the host: task reporting fails silently.
     }
@@ -407,20 +482,16 @@ export const RanchTasks = async () => ({
 
   "chat.message": async (input, output) => {
     try {
-      const path = storePath();
-      if (!path) return;
       const parts = Array.isArray(output?.parts) ? output.parts : [];
       const text = parts
         .filter((part) => part?.type === "text" && typeof part.text === "string")
         .map((part) => part.text)
         .join("");
       if (!text) return;
-      const store = loadStore(path);
-      const next = reduceOpencode(store, {
+      updateStore((store) => reduceOpencode(store, {
         type: "chat.message",
         properties: { sessionID: input?.sessionID, text },
-      });
-      if (next !== store) saveStore(path, next);
+      }));
     } catch {
       // Never break the host: task reporting fails silently.
     }
