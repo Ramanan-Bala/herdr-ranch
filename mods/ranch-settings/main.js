@@ -70,7 +70,7 @@ export default class RanchSettings extends View {
           const agents = {};
           for (const key of TASK_KEYS) {
             const v = data.agents[key];
-            agents[key] = v === "installed" || v === "outdated" || v === "broken" ? v : "missing";
+            agents[key] = ["installed", "outdated", "broken", "needs approval"].includes(v) ? v : "missing";
           }
           this.tasks = { agents };
         } else {
@@ -290,13 +290,17 @@ export default class RanchSettings extends View {
     } else {
       for (const key of TASK_KEYS) {
         const status = this.tasks.agents[key];
-        const color = status === "installed" ? t.done : status === "outdated" ? t.working : t.blocked;
+        const color = status === "installed" ? t.done : status === "outdated" || status === "needs approval" ? t.working : t.blocked;
         rows.push(h_flex().flex_none().items_center().justify_between().gap(8)
           .child(div().flex_1().min_w(0).truncate().child(key))
           .child(div().text_color(color).child(status)));
       }
       const repair = TASK_KEYS.some((key) => this.tasks.agents[key] === "broken");
-      if (TASK_KEYS.some((key) => this.tasks.agents[key] !== "installed")) {
+      // Codex hooks waiting for trust: only Codex's own /hooks can approve them.
+      if (this.tasks.agents.codex === "needs approval") {
+        rows.push(div().text_size(11).text_color(t.dim).child("Codex: approve the Ranch hooks once with /hooks in Codex."));
+      }
+      if (TASK_KEYS.some((key) => !["installed", "needs approval"].includes(this.tasks.agents[key]))) {
         rows.push(h_flex().flex_none().justify_end()
           .child(div().id("tasks-setup").flex_none().px(10).py(4).rounded(7).bg(t.accent).text_color(t.accent_foreground).font_semibold().cursor_pointer()
             .on_click((_e, cx) => this.runSetup(cx))

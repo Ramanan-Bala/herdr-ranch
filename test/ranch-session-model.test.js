@@ -187,3 +187,9 @@ test("subDuration", () => {
   assert.equal(subDuration(null, null, now), null);
   assert.equal(subDuration("nope", null, now), null);
 });
+
+test("taskEmptyState points at /hooks when Codex hooks need approval", () => {
+  const missing = { ok: false, reason: "missing" };
+  assert.deepEqual(taskEmptyState(missing, "codex", "needs approval"), { text: "Approve the Ranch hooks with /hooks in Codex." });
+  assert.equal(taskEmptyState(missing, "codex", "missing").setup, true);
+});

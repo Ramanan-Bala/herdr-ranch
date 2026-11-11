@@ -164,6 +164,10 @@ export function taskEmptyState(parsed, app, adapterState) {
     if (parsed.reason === "invalid") return { text: "Task reporting isn't set up", setup: true };
     // No store yet: only offer setup once `ranch-tasks status` says the adapter
     // isn't installed (undefined = still checking -> "No plan yet.").
+    // Codex hooks waiting for trust: Set up can't fix that, /hooks in Codex can.
+    if (parsed.reason === "missing" && adapterState === "needs approval") {
+      return { text: "Approve the Ranch hooks with /hooks in Codex." };
+    }
     if (parsed.reason === "missing" && TASK_AGENTS.has(app ?? "") && adapterState && adapterState !== "installed") {
       return { text: "Task reporting isn't set up", setup: true };
     }
