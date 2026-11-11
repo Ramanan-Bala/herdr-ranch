@@ -28,9 +28,12 @@ const PLAN_PAYLOAD = {
   tool_input: { plan: [{ step: "doctor check", status: "in_progress" }] },
 };
 
-/** The CLI entry this doctor was installed with (repo run falls back to ../bin). */
-function cliPath() {
-  const installed = join(homeDir(), ".herdr", "ranch", "bin", "ranch-tasks");
+/**
+ * The node entry this doctor was installed with (repo run falls back to
+ * ../bin). The installed bin/ranch-tasks is a sh launcher, so run the .js.
+ */
+export function cliPath() {
+  const installed = join(homeDir(), ".herdr", "ranch", "bin", "ranch-tasks.js");
   if (existsSync(installed)) return installed;
   return join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "ranch-tasks");
 }
