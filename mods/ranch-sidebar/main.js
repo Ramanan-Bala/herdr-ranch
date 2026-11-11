@@ -29,7 +29,8 @@ export default class RanchSidebar extends View {
     this.cardById = new Map();
     this.settings = resolveSettings(shared(SETTINGS_KEY));
 
-    // Folding: { m: {machineKey: bool}, s: {spaceId: bool}, w: {worktreeSpaceId: bool}, settled: {spaceId: bool} }
+    // Folding: { m: {machineKey: bool}, s: {spaceId: bool}, w: {worktreeSpaceId: bool},
+    // settled: {"m:<machineKey>": bool} } — old per-space settled keys may linger in storage; ignored.
     this.collapsed = this.loadCollapsed();
 
     // Git: repos `${machine}|${top}` -> {summary, at}; topOf `${machine}|${cwd}`
@@ -388,14 +389,9 @@ export default class RanchSidebar extends View {
   spaceRow(sp) {
     const t = theme();
     const folded = !!this.collapsed.s[sp.space];
-    const fold = div().id(`fold-${sp.space}`).flex_none().size(16).flex().items_center().justify_center()
-      .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
-      .tooltip(folded ? "Expand" : "Collapse")
-      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click((_e, cx) => {
-        cx.stop_propagation();
-        this.toggleFold("s", sp.space, cx);
-      })
+    // Clicking the row folds it (like the machine header); the chevron is an
+    // indicator only, aligned with the machine chevrons at the far right.
+    const fold = div().flex_none().size(16).flex().items_center().justify_center()
       .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
     // A space colour may be saved as hex ("#9333ea") or as a theme name
     // ("ansi6"): resolve names through the theme. Only a plain #rrggbb can
@@ -415,7 +411,7 @@ export default class RanchSidebar extends View {
       ? withWts.reduce((n, x) => n + x.cards.length + x.settled.length, 0)
       : sp.cards.length + sp.settled.length;
     return h_flex().id(`space-${sp.space}`).h(28).mt(10).flex_none().pl(10).pr(8).gap(8).items_center()
-      .cursor_pointer().hover((s) => s.bg(t.hover))
+      .cursor_pointer().hover((s) => s.bg(t.hover)).tooltip(folded ? "Expand" : "Collapse")
       .on_hover((isIn, cx) => {
         const next = isIn ? sp.space : null;
         if (this.hoveredSpace !== next) {
@@ -424,7 +420,7 @@ export default class RanchSidebar extends View {
         }
       })
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click(() => run("space.select", { id: sp.space }))
+      .on_click((_e, cx) => this.toggleFold("s", sp.space, cx))
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
         openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: sp.space } } });
@@ -514,22 +510,23 @@ export default class RanchSidebar extends View {
         .child(svg(ICON("folder-plus")).size(13)));
   }
 
-  settledRow(sp) {
+  /** The machine's Settled section header: `(id, count, folded, onToggle)`. */
+  settledRow(id, count, folded, onToggle) {
     const t = theme();
-    const folded = !!this.collapsed.settled[sp.space];
     // Aligned with the cards: mx(6) + pl(10) puts the icon on the cards' text
     // column, and mx(6) + pr(2) puts the chevron in the space/machine chevron
-    // column at the right.
-    return h_flex().id(`settled-${sp.space}`).h(26).my(3).mx(6).flex_none().pl(10).pr(2).gap(6).items_center()
+    // column at the right. The inset top border reads as the machine footer.
+    return h_flex().id(`settled-${id}`).h(26).mt(8).mx(6).flex_none().pl(10).pr(2).gap(6).items_center()
+      .border_t(1).border_color(t.border).pt(1)
       .rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
-        this.toggleFold("settled", sp.space, cx);
+        onToggle(cx);
       })
       .child(svg(ICON("archive")).size(11).flex_none().text_color(t.dim))
       .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child("Settled"))
-      .child(div().flex_none().text_size(11).text_color(t.dim).child(String(sp.settled.length)))
+      .child(div().flex_none().text_size(11).text_color(t.dim).child(String(count)))
       .child(div().flex_none().size(16).flex().items_center().justify_center()
         .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(10).flex_none().text_color(t.dim)));
   }
@@ -555,7 +552,7 @@ export default class RanchSidebar extends View {
         .child(`#${pr.number}`));
   }
 
-  card(c, { settled = false, grouped = false } = {}) {
+  card(c, { settled = false, grouped = false, context = false } = {}) {
     const t = theme();
     const active = c.active && !settled;
     const hovered = this.hovered === c.tabId;
@@ -583,16 +580,23 @@ export default class RanchSidebar extends View {
     const prog = tasks.length ? progress(tasks) : null;
     const activeTask = tasks.find((task) => task.status === "in_progress") ?? null;
     const parts2 = [];
+    // In the machine's Settled group the card names its space before the
+    // branch/folder, so you can tell where it lives.
+    const ctx = context && c.spaceName
+      ? div().flex_none().text_color(t.dim).child(`${truncateMiddle(c.spaceName, 14)} · `)
+      : null;
     if (showLoc) {
       if (branch) {
         parts2.push(h_flex().flex_1().min_w(0).items_center().gap(4)
           .child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim))
+          .when(Boolean(ctx), (e) => e.child(ctx))
           .child(div().flex_1().min_w(0).truncate()
             .text_color(settled ? t.dim : t.muted)
             .child(truncateMiddle(branch, 28))));
       } else if (c.cwd) {
         parts2.push(h_flex().flex_1().min_w(0).items_center().gap(4)
           .child(svg(ICON("folder")).size(10).flex_none().text_color(t.dim))
+          .when(Boolean(ctx), (e) => e.child(ctx))
           .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(c.repo ?? c.cwd)));
       }
     }
@@ -853,13 +857,20 @@ export default class RanchSidebar extends View {
   }
 
   allCards(tree) {
-    // Same walk as render: main cards, then each worktree's, in display order.
+    // Same walk as render: each machine's active cards in tree order, then
+    // that machine's settled cards (they draw in one group after the spaces).
     const out = [];
     for (const g of tree.groups) {
+      const settled = [];
       for (const e of nestWorktrees(g.spaces, (sp) => sp.checkout)) {
-        out.push(...e.cards, ...e.settled);
-        for (const wt of e.worktrees) out.push(...wt.cards, ...wt.settled);
+        out.push(...e.cards);
+        settled.push(...e.settled);
+        for (const wt of e.worktrees) {
+          out.push(...wt.cards);
+          settled.push(...wt.settled);
+        }
       }
+      out.push(...settled);
     }
     return out;
   }
@@ -911,23 +922,21 @@ export default class RanchSidebar extends View {
           rows.push(this.machineHeader(g, i === 0));
           if (this.collapsed.m[key]) continue;
         }
+        // Settled tabs of the whole machine gather in one group after the last
+        // space, in display order (this space, its worktrees, next space…).
+        const settledAll = [];
         for (const e of nestWorktrees(g.spaces, (sp) => sp.checkout)) {
           rows.push(this.spaceRow(e));
+          // Collected before any fold check: the Settled group lists them all,
+          // even from folded spaces and worktrees.
+          settledAll.push(...e.settled);
+          for (const wt of e.worktrees) settledAll.push(...wt.settled);
           if (this.collapsed.s[e.space]) continue; // folded: hides its worktrees too
           if (!e.checkout) {
             // Non-git space: its cards sit directly under the space row.
             for (const c of e.cards) {
               rows.push(this.card(c));
               this.order.push(c.tabId);
-            }
-            if (e.settled.length) {
-              rows.push(this.settledRow(e));
-              if (!this.collapsed.settled[e.space]) {
-                for (const c of e.settled) {
-                  rows.push(this.card(c, { settled: true }));
-                  this.order.push(c.tabId);
-                }
-              }
             }
             continue;
           }
@@ -946,19 +955,21 @@ export default class RanchSidebar extends View {
               body.push(this.card(c, { grouped: grouped(c) }));
               this.order.push(c.tabId);
             }
-            if (b.entry.settled.length) {
-              body.push(this.settledRow(b.entry));
-              if (!this.collapsed.settled[b.entry.space]) {
-                for (const c of b.entry.settled) {
-                  body.push(this.card(c, { settled: true, grouped: grouped(c) }));
-                  this.order.push(c.tabId);
-                }
-              }
-            }
             // Cards indented under the tree glyph, with a 1px guide line.
             if (body.length) {
               rows.push(v_flex().id(`worktree-body-${foldKey}`).flex_none().ml(13)
                 .border_l(1).border_color(t.border).children(body));
+            }
+          }
+        }
+        if (settledAll.length) {
+          const folded = !!this.collapsed.settled[`m:${key}`];
+          rows.push(this.settledRow(`m-${g.machine ?? "local"}`, settledAll.length, folded,
+            (cx) => this.toggleFold("settled", `m:${key}`, cx)));
+          if (!folded) {
+            for (const c of settledAll) {
+              rows.push(this.card(c, { settled: true, grouped: false, context: true }));
+              this.order.push(c.tabId);
             }
           }
         }
