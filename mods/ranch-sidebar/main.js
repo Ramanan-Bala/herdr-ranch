@@ -29,7 +29,8 @@ export default class RanchSidebar extends View {
     this.cardById = new Map();
     this.settings = resolveSettings(shared(SETTINGS_KEY));
 
-    // Folding: { m: {machineKey: bool}, s: {spaceId: bool}, w: {worktreeSpaceId: bool}, settled: {spaceId: bool} }
+    // Folding: { m: {machineKey: bool}, s: {spaceId: bool}, w: {worktreeSpaceId: bool},
+    // settled: {"m:<machineKey>": bool} } — old per-space settled keys may linger in storage; ignored.
     this.collapsed = this.loadCollapsed();
 
     // Git: repos `${machine}|${top}` -> {summary, at}; topOf `${machine}|${cwd}`
@@ -357,9 +358,9 @@ export default class RanchSidebar extends View {
   }
 
   /** The "+" button that opens the new-tab menu, shared by space and worktree rows. */
-  plusBtn(space) {
+  plusBtn(space, id = space) {
     const t = theme();
-    return div().id(`plus-${space}`).flex_none().size(16).flex().items_center().justify_center()
+    return div().id(`plus-${id}`).flex_none().size(16).flex().items_center().justify_center()
       .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
@@ -371,9 +372,9 @@ export default class RanchSidebar extends View {
   }
 
   /** The sparkle button that opens the start-agent dialog, same rows. */
-  sparkBtn(space) {
+  sparkBtn(space, id = space) {
     const t = theme();
-    return div().id(`spark-${space}`).flex_none().size(16).flex().items_center().justify_center()
+    return div().id(`spark-${id}`).flex_none().size(16).flex().items_center().justify_center()
       .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .tooltip("Start agent with a task")
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -388,14 +389,9 @@ export default class RanchSidebar extends View {
   spaceRow(sp) {
     const t = theme();
     const folded = !!this.collapsed.s[sp.space];
-    const fold = div().id(`fold-${sp.space}`).flex_none().size(16).flex().items_center().justify_center()
-      .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
-      .tooltip(folded ? "Expand" : "Collapse")
-      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click((_e, cx) => {
-        cx.stop_propagation();
-        this.toggleFold("s", sp.space, cx);
-      })
+    // Clicking the row folds it (like the machine header); the chevron is an
+    // indicator only, aligned with the machine chevrons at the far right.
+    const fold = div().flex_none().size(16).flex().items_center().justify_center()
       .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
     // A space colour may be saved as hex ("#9333ea") or as a theme name
     // ("ansi6"): resolve names through the theme. Only a plain #rrggbb can
@@ -407,12 +403,15 @@ export default class RanchSidebar extends View {
     const badge = div().flex_none().size(17).rounded(4).flex().items_center().justify_center()
       .bg(tintBg).text_size(8.5).font_bold().text_color(tint)
       .child(initials(sp.name) || "·");
-    // Checkout facts moved up from the cards: branch (+" · primary" when
-    // worktrees hang off this space), diff stats and PR badge.
-    const co = sp.checkout ?? null;
-    const coBranch = co ? (co.detached ? `detached @${co.head ?? ""}` : co.branch ?? null) : null;
+    // When linked worktrees hang off this space, its folded ring and count
+    // cover the whole repo: the main checkout plus its worktrees.
+    const withWts = sp.worktrees?.length ? [sp, ...sp.worktrees] : null;
+    const status = withWts ? mostUrgent(withWts.map((x) => x.status)) : sp.status;
+    const count = withWts
+      ? withWts.reduce((n, x) => n + x.cards.length + x.settled.length, 0)
+      : sp.cards.length + sp.settled.length;
     return h_flex().id(`space-${sp.space}`).h(28).mt(10).flex_none().pl(10).pr(8).gap(8).items_center()
-      .cursor_pointer().hover((s) => s.bg(t.hover))
+      .cursor_pointer().hover((s) => s.bg(t.hover)).tooltip(folded ? "Expand" : "Collapse")
       .on_hover((isIn, cx) => {
         const next = isIn ? sp.space : null;
         if (this.hoveredSpace !== next) {
@@ -421,52 +420,48 @@ export default class RanchSidebar extends View {
         }
       })
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click(() => run("space.select", { id: sp.space }))
+      .on_click((_e, cx) => this.toggleFold("s", sp.space, cx))
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
         openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: sp.space } } });
       })
       .child(badge)
-      // The name keeps its width; the dim branch label shrinks first.
-      .child(div().when(Boolean(coBranch), (e) => e.flex_none().max_w(130)).when(!coBranch, (e) => e.flex_1().min_w(0))
-        .truncate().text_size(12).font_semibold()
+      .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold()
         .text_color(sp.active ? t.foreground : t.muted).child(sp.name))
-      .when(Boolean(coBranch), (e) => e.child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim)
-        .child(coBranch + (sp.worktrees?.length > 0 ? " · primary" : ""))))
-      .when(Boolean(co) && this.settings.card.line3 && co.stat?.files > 0, (e) => e
-        .child(div().flex_none().text_size(10).text_color(t.ansi2).child(`+${co.stat.add}`))
-        .when(co.stat.del > 0, (el) => el.child(div().flex_none().text_size(10).text_color(t.ansi1).child(`\u2212${co.stat.del}`))))
-      .when(Boolean(this.settings.card.pr && sp.pr), (e) => e.child(this.prBadge(`pr-sp-${sp.space}`, sp.pr)))
-      // Plus/sparkle appear only on hover, left of the ring, so the ring,
-      // count and chevron keep their place.
+      // The checkout facts (branch, diff, PR) moved down to the main
+      // checkout's worktree row, first in the list of worktree rows.
       .when(this.hoveredSpace === sp.space, (e) => e.child(this.plusBtn(sp.space)).child(this.sparkBtn(sp.space)))
-      .when(Boolean(sp.status), (e) => e.child(this.ring(sp.status, 9)))
+      .when(Boolean(status), (e) => e.child(this.ring(status, 9)))
       .when(folded, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
-        .child(String(sp.cards.length + sp.settled.length))))
+        .child(String(count))))
       .child(fold);
   }
 
-  /** The compact 24px row drawn under a main space for each of its worktrees. */
-  worktreeRow(wt) {
+  /**
+   * A compact 24px row for one worktree. The main checkout's space entry is
+   * drawn through this too: pass `primary: true`, a `foldKey` distinct from
+   * any space id (ids and hover keys are keyed by foldKey) and the tree glyph.
+   */
+  worktreeRow(wt, { primary = false, foldKey = wt.space, tree = wt.tree } = {}) {
     const t = theme();
-    const folded = !!this.collapsed.w[wt.space];
-    const fold = div().id(`fold-${wt.space}`).flex_none().size(16).flex().items_center().justify_center()
+    const folded = !!this.collapsed.w[foldKey];
+    const fold = div().id(`fold-${foldKey}`).flex_none().size(16).flex().items_center().justify_center()
       .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .tooltip(folded ? "Expand" : "Collapse")
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
-        this.toggleFold("w", wt.space, cx);
+        this.toggleFold("w", foldKey, cx);
       })
       .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
     const label = wt.checkout
       ? (wt.checkout.detached ? `detached @${wt.checkout.head ?? ""}` : wt.checkout.branch ?? wt.name)
       : wt.name;
     const stat = wt.checkout?.stat ?? null;
-    return h_flex().id(`worktree-${wt.space}`).h(24).mt(2).flex_none().pl(10).pr(8).gap(8).items_center()
+    return h_flex().id(`worktree-${foldKey}`).h(24).mt(2).flex_none().pl(10).pr(8).gap(8).items_center()
       .cursor_pointer().hover((s) => s.bg(t.hover))
       .on_hover((isIn, cx) => {
-        const next = isIn ? wt.space : null;
+        const next = isIn ? foldKey : null;
         if (this.hoveredSpace !== next) {
           this.hoveredSpace = next;
           cx.notify();
@@ -479,15 +474,16 @@ export default class RanchSidebar extends View {
         openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: wt.space } } });
       })
       .tooltip([wt.name, wt.checkout?.top ?? null].filter(Boolean).join("\n"))
-      .child(div().flex_none().text_size(11).text_color(t.dim).child(wt.tree))
+      .child(div().flex_none().text_size(11).text_color(t.dim).child(tree))
       .child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim))
       .child(div().flex_1().min_w(0).truncate().text_size(11).font_semibold()
         .text_color(wt.active ? t.foreground : t.muted).child(truncateMiddle(label, 28)))
+      .when(primary, (e) => e.child(div().flex_none().text_size(10).text_color(t.dim).child("primary")))
       .when(this.settings.card.line3 && stat?.files > 0, (e) => e
         .child(div().flex_none().text_size(10).text_color(t.ansi2).child(`+${stat.add}`))
         .when(stat.del > 0, (el) => el.child(div().flex_none().text_size(10).text_color(t.ansi1).child(`\u2212${stat.del}`))))
-      .when(Boolean(this.settings.card.pr && wt.pr), (e) => e.child(this.prBadge(`pr-wt-${wt.space}`, wt.pr)))
-      .when(this.hoveredSpace === wt.space, (e) => e.child(this.plusBtn(wt.space)).child(this.sparkBtn(wt.space)))
+      .when(Boolean(this.settings.card.pr && wt.pr), (e) => e.child(this.prBadge(`pr-wt-${foldKey}`, wt.pr)))
+      .when(this.hoveredSpace === foldKey, (e) => e.child(this.plusBtn(wt.space, foldKey)).child(this.sparkBtn(wt.space, foldKey)))
       .when(folded && Boolean(wt.status), (e) => e.child(this.ring(wt.status, 9)))
       .when(folded && wt.blocked > 0, (e) => e.child(div().flex_none().text_size(10).text_color(t.blocked).child("Needs you")))
       .when(folded && !(wt.blocked > 0), (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
@@ -514,22 +510,23 @@ export default class RanchSidebar extends View {
         .child(svg(ICON("folder-plus")).size(13)));
   }
 
-  settledRow(sp) {
+  /** The machine's Settled section header: `(id, count, folded, onToggle)`. */
+  settledRow(id, count, folded, onToggle) {
     const t = theme();
-    const folded = !!this.collapsed.settled[sp.space];
     // Aligned with the cards: mx(6) + pl(10) puts the icon on the cards' text
     // column, and mx(6) + pr(2) puts the chevron in the space/machine chevron
-    // column at the right.
-    return h_flex().id(`settled-${sp.space}`).h(26).my(3).mx(6).flex_none().pl(10).pr(2).gap(6).items_center()
+    // column at the right. The inset top border reads as the machine footer.
+    return h_flex().id(`settled-${id}`).h(26).mt(8).mx(6).flex_none().pl(10).pr(2).gap(6).items_center()
+      .border_t(1).border_color(t.border).pt(1)
       .rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
-        this.toggleFold("settled", sp.space, cx);
+        onToggle(cx);
       })
       .child(svg(ICON("archive")).size(11).flex_none().text_color(t.dim))
       .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child("Settled"))
-      .child(div().flex_none().text_size(11).text_color(t.dim).child(String(sp.settled.length)))
+      .child(div().flex_none().text_size(11).text_color(t.dim).child(String(count)))
       .child(div().flex_none().size(16).flex().items_center().justify_center()
         .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(10).flex_none().text_color(t.dim)));
   }
@@ -555,7 +552,7 @@ export default class RanchSidebar extends View {
         .child(`#${pr.number}`));
   }
 
-  card(c, { settled = false, grouped = false } = {}) {
+  card(c, { settled = false, grouped = false, context = false } = {}) {
     const t = theme();
     const active = c.active && !settled;
     const hovered = this.hovered === c.tabId;
@@ -583,16 +580,23 @@ export default class RanchSidebar extends View {
     const prog = tasks.length ? progress(tasks) : null;
     const activeTask = tasks.find((task) => task.status === "in_progress") ?? null;
     const parts2 = [];
+    // In the machine's Settled group the card names its space before the
+    // branch/folder, so you can tell where it lives.
+    const ctx = context && c.spaceName
+      ? div().flex_none().text_color(t.dim).child(`${truncateMiddle(c.spaceName, 14)} · `)
+      : null;
     if (showLoc) {
       if (branch) {
         parts2.push(h_flex().flex_1().min_w(0).items_center().gap(4)
           .child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim))
+          .when(Boolean(ctx), (e) => e.child(ctx))
           .child(div().flex_1().min_w(0).truncate()
             .text_color(settled ? t.dim : t.muted)
             .child(truncateMiddle(branch, 28))));
       } else if (c.cwd) {
         parts2.push(h_flex().flex_1().min_w(0).items_center().gap(4)
           .child(svg(ICON("folder")).size(10).flex_none().text_color(t.dim))
+          .when(Boolean(ctx), (e) => e.child(ctx))
           .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(c.repo ?? c.cwd)));
       }
     }
@@ -819,7 +823,8 @@ export default class RanchSidebar extends View {
             c.repo = c.top.split(/[\\/]/).filter(Boolean).pop() ?? c.repo;
           }
         }
-        if (!settled && s.card.line3 && s.card.pr && c.top && c.summary && !c.summary.detached) {
+        // Settled tabs too: the PR badge now lives on the space/worktree row.
+        if (s.card.line3 && s.card.pr && c.top && c.summary && !c.summary.detached) {
           const branch = c.branch ?? c.summary.branch;
           if (branch && branch !== c.summary.default) {
             const pk = `${c.machine ?? ""}|${c.top}|${branch}`;
@@ -853,13 +858,20 @@ export default class RanchSidebar extends View {
   }
 
   allCards(tree) {
-    // Same walk as render: main cards, then each worktree's, in display order.
+    // Same walk as render: each machine's active cards in tree order, then
+    // that machine's settled cards (they draw in one group after the spaces).
     const out = [];
     for (const g of tree.groups) {
+      const settled = [];
       for (const e of nestWorktrees(g.spaces, (sp) => sp.checkout)) {
-        out.push(...e.cards, ...e.settled);
-        for (const wt of e.worktrees) out.push(...wt.cards, ...wt.settled);
+        out.push(...e.cards);
+        settled.push(...e.settled);
+        for (const wt of e.worktrees) {
+          out.push(...wt.cards);
+          settled.push(...wt.settled);
+        }
       }
+      out.push(...settled);
     }
     return out;
   }
@@ -911,45 +923,54 @@ export default class RanchSidebar extends View {
           rows.push(this.machineHeader(g, i === 0));
           if (this.collapsed.m[key]) continue;
         }
+        // Settled tabs of the whole machine gather in one group after the last
+        // space, in display order (this space, its worktrees, next space…).
+        const settledAll = [];
         for (const e of nestWorktrees(g.spaces, (sp) => sp.checkout)) {
           rows.push(this.spaceRow(e));
+          // Collected before any fold check: the Settled group lists them all,
+          // even from folded spaces and worktrees.
+          settledAll.push(...e.settled);
+          for (const wt of e.worktrees) settledAll.push(...wt.settled);
           if (this.collapsed.s[e.space]) continue; // folded: hides its worktrees too
-          const grouped = (c) => Boolean(e.checkout) && c.top === e.checkout.top;
-          for (const c of e.cards) {
-            rows.push(this.card(c, { grouped: grouped(c) }));
-            this.order.push(c.tabId);
-          }
-          if (e.settled.length) {
-            rows.push(this.settledRow(e));
-            if (!this.collapsed.settled[e.space]) {
-              for (const c of e.settled) {
-                rows.push(this.card(c, { settled: true, grouped: grouped(c) }));
-                this.order.push(c.tabId);
-              }
-            }
-          }
-          for (const wt of e.worktrees) {
-            rows.push(this.worktreeRow(wt));
-            if (this.collapsed.w[wt.space]) continue;
-            const wtGrouped = (c) => Boolean(wt.checkout) && c.top === wt.checkout.top;
-            const body = [];
-            for (const c of wt.cards) {
-              body.push(this.card(c, { grouped: wtGrouped(c) }));
+          if (!e.checkout) {
+            // Non-git space: its cards sit directly under the space row.
+            for (const c of e.cards) {
+              rows.push(this.card(c));
               this.order.push(c.tabId);
             }
-            if (wt.settled.length) {
-              body.push(this.settledRow(wt));
-              if (!this.collapsed.settled[wt.space]) {
-                for (const c of wt.settled) {
-                  body.push(this.card(c, { settled: true, grouped: wtGrouped(c) }));
-                  this.order.push(c.tabId);
-                }
-              }
+            continue;
+          }
+          // Git space: every checkout gets a worktree row — the main checkout
+          // first (tagged "primary"), then its linked worktrees.
+          const blocks = [{ entry: e, primary: true }, ...e.worktrees.map((entry) => ({ entry, primary: false }))];
+          blocks.forEach((b, i) => { b.tree = i === blocks.length - 1 ? "└─" : "├─"; });
+          for (const b of blocks) {
+            const foldKey = b.primary ? `main:${e.space}` : b.entry.space;
+            rows.push(this.worktreeRow(b.entry, { primary: b.primary, foldKey, tree: b.tree }));
+            if (this.collapsed.w[foldKey]) continue;
+            const checkout = b.entry.checkout;
+            const grouped = (c) => Boolean(checkout) && c.top === checkout.top;
+            const body = [];
+            for (const c of b.entry.cards) {
+              body.push(this.card(c, { grouped: grouped(c) }));
+              this.order.push(c.tabId);
             }
             // Cards indented under the tree glyph, with a 1px guide line.
             if (body.length) {
-              rows.push(v_flex().id(`worktree-body-${wt.space}`).flex_none().ml(13)
+              rows.push(v_flex().id(`worktree-body-${foldKey}`).flex_none().ml(13)
                 .border_l(1).border_color(t.border).children(body));
+            }
+          }
+        }
+        if (settledAll.length) {
+          const folded = !!this.collapsed.settled[`m:${key}`];
+          rows.push(this.settledRow(`m-${g.machine ?? "local"}`, settledAll.length, folded,
+            (cx) => this.toggleFold("settled", `m:${key}`, cx)));
+          if (!folded) {
+            for (const c of settledAll) {
+              rows.push(this.card(c, { settled: true, grouped: false, context: true }));
+              this.order.push(c.tabId);
             }
           }
         }
