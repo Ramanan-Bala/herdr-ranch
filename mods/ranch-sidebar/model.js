@@ -139,6 +139,46 @@ export function buildTree({ machines, spaces, agents, panes, filter, now, home =
   return { showMachines: groups.length > 1, groups };
 }
 
+/**
+ * Nest worktree spaces under their main checkout's space (display only; the
+ * input order and Herdr's spaces are never changed). `infoOf(sp)` returns
+ * `{common, linked}` (usually the git summary, which carries both) or null
+ * when the space is not a repo or is still unknown. A linked entry nests
+ * under the first non-linked entry in the array with the same `common`, in
+ * original order, the last one drawn with "└─" and the others "├─"; a linked
+ * entry with no main stays top-level. Never mutates the inputs.
+ *
+ * @param {Array<object>} spaces entries as buildTree returns them
+ * @param {(sp: object) => {common: string|null, linked: boolean}|null} infoOf
+ * @returns {Array<object>} shallow copies with `worktrees: Array` and `tree`
+ *   (null, or "├─"/"└─" on nested entries).
+ */
+export function nestWorktrees(spaces, infoOf) {
+  const infos = spaces.map((sp) => infoOf(sp) ?? null);
+  const mains = new Set(
+    infos.filter((inf) => inf && !inf.linked).map((inf) => inf.common)
+  );
+  const nested = (inf) => inf !== null && inf.linked && mains.has(inf.common);
+  const out = [];
+  const placed = new Set(); // commons whose worktrees are already nested
+  for (let i = 0; i < spaces.length; i++) {
+    const inf = infos[i];
+    if (nested(inf)) continue;
+    const entry = { ...spaces[i], worktrees: [], tree: null };
+    out.push(entry);
+    if (!inf || inf.linked || placed.has(inf.common)) continue;
+    placed.add(inf.common);
+    const kids = [];
+    for (let j = 0; j < spaces.length; j++) {
+      if (nested(infos[j]) && infos[j].common === inf.common) kids.push(j);
+    }
+    kids.forEach((j, n) => {
+      entry.worktrees.push({ ...spaces[j], worktrees: [], tree: n === kids.length - 1 ? "└─" : "├─" });
+    });
+  }
+  return out;
+}
+
 /** Palette used for agent initials badges (theme token names). */
 export const BADGE_COLORS = [
   "ansi1",

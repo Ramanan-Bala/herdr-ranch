@@ -188,6 +188,7 @@ test("repoSummary", async () => {
     "diff --shortstat base000": " 2 files changed, 5 insertions(+), 1 deletion(-)\n",
     "rev-list --left-right --count HEAD...@{u}": "2\t5\n",
     "remote get-url origin": "git@github.com:o/ranch.git\n",
+    "rev-parse --path-format=absolute --git-common-dir": "/home/me/ranch/.git\n",
   });
   assert.deepEqual(await repoSummary(git), {
     top: "/home/me/ranch",
@@ -201,6 +202,8 @@ test("repoSummary", async () => {
     ahead: 2,
     behind: 5,
     host: { kind: "github", base: "https://github.com/o/ranch" },
+    common: "/home/me/ranch/.git",
+    linked: false,
   });
 });
 
@@ -222,7 +225,33 @@ test("repoSummary detached, no upstream, no origin", async () => {
     ahead: null,
     behind: null,
     host: null,
+    common: null,
+    linked: false,
   });
+});
+
+test("repoSummary marks a linked worktree", async () => {
+  const git = fakeGit({
+    "rev-parse --show-toplevel": "/r/wt\n",
+    "branch --show-current": "feature/y\n",
+    "rev-parse --short HEAD": "abc1234\n",
+    "rev-parse --path-format=absolute --git-common-dir": "/r/main/.git\n",
+  });
+  const s = await repoSummary(git);
+  assert.equal(s.top, "/r/wt");
+  assert.equal(s.common, "/r/main/.git");
+  assert.equal(s.linked, true);
+});
+
+test("repoSummary keeps linked false when the common-dir command fails", async () => {
+  const git = fakeGit({
+    "rev-parse --show-toplevel": "/repo\n",
+    "branch --show-current": "work\n",
+    "rev-parse --short HEAD": "abc1234\n",
+  });
+  const s = await repoSummary(git);
+  assert.equal(s.common, null);
+  assert.equal(s.linked, false);
 });
 
 test("repoSummary falls back to the local default branch", async () => {
