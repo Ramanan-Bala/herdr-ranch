@@ -1,9 +1,11 @@
 // Codex adapter: pure reducer over hook payloads (requirements.md §7.4).
 // Codex exposes no session title, so session.title stays null.
 
+import { tasksFingerprint } from "../lib/tasks.js";
+
 const TASK_STATUS = new Set(["pending", "in_progress", "completed", "cancelled"]);
 const KNOWN_EVENTS = new Set([
-  "SessionStart", "UserPromptSubmit", "PostToolUse", "SubagentStart", "SubagentStop", "SessionEnd",
+  "SessionStart", "UserPromptSubmit", "PostToolUse", "SubagentStart", "SubagentStop", "SessionEnd", "Stop",
 ]);
 
 function ensureSession(store) {
@@ -105,6 +107,8 @@ function applyCodexCore(store, payload) {
     if (!session.first_prompt && typeof payload.prompt === "string" && payload.prompt) {
       session.first_prompt = payload.prompt.slice(0, 500);
     }
+    // Turn tracking (fixes §3.7); Stop compares against it.
+    session.turn = { tasks: tasksFingerprint(next.tasks), tools: false };
     return next;
   }
 
@@ -123,6 +127,16 @@ function applyCodexCore(store, payload) {
           active_form: null,
         }];
       });
+    }
+    return next;
+  }
+
+  if (event === "Stop") {
+    // Miss detection (fixes §3.7). Codex exposes no transcript or tool
+    // stream, so a turn that left the task list unchanged counts as missed.
+    const session = ensureSession(next);
+    if (session.turn && tasksFingerprint(next.tasks) === session.turn.tasks) {
+      next.missed_turns = (Number.isInteger(store.missed_turns) ? store.missed_turns : 0) + 1;
     }
     return next;
   }

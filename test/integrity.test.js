@@ -15,6 +15,15 @@ import { applyClaude } from "../adapters/claude.js";
 import { applyCodex } from "../adapters/codex.js";
 import { readStore, updateStore } from "../adapters/store.js";
 import { codexTrustState, gcStores, install, pruneCodexTrustText, statusSummary } from "../adapters/install.js";
+
+// Schema-2 layout: terminals/<t>.json is the store, or a pointer to
+// sessions/<sid>.json once the agent reported a session id.
+function terminalStoreText(home, terminal) {
+  const dir = join(home, ".herdr", "ranch", "tasks");
+  const text = readFileSync(join(dir, "terminals", `${terminal}.json`), "utf8");
+  const sid = JSON.parse(text).session;
+  return typeof sid === "string" && sid ? readFileSync(join(dir, "sessions", `${sid}.json`), "utf8") : text;
+}
 import { RanchTasks, reduceOpencode } from "../adapters/opencode-plugin.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -66,7 +75,7 @@ test("I1: TaskUpdate with an unknown id and no subject is logged, not dropped si
   assert.match(store.hook_error, /unknown task id 42/);
 });
 
-test("I1: the CLI logs hook_error to errors.log and never persists it", () => {
+test("I1: the CLI logs hook_error to adapter.log and never persists it", () => {
   const home = mkdtempSync(join(tmpdir(), "ranch-integrity-"));
   const bin = join(repoRoot, "bin", "ranch-tasks");
   const env = { ...process.env, RANCH_HOME: home, HC_TERMINAL_ID: "te1", RANCH_REMIND: "0" };
@@ -85,10 +94,10 @@ test("I1: the CLI logs hook_error to errors.log and never persists it", () => {
   assert.equal(second.status, 0);
   assert.equal(second.stdout, "");
 
-  const disk = parseStore(readFileSync(join(home, ".herdr", "ranch", "tasks", "te1.json"), "utf8"));
+  const disk = parseStore(terminalStoreText(home, "te1"));
   assert.equal(disk.ok, true);
   assert.equal(disk.store.hook_error, undefined);
-  const log = readFileSync(join(home, ".herdr", "ranch", "logs", "errors.log"), "utf8");
+  const log = readFileSync(join(home, ".herdr", "ranch", "logs", "adapter.log"), "utf8");
   assert.match(log, /unknown task id 77/);
 });
 
@@ -267,8 +276,11 @@ test("I10: readStore never continues another agent's store", () => {
   process.env.HC_TERMINAL_ID = "t9";
   try {
     const next = updateStore("codex", (store) => ({ ...store, tasks: [{ id: "1", title: "mine", status: "pending", active_form: null }] }));
-    assert.equal(next.agent, "codex");
-    assert.equal(parseStore(readFileSync(path, "utf8")).store.agent, "codex");
+    assert.equal(next.agent.app, "codex");
+    // The legacy claude-code list was not adopted: the codex store starts fresh.
+    const disk = parseStore(terminalStoreText(home, "t9")).store;
+    assert.equal(disk.agent.app, "codex");
+    assert.deepEqual(disk.tasks.map((t) => t.title), ["mine"]);
   } finally {
     delete process.env.RANCH_HOME;
     delete process.env.HC_TERMINAL_ID;
@@ -281,7 +293,8 @@ test("I9: a held lock makes updateStore throw, never write blind", () => {
   const home = mkdtempSync(join(tmpdir(), "ranch-integrity-"));
   const dir = join(home, ".herdr", "ranch", "tasks");
   mkdirSync(dir, { recursive: true });
-  const path = join(dir, "t8.json");
+  mkdirSync(join(dir, "terminals"), { recursive: true });
+  const path = join(dir, "terminals", "t8.json"); // schema-2 store, locked per terminal file
   const before = { ...emptyStore("t8", "codex"), updated_at: "2026-01-01T00:00:00.000Z" };
   writeFileSync(path, JSON.stringify(before));
   writeFileSync(`${path}.lock`, "");
@@ -294,7 +307,7 @@ test("I9: a held lock makes updateStore throw, never write blind", () => {
     );
     // The store was left untouched and no tmp leftovers exist.
     assert.deepEqual(parseStore(readFileSync(path, "utf8")).store.updated_at, "2026-01-01T00:00:00.000Z");
-    assert.equal(readdirSync(dir).filter((n) => n.includes(".tmp-")).length, 0);
+    assert.equal(readdirSync(join(dir, "terminals")).filter((n) => n.includes(".tmp-")).length, 0);
   } finally {
     delete process.env.RANCH_HOME;
     delete process.env.HC_TERMINAL_ID;
@@ -532,9 +545,9 @@ test("I10: the opencode plugin starts fresh on a store from another agent", asyn
     await plugin.event({
       event: { type: "todo.updated", properties: { sessionID: "s1", todos: [{ id: "1", content: "mine", status: "pending" }] } },
     });
-    const disk = parseStore(readFileSync(join(dir, "top.json"), "utf8"));
+    const disk = parseStore(terminalStoreText(home, "top"));
     assert.equal(disk.ok, true);
-    assert.equal(disk.store.agent, "opencode");
+    assert.equal(disk.store.agent.app, "opencode");
     assert.deepEqual(disk.store.tasks.map((t) => t.title), ["mine"]);
   } finally {
     delete process.env.RANCH_HOME;

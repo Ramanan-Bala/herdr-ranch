@@ -1,0 +1,11 @@
+{
+  "type": "todo.updated",
+  "data": {
+    "sessionID": "ses_golden2",
+    "todos": [
+      { "id": "1", "content": "Read the spec", "status": "completed" },
+      { "id": "2", "content": "Implement the fix", "status": "completed" },
+      { "id": "3", "content": "Write the tests", "status": "in_progress" }
+    ]
+  }
+}

@@ -3,10 +3,50 @@
 // needed, is passed in as payload.transcript by the CLI — this module never
 // touches the filesystem.
 
+import { tasksFingerprint } from "../lib/tasks.js";
+
 const TASK_STATUS = new Set(["pending", "in_progress", "completed", "cancelled"]);
 const KNOWN_EVENTS = new Set([
   "SessionStart", "UserPromptSubmit", "PostToolUse", "SubagentStart", "SubagentStop", "SessionEnd", "Stop",
 ]);
+
+// Tools that mean the agent did real work this turn (fixes §3.7).
+const WORK_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"]);
+
+/**
+ * Whether the transcript shows a write/edit/shell tool use since the last
+ * real user prompt (fixes §3.7). Transcript JSONL, as passed by the CLI.
+ */
+export function transcriptWorkTools(text) {
+  if (typeof text !== "string" || !text) return false;
+  let inTurn = false;
+  let worked = false;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const content = record?.message?.content;
+    if (record?.type === "user") {
+      const toolResult = Array.isArray(content) && content.some((part) => part?.type === "tool_result");
+      const prompt = typeof content === "string" ||
+        (Array.isArray(content) && !toolResult && content.some((part) => part?.type === "text"));
+      if (prompt) {
+        inTurn = true; // a new turn starts: earlier tool use no longer counts
+        worked = false;
+      }
+      continue;
+    }
+    if (inTurn && record?.type === "assistant" && Array.isArray(content)
+      && content.some((part) => part?.type === "tool_use" && WORK_TOOLS.has(part?.name))) {
+      worked = true;
+    }
+  }
+  return worked;
+}
 
 function ensureSession(store) {
   const base = store.session && typeof store.session === "object" ? store.session : {};
@@ -247,7 +287,26 @@ function applyClaudeCore(store, payload) {
     const session = ensureSession(next);
     if (!session.first_prompt) session.first_prompt = payload.prompt.slice(0, 500);
   }
-  if (event === "PostToolUse") applyTool(next, payload);
+  if (event === "UserPromptSubmit") {
+    // Turn tracking (fixes §3.7): remember the list as it stood when the
+    // prompt arrived; Stop compares against it.
+    const session = ensureSession(next);
+    session.turn = { tasks: tasksFingerprint(next.tasks), tools: false };
+  }
+  if (event === "PostToolUse") {
+    applyTool(next, payload);
+    const session = next.session;
+    if (session?.turn) session.turn.tools = true;
+  }
+  if (event === "Stop") {
+    // Miss detection (fixes §3.7): the turn used write/edit/shell tools but
+    // the task list did not change -> count a missed turn.
+    const session = ensureSession(next);
+    if (session.turn && transcriptWorkTools(payload.transcript)
+      && tasksFingerprint(next.tasks) === session.turn.tasks) {
+      next.missed_turns = (Number.isInteger(store.missed_turns) ? store.missed_turns : 0) + 1;
+    }
+  }
   if (event === "SessionEnd") ensureSession(next).state = "ended";
   return next;
 }

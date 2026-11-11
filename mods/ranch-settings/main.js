@@ -1,7 +1,8 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { theme, shared, setShared, run, exec, home, knownAgents, nextCommand, window as appWindow } from "herdr";
+import { theme, shared, setShared, run, exec, home, knownAgents, nextCommand, readTextFile, window as appWindow } from "herdr";
 import { runGh } from "./lib/git.js";
+import { relativeTime } from "./lib/format.js";
 import { SETTINGS_KEY, resolveSettings, withSetting } from "./lib/settings.js";
 import { tasksCommand } from "./lib/tasks-command.js";
 
@@ -32,6 +33,7 @@ export default class RanchSettings extends View {
     this.tasks = null; // null = checking; {agents: {claude, codex, opencode}} | {error: true}
     this.setup = null; // output of the last "Set up" run
     this.health = { git: "checking", herdr: "checking" };
+    this.report = null; // agent -> last_event_at, from ~/.herdr/ranch/health.json
     cx.spawn(async (cx) => {
       try {
         this.known = await knownAgents();
@@ -109,6 +111,18 @@ export default class RanchSettings extends View {
         })
         .catch(() => "missing");
       this.health = { git, herdr };
+      // Per-agent last event time (fixes 3.8), written by the adapters.
+      try {
+        const raw = await readTextFile(`${home()}/.herdr/ranch/health.json`);
+        const agents = JSON.parse(raw || "{}")?.agents ?? {};
+        this.report = Object.fromEntries(
+          Object.entries(agents)
+            .filter(([, v]) => v && typeof v.last_event_at === "string")
+            .map(([k, v]) => [k, v.last_event_at])
+        );
+      } catch {
+        this.report = null;
+      }
       cx.notify();
     });
   }
@@ -294,6 +308,14 @@ export default class RanchSettings extends View {
         rows.push(h_flex().flex_none().items_center().justify_between().gap(8)
           .child(div().flex_1().min_w(0).truncate().child(key))
           .child(div().text_color(color).child(status)));
+        // "last report N min ago" (fixes 3.8): when the agent last evented.
+        const at = this.report?.[key] ? Date.parse(this.report[key]) : null;
+        if (Number.isFinite(at)) {
+          const ago = Date.now() - at;
+          if (ago >= 0) {
+            rows.push(div().text_size(11).text_color(t.dim).child(`last report ${relativeTime(ago)}`));
+          }
+        }
       }
       const repair = TASK_KEYS.some((key) => this.tasks.agents[key] === "broken");
       // Codex hooks waiting for trust: only Codex's own /hooks can approve them.

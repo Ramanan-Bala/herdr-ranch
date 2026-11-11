@@ -1,18 +1,26 @@
 // ranch-tasks plugin
-// Ranch task reporting for OpenCode (requirements.md §7.4). This file is
-// copied alone into ~/.config/opencode/plugins/, so it must not import ../lib:
-// it inlines a minimal store read/normalise/atomic-write. It runs inside the
-// OpenCode process and only ever writes the store file — nothing else.
+// Ranch task reporting for OpenCode (requirements.md §7.4, fixes §3.3). This
+// file is copied alone into ~/.config/opencode/plugins/, so it must not import
+// ../lib: it inlines a minimal store read/normalise/atomic-write with the same
+// session-keyed layout the other adapters use (sessions/<session>.json plus a
+// terminals/<terminal>.json pointer; legacy flat stores are still read). It
+// runs inside the OpenCode process and only ever writes the store files —
+// nothing else.
 // One file, both hosts: OpenCode 2.x schema-validates the default export as
 // an object ({ id, setup, server }) and calls setup(ctx); v1 calls server(),
 // which returns the classic hooks object.
+import { execFileSync } from "node:child_process";
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
-const STORE_VERSION = 1;
+const STORE_VERSION = 2;
 const TASKS_DIR = ".herdr/ranch/tasks";
 const TASK_STATUS = new Set(["pending", "in_progress", "completed", "cancelled"]);
+// The marked block the installer writes to ~/.config/opencode/AGENTS.md; when
+// it is there, the plugin does not also inject its rule (fixes F13: one
+// instruction source).
+const BLOCK_MARK = "<!-- ranch-tasks:begin -->";
 
 function homeDir() {
   return process.env.RANCH_HOME || homedir();
@@ -23,16 +31,43 @@ function storeFileName(address) {
   return safe ? `${safe}.json` : null;
 }
 
-function storePath() {
+function sessionPath(session) {
+  const name = storeFileName(session);
+  return name ? join(homeDir(), TASKS_DIR, "sessions", name) : null;
+}
+
+function terminalPath() {
+  const name = storeFileName(process.env.HC_TERMINAL_ID);
+  return name ? join(homeDir(), TASKS_DIR, "terminals", name) : null;
+}
+
+function legacyPath() {
   const name = storeFileName(process.env.HC_TERMINAL_ID);
   return name ? join(homeDir(), TASKS_DIR, name) : null;
+}
+
+/** When the terminal started, from `hc get --json` (created_ms); best effort. */
+function terminalStartedAt(terminal) {
+  try {
+    const out = execFileSync("hc", ["get", "--json", String(terminal)], {
+      timeout: 2000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    });
+    const ms = JSON.parse(out)?.created_ms;
+    if (typeof ms === "number" && ms > 0) return new Date(ms).toISOString();
+  } catch {
+    // No hc on PATH or unknown terminal: keep what the store already had.
+  }
+  return null;
 }
 
 function emptyStore(terminal) {
   return {
     version: STORE_VERSION,
     terminal,
-    agent: "opencode",
+    agent: { app: "opencode", session: null, pid: process.pid },
+    terminal_started_at: null,
+    seq: 0,
+    missed_turns: 0,
     updated_at: null,
     session: null,
     tasks: [],
@@ -47,7 +82,8 @@ function normalizeStore(raw, terminal) {
   }
   // The store belongs to another agent (terminal reuse, I10): never continue
   // its session, tasks or sub-agents.
-  if (typeof raw.agent === "string" && raw.agent !== "opencode") return emptyStore(terminal);
+  const owner = typeof raw.agent === "string" ? raw.agent : raw.agent?.app;
+  if (typeof owner === "string" && owner && owner !== "opencode") return emptyStore(terminal);
   const tasks = (Array.isArray(raw.tasks) ? raw.tasks : [])
     .filter((t) => t && typeof t.title === "string" && t.title.trim())
     .map((t) => ({
@@ -64,6 +100,8 @@ function normalizeStore(raw, terminal) {
       status: s.status === "done" || s.status === "failed" ? s.status : "running",
       started_at: typeof s.started_at === "string" ? s.started_at : null,
       ended_at: typeof s.ended_at === "string" ? s.ended_at : null,
+      ...(typeof s.parent_terminal === "string" && s.parent_terminal ? { parent_terminal: s.parent_terminal } : {}),
+      ...(typeof s.parent_session === "string" && s.parent_session ? { parent_session: s.parent_session } : {}),
     }));
   const session = raw.session && typeof raw.session === "object"
     ? {
@@ -76,12 +114,21 @@ function normalizeStore(raw, terminal) {
         ...(raw.session.activity && typeof raw.session.activity.state === "string" && typeof raw.session.activity.at === "number"
           ? { activity: { state: raw.session.activity.state, at: raw.session.activity.at } }
           : {}),
+        ...(raw.session.turn && typeof raw.session.turn.tasks === "string"
+          ? { turn: { tasks: raw.session.turn.tasks, tools: raw.session.turn.tools === true } }
+          : {}),
       }
+    : null;
+  const agent = raw.agent && typeof raw.agent === "object" && typeof raw.agent.app === "string"
+    ? { app: raw.agent.app, session: typeof raw.agent.session === "string" ? raw.agent.session : null, pid: raw.agent.pid }
     : null;
   return {
     version: STORE_VERSION,
     terminal: typeof raw.terminal === "string" ? raw.terminal : terminal,
-    agent: "opencode",
+    agent: agent ?? { app: "opencode", session: null, pid: process.pid },
+    terminal_started_at: typeof raw.terminal_started_at === "string" ? raw.terminal_started_at : null,
+    seq: typeof raw.seq === "number" && Number.isInteger(raw.seq) && raw.seq >= 0 ? raw.seq : 0,
+    missed_turns: typeof raw.missed_turns === "number" && Number.isInteger(raw.missed_turns) && raw.missed_turns >= 0 ? raw.missed_turns : 0,
     updated_at: typeof raw.updated_at === "string" ? raw.updated_at : null,
     session,
     tasks,
@@ -89,15 +136,20 @@ function normalizeStore(raw, terminal) {
   };
 }
 
-function loadStore(path) {
+function readJsonFile(path) {
   try {
-    return normalizeStore(JSON.parse(readFileSync(path, "utf8")), process.env.HC_TERMINAL_ID);
+    return JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    return emptyStore(process.env.HC_TERMINAL_ID);
+    return null;
   }
 }
 
 const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+
+function loadStore(path) {
+  const raw = readJsonFile(path);
+  return raw ? normalizeStore(raw, process.env.HC_TERMINAL_ID) : emptyStore(process.env.HC_TERMINAL_ID);
+}
 
 function saveStore(path, store) {
   store.updated_at = new Date().toISOString();
@@ -151,13 +203,12 @@ function takeLock(path) {
 }
 
 /**
- * One locked read → fn → conditional write. When the lock cannot be taken
- * the whole read-modify-write is retried once; failing that the write is
- * skipped — the store is never written without the lock (I9). Throws only
- * for genuine write errors (the callers catch everything).
+ * Runs one read-modify-write under the store lock. When the lock cannot be
+ * taken it is retried once; failing that the write is skipped, so the store
+ * is never written without the lock (I9). Write errors propagate to the
+ * caller, which catches everything.
  */
-function updateStore(fn) {
-  const path = storePath();
+function withLock(path, fn) {
   if (!path) return;
   for (let attempt = 0; attempt < 2; attempt++) {
     const release = takeLock(path);
@@ -166,9 +217,7 @@ function updateStore(fn) {
       continue;
     }
     try {
-      const loaded = loadStore(path);
-      const next = fn(loaded);
-      if (next && next !== loaded) saveStore(path, next);
+      fn();
       return;
     } finally {
       release();
@@ -208,13 +257,33 @@ export function opencodeActivity(store, event) {
  * { type: "chat.message", properties: { sessionID, text } }). Returns the next
  * store, or the same store when the event changes nothing.
  */
+/** Task-list fingerprint for missed-turn detection (§3.7). */
+function fingerprint(tasks) {
+  return JSON.stringify((Array.isArray(tasks) ? tasks : []).map((t) => [t.id, t.status, t.title]));
+}
+
 export function reduceOpencode(store, event) {
   const next = reduceOpencodeCore(store, event);
   const state = opencodeActivity(next ?? store, event);
-  if (!state) return next;
-  const base = next ?? store;
+  let base = next ?? store;
+  // Missed turns (§3.7): the session did work this turn but the task list did
+  // not change since the prompt. Counted once; the turn is consumed so
+  // repeated idle events do not recount.
+  const turn = base.session?.turn;
+  if (turn) {
+    if (state === "working" && !turn.tools) {
+      base = { ...base, session: { ...base.session, turn: { ...turn, tools: true } } };
+    } else if (state === "done" && turn.tools && fingerprint(base.tasks) === turn.tasks) {
+      base = {
+        ...base,
+        missed_turns: (Number.isInteger(base.missed_turns) ? base.missed_turns : 0) + 1,
+        session: { ...base.session, turn: { ...turn, tools: false } },
+      };
+    }
+  }
+  if (!state) return base;
   // Only write when the state changes: events arrive many times a second.
-  if (base.session?.activity?.state === state) return next;
+  if (base.session?.activity?.state === state) return base;
   const session = base.session && typeof base.session === "object"
     ? base.session
     : { id: null, title: null, title_source: null, first_prompt: null, state: "running" };
@@ -324,13 +393,12 @@ function reduceOpencodeCore(store, event) {
     const text = typeof props.text === "string" ? props.text : "";
     if (!text) return store;
     const session = { id: null, title: null, title_source: null, first_prompt: null, state: "running", ...(store.session ?? {}) };
-    // Only the main session's first message counts.
-    if (!session.first_prompt && (!session.id || props.sessionID === session.id)) {
-      session.first_prompt = text.slice(0, 500);
-      next.session = session;
-      return next;
-    }
-    return store;
+    if (session.id && props.sessionID && props.sessionID !== session.id) return store;
+    // New turn (§3.7): remember the list as it stood at the prompt.
+    session.turn = { tasks: fingerprint(next.tasks), tools: false };
+    if (!session.first_prompt) session.first_prompt = text.slice(0, 500);
+    next.session = session;
+    return next;
   }
 
   return store;
@@ -339,6 +407,15 @@ function reduceOpencodeCore(store, event) {
 // Mandatory task reporting (also in ~/.config/opencode/AGENTS.md): added to
 // the system prompt of every request so the model sees it each turn.
 const TASK_RULE = "Task reporting is mandatory (Ranch): for EVERY user message, before anything else record the work as tasks with the todowrite tool (at least one task per message, one per step when there are several), mark each in_progress when you start it and completed the moment it is done, and complete all of them before you end your reply.";
+
+/** True when the installer's marked rule block is already in AGENTS.md (F13). */
+function agentsBlockInstalled() {
+  try {
+    return readFileSync(join(homedir(), ".config", "opencode", "AGENTS.md"), "utf8").includes(BLOCK_MARK);
+  } catch {
+    return false;
+  }
+}
 
 // ---- OpenCode 2.x -----------------------------------------------------------
 // v2's bus-event payload shapes are undocumented, so every read is defensive
@@ -390,7 +467,61 @@ function adoptSession(store, event) {
 /** One store read → reduce → conditional atomic write, shared by both hosts. */
 function recordEvent(event) {
   try {
-    updateStore((loaded) => reduceOpencode(adoptSession(loaded, event), event));
+    withLock(terminalPath(), () => {
+      const terminal = process.env.HC_TERMINAL_ID;
+      const tPath = terminalPath();
+      if (!terminal || !tPath) return;
+      const raw = readJsonFile(tPath);
+      let sessionFile = null;
+      let loaded;
+      if (raw && typeof raw.session === "string" && raw.session) {
+        // Terminal pointer → the store lives in sessions/<session>.json.
+        sessionFile = sessionPath(raw.session) ?? tPath;
+        loaded = loadStore(sessionFile);
+      } else if (raw) {
+        // No session id yet: the terminal file itself is the store.
+        loaded = loadStore(tPath);
+      } else {
+        // First event in this terminal: adopt a legacy flat store if one exists
+        // (e.g. the session was resumed in a new terminal).
+        const legacy = legacyPath();
+        const legacyRaw = legacy ? readJsonFile(legacy) : null;
+        const legacyApp = typeof legacyRaw?.agent === "string" ? legacyRaw.agent : legacyRaw?.agent?.app;
+        const candidate = legacyRaw ? normalizeStore(legacyRaw, terminal) : null;
+        const legacySession = candidate?.session?.id ?? candidate?.agent?.session ?? null;
+        const incomingSession = pickSessionID(event);
+        const sameSession = !legacySession || !incomingSession || legacySession === incomingSession;
+        loaded = candidate && legacyApp === "opencode" && sameSession ? candidate : emptyStore(terminal);
+        loaded.terminal = terminal;
+      }
+      const adopted = adoptSession(loaded, event);
+      const next = reduceOpencode(adopted, event);
+      if (next === adopted && adopted === loaded) return;
+
+      // Identity (§3.3): schema 2, monotonic seq, this agent run.
+      const updated = { ...next };
+      updated.version = STORE_VERSION;
+      updated.terminal = terminal;
+      const sid = typeof updated.session?.id === "string" && updated.session.id ? updated.session.id : null;
+      updated.agent = { app: "opencode", session: sid, pid: process.pid };
+      updated.seq = Math.max(Number.isInteger(loaded.seq) ? loaded.seq : 0, Number.isInteger(updated.seq) ? updated.seq : 0) + 1;
+      updated.terminal_started_at = loaded.terminal_started_at ?? terminalStartedAt(terminal) ?? new Date().toISOString();
+      updated.updated_at = new Date().toISOString();
+      if (sid) {
+        saveStore(sessionPath(sid) ?? sessionFile, updated); // the incoming session's file, so the pointer matches after a session change
+        // Terminal pointer so the mod can find the session store again.
+        saveStore(tPath, {
+          version: STORE_VERSION,
+          terminal,
+          terminal_started_at: updated.terminal_started_at,
+          agent: updated.agent,
+          session: sid,
+          updated_at: updated.updated_at,
+        });
+      } else {
+        saveStore(tPath, updated);
+      }
+    });
   } catch {
     // Never break the host: task reporting fails silently.
   }
@@ -441,6 +572,14 @@ function normalizeV2(event) {
       return { type, properties: { sessionID: sid } };
     case "session.status":
       return { type, properties: { sessionID: sid, status: raw.status } };
+    case "todo.updated": {
+      // Bus todo updates (v2): the tool hook already records the tool-based
+      // path; this catches session-scoped todo events.
+      const todos = Array.isArray(raw.todos) ? raw.todos
+        : Array.isArray(raw.info?.todos) ? raw.info.todos : null;
+      if (!todos) return null;
+      return { type: "todo.updated", properties: { sessionID: sid, todos } };
+    }
     default:
       return null;
   }
@@ -466,6 +605,9 @@ function pickPromptText(event) {
 export const RanchTasks = async () => ({
   "experimental.chat.system.transform": async (_input, output) => {
     try {
+      // One instruction source (fixes F13): the installer's AGENTS.md block
+      // already carries the rule, so skip the plugin copy when it exists.
+      if (agentsBlockInstalled()) return;
       if (Array.isArray(output?.system) && !output.system.includes(TASK_RULE)) output.system.push(TASK_RULE);
     } catch {
       // Never break the host.
@@ -473,11 +615,8 @@ export const RanchTasks = async () => ({
   },
 
   event: async ({ event }) => {
-    try {
-      updateStore((store) => reduceOpencode(store, event));
-    } catch {
-      // Never break the host: task reporting fails silently.
-    }
+    // v1 hosts deliver v1 events; a bus-shaped (v2) event still records.
+    recordEvent(normalizeV2(event) ?? event);
   },
 
   "chat.message": async (input, output) => {
@@ -488,10 +627,7 @@ export const RanchTasks = async () => ({
         .map((part) => part.text)
         .join("");
       if (!text) return;
-      updateStore((store) => reduceOpencode(store, {
-        type: "chat.message",
-        properties: { sessionID: input?.sessionID, text },
-      }));
+      recordEvent({ type: "chat.message", properties: { sessionID: input?.sessionID, text } });
     } catch {
       // Never break the host: task reporting fails silently.
     }
@@ -553,10 +689,12 @@ const RanchTasksPlugin = {
         recordEvent({ type: "chat.message", properties: { sessionID: sid, text } });
       })));
 
-      // System prompt: the mandatory task rule, exactly once. v2 system parts
-      // are objects ({ type: "text", text }), never bare strings.
+      // System prompt: the mandatory task rule, exactly once — skipped when
+      // the installer's AGENTS.md block already carries it (fixes F13). v2
+      // system parts are objects ({ type: "text", text }), never bare strings.
       quiet(ctx?.session?.hook?.("context", safeCall((event) => {
         if (!Array.isArray(event?.system)) return;
+        if (agentsBlockInstalled()) return;
         const has = event.system.some((part) => part === TASK_RULE || part?.text === TASK_RULE);
         if (!has) event.system.push({ type: "text", text: TASK_RULE });
       })));
