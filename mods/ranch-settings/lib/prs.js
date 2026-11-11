@@ -89,17 +89,30 @@ export function prsFor(registry, top, branch) {
 }
 
 /**
+ * `gh pr create` as a command actually run: at the start of the command or of
+ * a segment (after ; && || | ( $( or a newline), optionally after env
+ * assignments — not the words inside a comment, string or heredoc body.
+ */
+const GH_PR_CREATE = /(?:^|[\n;&|(]|\$\()\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*gh\s+pr\s+create\b/;
+
+/**
  * Pure detection of a `gh pr create` in a PostToolUse hook payload: returns
  * { url, number } when the command created a PR, else null. Shared by the
  * reducers (they record it in the store) and by the CLI (shared registry).
  */
 export function detectCreatedPr(payload) {
   const input = payload?.tool_input;
-  const command = Array.isArray(input?.command) ? input.command.join(" ") : input?.command;
-  if (typeof command !== "string" || !/\bgh\s+pr\s+create\b/.test(command)) return null;
+  // Codex passes argv (["bash", "-lc", "gh pr create …"]): the joined line
+  // and each element (a shell's -c script) are candidate commands.
+  const commands = Array.isArray(input?.command)
+    ? [input.command.join(" "), ...input.command]
+    : [input?.command];
+  if (!commands.some((c) => typeof c === "string" && GH_PR_CREATE.test(c))) return null;
   const response = typeof payload.tool_response === "string"
     ? payload.tool_response
     : JSON.stringify(payload.tool_response ?? "");
-  const match = PR_URL.exec(response ?? "");
+  // gh prints the new PR's URL last; earlier URLs are other output.
+  const matches = [...(response ?? "").matchAll(new RegExp(PR_URL.source, "g"))];
+  const match = matches.at(-1);
   return match ? { url: match[0], number: Number(match[1]) } : null;
 }

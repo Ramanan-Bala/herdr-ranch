@@ -105,3 +105,19 @@ test("detectCreatedPr matches the reducers' gh pr create detection", () => {
   assert.equal(detectCreatedPr({}), null);
   assert.equal(detectCreatedPr(null), null);
 });
+
+test("detectCreatedPr only counts gh pr create run as a command", () => {
+  const url = "https://github.com/o/r/pull/9";
+  const ran = (command, out = `${url}\n`) => detectCreatedPr({ tool_input: { command }, tool_response: out });
+  // Real invocations: after cd &&, ;, a pipe, $( and with env assignments.
+  assert.equal(ran("cd repo && gh pr create --fill")?.number, 9);
+  assert.equal(ran("git push -q ; gh pr create --base main")?.number, 9);
+  assert.equal(ran('echo x | GH_TOKEN=x gh pr create --fill')?.number, 9);
+  assert.equal(ran('url=$(gh pr create --fill)')?.number, 9);
+  // Mentions are not invocations: comments, strings, heredoc bodies.
+  assert.equal(ran("python3 - <<'EOF'\n  /** recorded `gh pr create` here */\nEOF"), null);
+  assert.equal(ran('echo "run gh pr create later"'), null);
+  assert.equal(ran("grep -n 'gh pr create' lib/prs.js"), null);
+  // The URL gh prints last wins over earlier URLs in the output.
+  assert.equal(ran("gh pr create --fill", "see https://github.com/a/b/pull/1\nhttps://github.com/o/r/pull/9\n")?.number, 9);
+});

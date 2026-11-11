@@ -89,6 +89,9 @@ function editorName(path) {
   return EDITOR_NAMES[base] ?? base;
 }
 
+/** How long a task-store read may run before a new one replaces it. */
+const TASKS_READ_STALL_MS = 5000;
+
 export default class RanchSession extends View {
   init(_props, cx) {
     this.remembered = new Map(); // tabId -> chosen agent address
@@ -254,11 +257,16 @@ export default class RanchSession extends View {
 
   /** Reads the chosen agent's store file (one read in flight). */
   async loadTasks(cx) {
-    if (this.tasksBusy) {
+    // A read that never settles (seen across a mod reload) must not leave
+    // tasksBusy set forever: after TASKS_READ_STALL_MS a new read takes over
+    // and the stalled one's result is ignored by its generation.
+    if (this.tasksBusy && Date.now() - (this.tasksBusyAt ?? 0) < TASKS_READ_STALL_MS) {
       this.tasksPending = true;
       return;
     }
+    const gen = (this.tasksGen = (this.tasksGen ?? 0) + 1);
     this.tasksBusy = true;
+    this.tasksBusyAt = Date.now();
     try {
       const s = this.session();
       const agent = s.chosen;
@@ -270,6 +278,7 @@ export default class RanchSession extends View {
       const key = `${agent.address}@${s.machine ?? ""}`;
       const homeDir = await this.homeFor(s.machine);
       const { parsed } = await this.readStoreText(s.machine, homeDir, agent.address);
+      if (gen !== this.tasksGen) return; // superseded after a stall
       // Stale read (I2): the focused agent changed while the file was read.
       const now = this.session();
       if (now.chosen?.address !== agent.address || (now.machine ?? null) !== (s.machine ?? null)) return;
@@ -282,10 +291,13 @@ export default class RanchSession extends View {
       this.loadSubTasks(s, cx);
       return;
     } finally {
-      this.tasksBusy = false;
-      if (this.tasksPending) {
-        this.tasksPending = false;
-        this.loadTasks(cx);
+      // A newer read (after a stall) owns the flags.
+      if (gen === this.tasksGen) {
+        this.tasksBusy = false;
+        if (this.tasksPending) {
+          this.tasksPending = false;
+          this.loadTasks(cx);
+        }
       }
     }
   }
@@ -643,7 +655,8 @@ export default class RanchSession extends View {
       this.push = { busy: false, err: null };
       this.copyAt = 0;
     }
-    if (akey !== this.tasks.key && !this.tasksBusy) this.loadTasks(cx);
+    // loadTasks guards itself (and takes over from a stalled read).
+    if (akey !== this.tasks.key) this.loadTasks(cx);
     // The action bar's Editor button needs one detection per machine.
     this.maybeDetectEditor(s.machine, cx);
     // Only needed while the store is missing (to offer Set up), once a minute.
@@ -1547,12 +1560,11 @@ export default class RanchSession extends View {
    * main agent's and each sub-agent's store, deduped against the branch PR.
    */
   recordedPrs(s, pr) {
-    const host = this.git.summary?.host;
-    const branchUrl = pr?.url || (host && pr?.number ? links(host).pr(pr.number) : null);
+    const branchUrl = this.branchPrUrl(pr);
     const seenUrls = new Set(branchUrl ? [branchUrl] : []);
     const out = [];
     const stores = [];
-    if (this.tasks.parsed?.ok) stores.push(this.tasks.parsed.store);
+    if (this.tasksReady(s) && this.tasks.parsed?.ok) stores.push(this.tasks.parsed.store);
     for (const k of this.subTerminals(s)) {
       const entry = this.subTasks.get(k.address);
       if (entry?.parsed?.ok) stores.push(entry.parsed.store);
@@ -1575,6 +1587,12 @@ export default class RanchSession extends View {
       out.push(p);
     }
     return out;
+  }
+
+  /** The branch PR's URL (gh's, else built from the host and number). */
+  branchPrUrl(pr) {
+    const host = this.git.summary?.host;
+    return pr?.url || (host && pr?.number ? links(host).pr(pr.number) : null);
   }
 
   /** The CI glyph: ✕ failed, ○ ring running, ✓ passed, – skipped. */
