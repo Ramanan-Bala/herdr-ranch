@@ -1,0 +1,20 @@
+Orca for Herdr
+Copyright 2026 VladTemp27
+
+This layout's mods include code adapted from Herdr Desktop's shipped mods
+(https://github.com/herdrdev/herdr-app), licensed under the Apache License, Version 2.0.
+
+mods/better-sidebar is Better Sidebar from munza/herdr-mods
+(https://github.com/munza/herdr-mods), Copyright 2026 Tawsif Aqib, licensed under the
+Apache License, Version 2.0, and modified here (see mods/better-sidebar/CHANGES.md).
+Its NOTICE is kept in licenses/munza-herdr-mods-NOTICE.txt.
+
+mods/t3-actions is t3-actions from JinJieBeWater/herdr-t3
+(https://github.com/JinJieBeWater/herdr-t3), licensed under the Apache License,
+Version 2.0, and modified here (see mods/t3-actions/CHANGES.md).
+
+mods/usage-limits asks the claude and codex CLIs for usage the way Joseph Malicki's
+jmalicki/herdr-mod-ai-usage (MIT) does; no code is copied from it.
+
+mods/excalidraw bundles Excalidraw (MIT) and mods/file-icons bundles icons from the
+Material Icon Theme (MIT); their notices are in those folders.
