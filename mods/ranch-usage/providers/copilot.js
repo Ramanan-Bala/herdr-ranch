@@ -1,4 +1,4 @@
-// GitHub Copilot: `gh api /copilot_internal/user` (helpers/copilot-usage.sh).
+// GitHub Copilot: `gh api /copilot_internal/user` (helpers/copilot-usage.mjs).
 // gh authenticates itself; nothing here sees a token.
 import { makeWindow, okReport, errorReport, unavailableReport, toEpoch } from "../usage/report.js";
 
@@ -61,6 +61,6 @@ export default {
   name: "Copilot",
   icon: "icons/copilot.svg",
   tint: true, // one-colour glyph (fill="currentColor"): draw with svg() in the text colour
-  helper: "helpers/copilot-usage.sh",
+  helper: "helpers/copilot-usage.mjs",
   parse,
 };

@@ -343,7 +343,7 @@ export const PR_JSON_FIELDS =
  * Where `gh` usually lives. Herdr runs programs with the login shell's PATH,
  * which may lack Homebrew; mods try PATH first, then these.
  */
-export const GH_CANDIDATES = ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh", "/home/linuxbrew/.linuxbrew/bin/gh"];
+export const GH_CANDIDATES = ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh", "/home/linuxbrew/.linuxbrew/bin/gh", "C:/Program Files/GitHub CLI/gh.exe"];
 
 /**
  * Runs gh with `run(cmd, args)` (bind it to Herdr's exec with cwd/on),

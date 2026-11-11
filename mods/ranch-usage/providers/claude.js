@@ -1,4 +1,4 @@
-// Claude Code: the CLI's own `get_usage` control request (helpers/claude-usage.sh).
+// Claude Code: the CLI's own `get_usage` control request (helpers/claude-usage.mjs).
 // The CLI authenticates itself; nothing here sees a token.
 import { makeWindow, okReport, errorReport, unavailableReport, toEpoch, jsonLines } from "../usage/report.js";
 
@@ -52,6 +52,6 @@ export default {
   id: "claude",
   name: "Claude",
   icon: "icons/claude.svg",
-  helper: "helpers/claude-usage.sh",
+  helper: "helpers/claude-usage.mjs",
   parse,
 };

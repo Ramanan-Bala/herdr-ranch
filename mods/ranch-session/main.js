@@ -52,19 +52,23 @@ import {
   herdrSubStatus,
   activityStatus,
 } from "./model.js";
+import { isWinHome, whereFirstPath, editorLaunch, windowsHome } from "./win.js";
 
 const MAX_FILES = 20;
 
 // Windows can't exec the POSIX sh launcher: locally Herdr's platform tells the
 // OS; on a remote machine, the home dir we probed does.
 const tasksCmd = (dir, args, machine) =>
-  tasksCommand(dir, args, machine ? looksWindows(dir) : appWindow().platform === "windows");
+  tasksCommand(dir, args, machine ? looksWindows(dir) : appWindow()?.platform === "windows");
+
+// This computer is Windows (fixes doc F14: "This PC").
+const isWin = () => appWindow()?.platform === "windows";
 
 /** Friendly name for a detected editor CLI, for tooltips. */
 const EDITOR_NAMES = { cursor: "Cursor", code: "VS Code", zed: "Zed", subl: "Sublime Text" };
 
 function editorName(path) {
-  const base = (path.split("/").pop() ?? "").replace(/\.exe$/i, "");
+  const base = (path.split(/[\\/]/).pop() ?? "").replace(/\.(exe|cmd)$/i, "");
   return EDITOR_NAMES[base] ?? base;
 }
 
@@ -126,7 +130,7 @@ export default class RanchSession extends View {
       tab,
       space,
       machine: space?.machine ?? null,
-      machineLabel: space?.machine ?? "This Mac",
+      machineLabel: space?.machine ?? (isWin() ? "This PC" : "This Mac"),
       inTab,
       chosen,
       cwd: pane?.cwd ?? null,
@@ -141,6 +145,16 @@ export default class RanchSession extends View {
     try {
       const r = await exec("sh", ["-c", 'printf %s "$HOME"'], { on: machine });
       const out = r.code === 0 ? r.stdout.trim() : "";
+      if (out) {
+        this.homes.set(machine, out);
+        return out;
+      }
+    } catch {}
+    // Windows remote (F12): sh answered nothing, so ask cmd.exe. Backslashes
+    // are normalized so the store path joins work like on Unix.
+    try {
+      const r = await exec("cmd.exe", ["/c", "echo %USERPROFILE%"], { on: machine });
+      const out = windowsHome(r.code === 0 ? r.stdout : "");
       if (out) {
         this.homes.set(machine, out);
         return out;
@@ -284,6 +298,11 @@ export default class RanchSession extends View {
       if (entry?.parsed?.ok) lists.push(entry.parsed.store.tasks);
     }
     return lists;
+  }
+
+  /** Cancelled tasks are struck through, not counted in "x of y" (F7). */
+  liveTasks(tasks) {
+    return tasks.filter((t) => t.status !== "cancelled");
   }
 
   /** Publishes the focused tab's unfinished-task count for the sidebar badge. */
@@ -586,7 +605,7 @@ export default class RanchSession extends View {
 
   /** Completed/total across the chosen agent's tasks and its sub-agents'. */
   totals(s) {
-    return totalsOf(this.taskLists(s));
+    return totalsOf(this.taskLists(s).map((tasks) => this.liveTasks(tasks)));
   }
 
   /** Same rule as the top bar: an unnamed tab shows its agent's program name. */
@@ -660,7 +679,9 @@ export default class RanchSession extends View {
           "Editor",
           `Open in ${editorName(editor.path)}`,
           () => {
-            exec(editor.path, [top], { on: s.machine }).catch(() => {});
+            // .cmd launchers (code.cmd, cursor.cmd) need cmd.exe on Windows (F10).
+            const [cmd, args] = editorLaunch(editor.path, top);
+            exec(cmd, args, { on: s.machine }).catch(() => {});
           }
         )
       );
@@ -763,12 +784,21 @@ export default class RanchSession extends View {
     cx.spawn(async (cx) => {
       let path = null;
       try {
-        const r = await exec(
-          "sh",
-          ["-c", "command -v cursor || command -v code || command -v zed || command -v subl"],
-          { on: machine }
-        );
-        path = r.code === 0 ? r.stdout.trim().split("\n")[0] || null : null;
+        // Windows (F10): Git sh answers with an MSYS path exec can't start, so
+        // ask where.exe; it exits 1 when some names are missing — don't check.
+        // Decide by the target machine's home: a remote may differ from here.
+        const target = machine ? await this.homeFor(machine) : home();
+        if (isWinHome(target)) {
+          const r = await exec("where.exe", ["cursor.cmd", "code.cmd", "zed.exe", "subl.exe"], { on: machine });
+          path = whereFirstPath(r.stdout);
+        } else {
+          const r = await exec(
+            "sh",
+            ["-c", "command -v cursor || command -v code || command -v zed || command -v subl"],
+            { on: machine }
+          );
+          path = r.code === 0 ? r.stdout.trim().split("\n")[0] || null : null;
+        }
       } catch {}
       this.editors.set(key, { path, busy: false });
       cx.notify();
@@ -1284,7 +1314,7 @@ export default class RanchSession extends View {
     const open = this.tasksOpen.get(addr) ?? true;
 
     const head = h_flex().gap(6).items_center().min_w(0);
-    const prog = parsed?.ok ? progress(parsed.store.tasks) : { done: 0, total: 0 };
+    const prog = parsed?.ok ? progress(this.liveTasks(parsed.store.tasks)) : { done: 0, total: 0 };
     const label = isMain
       ? "Tasks"
       : `Tasks \u00b7 ${sub.name || sub.template || sub.program?.name || sub.address}`;
@@ -1359,7 +1389,9 @@ export default class RanchSession extends View {
           )
         )
     );
-    for (const task of orderTasks(tasks)) card.child(this.taskRow(t, task, addr));
+    // Cancelled tasks render struck through, after the live ones.
+    const cancelled = tasks.filter((x) => x.status === "cancelled");
+    for (const task of [...orderTasks(this.liveTasks(tasks)), ...cancelled]) card.child(this.taskRow(t, task, addr));
     return card;
   }
 
@@ -1377,6 +1409,14 @@ export default class RanchSession extends View {
       return row
         .child(div().size(9).flex_none().rounded(5).border(1.5).border_color(t.dim))
         .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(task.title));
+    }
+    if (task.status === "cancelled") {
+      return row
+        .child(div().flex_none().text_size(11).text_color(t.dim).child("\u2013"))
+        .child(
+          div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).line_through()
+            .child(task.title)
+        );
     }
     return row
       .child(svg("mods/ranch-session/check.svg").size(11).flex_none().text_color(t.done))

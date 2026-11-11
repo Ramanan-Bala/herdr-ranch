@@ -1,4 +1,4 @@
-// Codex: `codex app-server` → account/rateLimits/read (helpers/codex-limits.sh),
+// Codex: `codex app-server` → account/rateLimits/read (helpers/codex-limits.mjs),
 // or the newest snapshot Codex logged, printed as {"snapshot": <line>}.
 import { makeWindow, okReport, errorReport, toEpoch, jsonLines } from "../usage/report.js";
 
@@ -61,6 +61,6 @@ export default {
   id: "codex",
   name: "Codex",
   icon: "icons/codex.svg",
-  helper: "helpers/codex-limits.sh",
+  helper: "helpers/codex-limits.mjs",
   parse,
 };

@@ -1,7 +1,7 @@
 // Codex adapter: pure reducer over hook payloads (requirements.md §7.4).
 // Codex exposes no session title, so session.title stays null.
 
-const TASK_STATUS = new Set(["pending", "in_progress", "completed"]);
+const TASK_STATUS = new Set(["pending", "in_progress", "completed", "cancelled"]);
 const KNOWN_EVENTS = new Set([
   "SessionStart", "UserPromptSubmit", "PostToolUse", "SubagentStart", "SubagentStop", "SessionEnd",
 ]);
