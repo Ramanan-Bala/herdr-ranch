@@ -494,12 +494,14 @@ export default class RanchSidebar extends View {
         ));
       }
       if (this.settings.card.pr && c.pr) {
-        const color = c.pr.state === "open" ? t.accent
+        // Same colours as the Session panel's PR pill (GitHub's).
+        const color = c.pr.state === "open" ? t.ansi2
           : c.pr.state === "draft" ? t.dim
-          : c.pr.state === "merged" ? t.done
+          : c.pr.state === "merged" ? t.ansi5
           : t.blocked;
+        const stateWord = { open: "Open", draft: "Draft", merged: "Merged", closed: "Closed" }[c.pr.state] ?? "";
         parts3.push(div().id(`pr-${c.tabId}`).flex_none().text_size(10).font_medium().text_color(color)
-          .cursor_pointer().tooltip(c.pr.title ?? `Pull request #${c.pr.number}`)
+          .cursor_pointer().tooltip([stateWord, c.pr.title ?? `Pull request #${c.pr.number}`].filter(Boolean).join(" · "))
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .on_click((_e, cx) => {
             cx.stop_propagation();

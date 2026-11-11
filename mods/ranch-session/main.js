@@ -1079,9 +1079,12 @@ export default class RanchSession extends View {
     const head = h_flex().gap(6).items_center().min_w(0);
     head.child(this.cardTitle(t, "Pull request"));
     head.child(div().flex_1().min_w(0));
-    const stateToken = { open: "working", draft: "dim", merged: "done", closed: "blocked" }[pr.state];
+    // The PR's own state as the label (the token is only its colour), in
+    // GitHub's colours: open green, draft grey, merged purple, closed red.
+    const stateToken = { open: "ansi2", draft: "dim", merged: "ansi5", closed: "blocked" }[pr.state];
+    const stateLabel = { open: "Open", draft: "Draft", merged: "Merged", closed: "Closed" }[pr.state];
     if (stateToken) {
-      head.child(this.pill(t, stateToken[0].toUpperCase() + stateToken.slice(1), stateToken));
+      head.child(this.pill(t, stateLabel, stateToken));
     }
     card.child(head);
 
@@ -1089,9 +1092,16 @@ export default class RanchSession extends View {
     const title = h_flex().id("pr-title").gap(6).items_start().min_w(0);
     title
       .when(Boolean(url), (el) => el.cursor_pointer().on_click(() => this.openUrl(url)))
-      .child(svg("mods/ranch-session/git-pull-request.svg").size(13).flex_none().text_color(t.working))
+      // Icon centred in a box one text line tall (12px type ≈ 18px line), so
+      // it sits on the title's first line however the title wraps. Coloured
+      // by the PR's state, like the pill.
       .child(
-        div().flex_1().min_w(0).text_size(12).text_color(t.foreground).child(`#${pr.number} ${pr.title ?? ""}`)
+        h_flex().h(18).flex_none().items_center().child(
+          svg("mods/ranch-session/git-pull-request.svg").size(13).text_color(stateToken ? t[stateToken] : t.dim)
+        )
+      )
+      .child(
+        div().flex_1().min_w(0).text_size(12).line_height(1.5).text_color(t.foreground).child(`#${pr.number} ${pr.title ?? ""}`)
       );
     card.child(title);
 
