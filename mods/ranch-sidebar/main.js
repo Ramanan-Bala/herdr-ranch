@@ -24,6 +24,7 @@ export default class RanchSidebar extends View {
     this.size = null; // root size, null until first layout
     this.highlight = null; // keyboard-highlighted tab id
     this.hovered = null; // pointer-hovered tab id (drives the card action strip)
+    this.hoveredSpace = null; // pointer-hovered space id (drives plus/sparkle)
     this.order = []; // visible card tab ids, display order
     this.cardById = new Map();
     this.settings = resolveSettings(shared(SETTINGS_KEY));
@@ -75,9 +76,12 @@ export default class RanchSidebar extends View {
     }
   }
 
-  toggleFold(map, key) {
+  toggleFold(map, key, cx) {
     this.collapsed = { ...this.collapsed, [map]: { ...this.collapsed[map], [key]: !this.collapsed[map][key] } };
     localStorage.setItem(COLLAPSE_KEY, JSON.stringify(this.collapsed));
+    // Redraw now: without it the fold only showed on the next unrelated
+    // render (a timer tick or a hover), which felt slow.
+    cx?.notify();
   }
 
   // ---- git ----
@@ -318,18 +322,23 @@ export default class RanchSidebar extends View {
       .child(div().text_size(10).text_color(t.blocked).child(String(count)));
   }
 
-  machineHeader(g) {
+  machineHeader(g, first) {
     const t = theme();
     const key = g.machine ?? "";
     const open = !this.collapsed.m[key];
-    return h_flex().id(`machine-${key || "local"}`).h(24).flex_none().pl(4).pr(6).gap(3).items_center()
+    // Machine icon in the space-badge column; chevron in the space-row chevron
+    // column so every fold control lines up.
+    return h_flex().id(`machine-${key || "local"}`).h(30).flex_none().pl(10).pr(8).gap(8).items_center()
+      .when(first, (e) => e.mt(4))
+      .when(!first, (e) => e.mt(10).border_t(1).border_color(t.border).pt(1))
       .cursor_pointer().hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click(() => this.toggleFold("m", key))
-      .child(svg(ICON(open ? "chevron-down" : "chevron-right")).size(10).flex_none().text_color(t.dim))
-      .child(div().flex_1().min_w(0).truncate().text_size(11).font_semibold().text_color(t.dim).child(g.label))
+      .on_click((_e, cx) => this.toggleFold("m", key, cx))
+      .child(div().flex_none().size(17).flex().items_center().justify_center()
+        .child(svg(ICON(g.machine ? "server" : "laptop")).size(13).flex_none().text_color(t.muted)))
+      .child(div().flex_1().min_w(0).truncate().text_size(11.5).font_semibold().text_color(t.muted).child(g.label))
       .when(g.state !== "ready", (e) => e.child(
-        div().flex_none().text_size(10).text_color(t.dim)
+        div().flex_none().text_size(10.5).text_color(t.dim)
           .child(g.state === "loading" ? "connecting…" : "offline")))
       .when(g.blocked > 0, (e) => e.child(this.badge(g.blocked)))
       .when(g.state === "unavailable" && g.machine, (e) => e.child(
@@ -340,7 +349,11 @@ export default class RanchSidebar extends View {
             cx.stop_propagation();
             cx.write_to_clipboard(`hc machine login ${g.machine}`);
           })
-          .child("Copy")));
+          .child("Copy")))
+      .when(!open, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
+        .child(String(g.spaces.length))))
+      .child(div().flex_none().size(16).flex().items_center().justify_center()
+        .child(svg(ICON(open ? "chevron-down" : "chevron-right")).size(10).flex_none().text_color(t.dim)));
   }
 
   spaceRow(sp) {
@@ -371,24 +384,37 @@ export default class RanchSidebar extends View {
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
-        this.toggleFold("s", sp.space);
+        this.toggleFold("s", sp.space, cx);
       })
       .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
+    // A space colour may be saved as hex ("#9333ea") or as a theme name
+    // ("ansi6"): resolve names through the theme. Only a plain #rrggbb can
+    // take the "38" alpha suffix for the badge's tint.
     const custom = shared("space.colors")?.[sp.space];
-    const tint = custom ?? t[BADGE_COLORS[badgeColorIndex(sp.space)]] ?? t.muted;
+    const resolved = typeof custom === "string" ? (custom.startsWith("#") ? custom : t[custom]) : null;
+    const tint = resolved ?? t[BADGE_COLORS[badgeColorIndex(sp.space)]] ?? t.muted;
+    const tintBg = /^#[0-9a-f]{6}$/i.test(tint) ? `${tint}38` : t.hover;
     const badge = div().flex_none().size(17).rounded(4).flex().items_center().justify_center()
-      .bg(`${tint}38`).text_size(8.5).font_bold().text_color(tint)
+      .bg(tintBg).text_size(8.5).font_bold().text_color(tint)
       .child(initials(sp.name) || "·");
     return h_flex().id(`space-${sp.space}`).h(28).mt(10).flex_none().pl(10).pr(8).gap(8).items_center()
       .cursor_pointer().hover((s) => s.bg(t.hover))
+      .on_hover((isIn, cx) => {
+        const next = isIn ? sp.space : null;
+        if (this.hoveredSpace !== next) {
+          this.hoveredSpace = next;
+          cx.notify();
+        }
+      })
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click(() => run("space.select", { id: sp.space }))
       .child(badge)
       .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold()
         .text_color(sp.active ? t.foreground : t.muted).child(sp.name))
+      // Plus/sparkle appear only on hover, left of the ring, so the ring,
+      // count and chevron keep their place.
+      .when(this.hoveredSpace === sp.space, (e) => e.child(plus).child(spark))
       .when(Boolean(sp.status), (e) => e.child(this.ring(sp.status, 9)))
-      .child(plus)
-      .child(spark)
       .when(folded, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
         .child(String(sp.cards.length + sp.settled.length))))
       .child(fold);
@@ -416,15 +442,21 @@ export default class RanchSidebar extends View {
   settledRow(sp) {
     const t = theme();
     const folded = !!this.collapsed.settled[sp.space];
-    return h_flex().id(`settled-${sp.space}`).h(22).flex_none().pl(28).pr(6).gap(3).items_center()
-      .cursor_pointer().hover((s) => s.bg(t.hover))
+    // Aligned with the cards: mx(6) + pl(10) puts the icon on the cards' text
+    // column, and mx(6) + pr(2) puts the chevron in the space/machine chevron
+    // column at the right.
+    return h_flex().id(`settled-${sp.space}`).h(26).my(3).mx(6).flex_none().pl(10).pr(2).gap(6).items_center()
+      .rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
-        this.toggleFold("settled", sp.space);
+        this.toggleFold("settled", sp.space, cx);
       })
-      .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(9).flex_none().text_color(t.dim))
-      .child(div().text_size(10).text_color(t.dim).child(`Settled (${sp.settled.length})`));
+      .child(svg(ICON("archive")).size(11).flex_none().text_color(t.dim))
+      .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child("Settled"))
+      .child(div().flex_none().text_size(11).text_color(t.dim).child(String(sp.settled.length)))
+      .child(div().flex_none().size(16).flex().items_center().justify_center()
+        .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(10).flex_none().text_color(t.dim)));
   }
 
   card(c, { settled = false } = {}) {
@@ -494,12 +526,14 @@ export default class RanchSidebar extends View {
         ));
       }
       if (this.settings.card.pr && c.pr) {
-        const color = c.pr.state === "open" ? t.accent
+        // Same colours as the Session panel's PR pill (GitHub's).
+        const color = c.pr.state === "open" ? t.ansi2
           : c.pr.state === "draft" ? t.dim
-          : c.pr.state === "merged" ? t.done
+          : c.pr.state === "merged" ? t.ansi5
           : t.blocked;
+        const stateWord = { open: "Open", draft: "Draft", merged: "Merged", closed: "Closed" }[c.pr.state] ?? "";
         parts3.push(div().id(`pr-${c.tabId}`).flex_none().text_size(10).font_medium().text_color(color)
-          .cursor_pointer().tooltip(c.pr.title ?? `Pull request #${c.pr.number}`)
+          .cursor_pointer().tooltip([stateWord, c.pr.title ?? `Pull request #${c.pr.number}`].filter(Boolean).join(" · "))
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .on_click((_e, cx) => {
             cx.stop_propagation();
@@ -768,10 +802,10 @@ export default class RanchSidebar extends View {
     } else if (narrow) {
       rows.push(this.rail(tree));
     } else {
-      for (const g of tree.groups) {
+      for (const [i, g] of tree.groups.entries()) {
         const key = g.machine ?? "";
         if (tree.showMachines) {
-          rows.push(this.machineHeader(g));
+          rows.push(this.machineHeader(g, i === 0));
           if (this.collapsed.m[key]) continue;
         }
         for (const sp of g.spaces) {
