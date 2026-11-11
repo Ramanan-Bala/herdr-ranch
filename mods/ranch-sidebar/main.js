@@ -823,7 +823,8 @@ export default class RanchSidebar extends View {
             c.repo = c.top.split(/[\\/]/).filter(Boolean).pop() ?? c.repo;
           }
         }
-        if (!settled && s.card.line3 && s.card.pr && c.top && c.summary && !c.summary.detached) {
+        // Settled tabs too: the PR badge now lives on the space/worktree row.
+        if (s.card.line3 && s.card.pr && c.top && c.summary && !c.summary.detached) {
           const branch = c.branch ?? c.summary.branch;
           if (branch && branch !== c.summary.default) {
             const pk = `${c.machine ?? ""}|${c.top}|${branch}`;
