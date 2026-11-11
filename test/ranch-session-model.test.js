@@ -24,7 +24,9 @@ const {
   fileRow,
   subDuration,
   herdrSubStatus,
+  activityStatus,
 } = await import(join(root, "mods/ranch-session/model.js"));
+const { ACTIVITY_STALE_MS } = await import(join(root, "mods/ranch-session/lib/format.js"));
 
 const agent = (address, status) => ({ address, status });
 
@@ -49,7 +51,10 @@ test("pickAgent: most urgent by default, ties keep order", () => {
 test("herdrSubStatus maps raw words", () => {
   assert.equal(herdrSubStatus({ status: "running" }), "working");
   assert.equal(herdrSubStatus({ status: "error" }), "blocked");
-  assert.equal(herdrSubStatus({ status: "done" }), "idle");
+  assert.equal(herdrSubStatus({ status: "done" }), "done");
+  assert.equal(herdrSubStatus({ status: "working" }), "working");
+  assert.equal(herdrSubStatus({ status: "blocked" }), "blocked");
+  assert.equal(herdrSubStatus({ status: "idle" }), "idle");
   assert.equal(herdrSubStatus({ status: "weird" }), null);
   assert.equal(herdrSubStatus({}), null);
 });
@@ -63,11 +68,22 @@ test("totalsOf and unfinishedCount", () => {
   assert.equal(unfinishedCount(null), 0);
 });
 
-test("subtitle", () => {
+test("subtitle shows only with tasks (quieter header)", () => {
   assert.equal(subtitle({ done: 2, total: 6 }), "2 of 6 done");
   assert.equal(subtitle({ done: 6, total: 6 }), "6 of 6 done");
-  assert.equal(subtitle({ done: 0, total: 0 }), "Nothing tracked");
-  assert.equal(subtitle(null), "Nothing tracked");
+  assert.equal(subtitle({ done: 0, total: 0 }), null);
+  assert.equal(subtitle(null), null);
+});
+
+test("activityStatus maps store activity, stale working reads idle", () => {
+  const now = 1_700_000_000_000;
+  assert.equal(activityStatus({ state: "working", at: now - 1000 }, now), "working");
+  assert.equal(activityStatus({ state: "blocked", at: now - 1000 }, now), "blocked");
+  assert.equal(activityStatus({ state: "done", at: now - 1000 }, now), "done");
+  assert.equal(activityStatus({ state: "working" }, now), "working");
+  assert.equal(activityStatus({ state: "working", at: now - ACTIVITY_STALE_MS - 1 }, now), "idle");
+  assert.equal(activityStatus(null, now), null);
+  assert.equal(activityStatus({}, now), null);
 });
 
 test("stateWord", () => {

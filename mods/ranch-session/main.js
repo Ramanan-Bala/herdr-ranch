@@ -49,9 +49,18 @@ import {
   remoteText,
   fileRow,
   herdrSubStatus,
+  activityStatus,
 } from "./model.js";
 
 const MAX_FILES = 20;
+
+/** Friendly name for a detected editor CLI, for tooltips. */
+const EDITOR_NAMES = { cursor: "Cursor", code: "VS Code", zed: "Zed", subl: "Sublime Text" };
+
+function editorName(path) {
+  const base = (path.split("/").pop() ?? "").replace(/\.exe$/i, "");
+  return EDITOR_NAMES[base] ?? base;
+}
 
 export default class RanchSession extends View {
   init(_props, cx) {
@@ -72,8 +81,17 @@ export default class RanchSession extends View {
     this.tasksOpen = new Map(); // agent address -> collapsed?
     this.settingUp = false;
     this.setupResult = null; // string output, "missing", or null
+    this.editors = new Map(); // machine key -> { path: string|null, busy }
+    this.push = { busy: false, err: null };
+    this.pushAt = 0; // ms epoch of the last successful push (for "Pushed")
+    this.copyAt = 0; // ms epoch of the last "Copy branch" click
     this.size = null;
     cx.timer.every(1000, (cx) => this.pump(cx));
+    // Keep sub-agent activity statuses (store-based) fresh on screen.
+    cx.timer.every(3000, (cx) => {
+      const s = this.session();
+      if (s.chosen && this.subTerminals(s).some((k) => this.subAgentStatus(k) === "working")) cx.notify();
+    });
     this.watchTasks(cx);
     this.pump(cx);
   }
@@ -198,6 +216,19 @@ export default class RanchSession extends View {
   /** Terminals the chosen agent started (its Herdr sub-agents). */
   subTerminals(s) {
     return s.chosen ? terminals().filter((k) => k.parent === s.chosen.address) : [];
+  }
+
+  /**
+   * A sub-agent's status for display: Herdr's own when it has one, else the
+   * activity its adapter recorded in the store (headless agents such as
+   * `opencode run` report no Herdr status), mapped with effectiveStatus()'s
+   * staleness rule; null when nothing is known.
+   */
+  subAgentStatus(k) {
+    const st = herdrSubStatus(k);
+    if (st) return st;
+    const activity = this.subTasks.get(k.address)?.parsed?.store?.session?.activity;
+    return activityStatus(activity, Date.now());
   }
 
   /**
@@ -429,10 +460,14 @@ export default class RanchSession extends View {
       this.pr.dirty = true;
       this.filesOpen = false;
       this.ciOpen = null;
+      this.push = { busy: false, err: null };
+      this.copyAt = 0;
       const tkey = s.chosen ? `${s.chosen.address}@${s.machine ?? ""}` : null;
       if (tkey !== this.tasks.key) this.loadTasks(cx);
       else this.loadSubTasks(s, cx);
     }
+    // The action bar's Editor button needs one detection per machine.
+    this.maybeDetectEditor(s.machine, cx);
     // Only needed while the store is missing (to offer Set up), once a minute.
     if (s.chosen && this.tasks.parsed && !this.tasks.parsed.ok && this.tasks.parsed.reason === "missing") {
       this.maybeCheckAdapters(s.machine, cx);
@@ -476,28 +511,30 @@ export default class RanchSession extends View {
       return root;
     }
     if (s.inTab.length > 1) root.child(this.picker(t, s));
+    root.child(this.actionBar(t, s));
     if (!s.chosen) {
       // No agent: no tasks or sub-agents, but the tab's git state still applies.
       root.child(div().text_size(12).text_color(t.dim).px(12).py(10).child("No agent in this tab"));
       if (set.session.git) root.child(this.gitCard(t, s, set));
       return root;
     }
-    if (set.session.git) {
-      root.child(this.gitCard(t, s, set));
-      // Only gh itself being absent is worth a word; other failures stay quiet.
-      if (this.pr.failed === "missing") {
-        root.child(div().text_size(12).text_color(t.dim).px(12).py(10).child("GitHub CLI not found"));
-      }
-      const pr = this.prCard(t);
-      if (pr) root.child(pr);
+    // Tasks first (R-SD-1): the main agent's card, then each sub-agent's.
+    if (set.session.tasks) {
+      root.child(this.tasksCard(t, s, null));
+      for (const card of this.subTaskCards(t, s)) root.child(card);
     }
     if (set.session.subagents) {
       const subs = this.subsCard(t, s);
       if (subs) root.child(subs);
     }
-    if (set.session.tasks) {
-      root.child(this.tasksCard(t, s, null));
-      for (const card of this.subTaskCards(t, s)) root.child(card);
+    if (set.session.git) {
+      root.child(this.gitCard(t, s, set));
+      const pr = this.prCard(t);
+      if (pr) root.child(pr);
+      // Only gh itself being absent is worth a word; other failures stay quiet.
+      if (this.pr.failed === "missing") {
+        root.child(div().text_size(12).text_color(t.dim).px(12).py(10).child("GitHub CLI not found"));
+      }
     }
     return root;
   }
@@ -514,6 +551,7 @@ export default class RanchSession extends View {
         .tooltip(this.tabTitle(s))
         .child("Session Details")
     );
+    const sub = subtitle(this.totals(s)); // null when nothing is tracked
     row.child(
       div()
         .flex_1()
@@ -521,7 +559,7 @@ export default class RanchSession extends View {
         .text_size(11.5)
         .text_color(t.dim)
         .truncate()
-        .child(subtitle(this.totals(s)))
+        .when(sub, (el) => el.child(sub))
     );
     row.child(
       div()
@@ -580,6 +618,180 @@ export default class RanchSession extends View {
           );
       })
     );
+  }
+
+  // ---- action bar --------------------------------------------------------
+
+  /**
+   * One row of common next steps under the header (R-SD-2): shell, editor,
+   * copy branch, push and PR. Only known/possible actions show.
+   */
+  actionBar(t, s) {
+    const sum = this.git.summary;
+    const top = sum?.top ?? s.cwd;
+    const branch = sum?.branch ?? null;
+    const lk = sum?.host ? links(sum.host) : null;
+    const dbl = defaultBranchLine(sum);
+    const compare =
+      branch && lk && dbl?.kind === "diverged" && (dbl.ahead || dbl.behind)
+        ? lk.compare(dbl.default, branch)
+        : null;
+    const bar = h_flex().px(12).py(8).gap(6).flex_wrap().border_b(1).border_color(t.border);
+
+    bar.child(
+      this.actionBtn(t, "action-shell", "mods/ranch-session/terminal.svg", "Shell", "Open a shell below, in this repo", () =>
+        run("terminal.open", { folder: top, place: "down" })
+      )
+    );
+
+    const editor = this.editors.get(s.machine ?? "");
+    if (editor?.path) {
+      bar.child(
+        this.actionBtn(
+          t,
+          "action-editor",
+          "mods/ranch-session/code.svg",
+          "Editor",
+          `Open in ${editorName(editor.path)}`,
+          () => {
+            exec(editor.path, [top], { on: s.machine }).catch(() => {});
+          }
+        )
+      );
+    }
+
+    if (branch) {
+      const copied = Date.now() - this.copyAt < 1500;
+      bar.child(
+        this.actionBtn(
+          t,
+          "action-copy",
+          "mods/ranch-session/copy.svg",
+          copied ? "Copied" : "Copy branch",
+          "Copy the branch name",
+          (_e, cx) => {
+            cx.write_to_clipboard(branch);
+            this.copyAt = Date.now();
+            cx.notify();
+            cx.timer.after(1500, (cx) => cx.notify());
+          }
+        )
+      );
+    }
+
+    if (branch && sum.host && branch !== sum.default) {
+      const pushed = this.pushAt && Date.now() - this.pushAt < 1500;
+      bar.child(
+        this.actionBtn(
+          t,
+          "action-push",
+          "mods/ranch-session/upload.svg",
+          this.push.busy ? "Pushing\u2026" : pushed ? "Pushed" : "Push",
+          "Push this branch to origin",
+          (_e, cx) => this.pushBranch(cx),
+          this.push.busy
+        )
+      );
+    }
+
+    const pr = this.pr.parsed;
+    if (pr?.url && pr.number != null) {
+      bar.child(
+        this.actionBtn(
+          t,
+          "action-pr",
+          "mods/ranch-session/git-pull-request.svg",
+          `PR #${pr.number}`,
+          "Open the pull request",
+          () => this.openUrl(pr.url)
+        )
+      );
+    } else if (compare) {
+      bar.child(
+        this.actionBtn(
+          t,
+          "action-pr",
+          "mods/ranch-session/git-pull-request.svg",
+          "Create PR",
+          "Open the pull-request page",
+          () => this.openUrl(compare)
+        )
+      );
+    }
+
+    const wrap = v_flex().flex_none();
+    wrap.child(bar);
+    if (this.push.err) {
+      wrap.child(div().text_size(11).text_color(t.blocked).truncate().child(this.push.err));
+    }
+    return wrap;
+  }
+
+  /** A compact button in the action bar: icon + label, hover lights it up. */
+  actionBtn(t, id, icon, label, tip, act, inert) {
+    return h_flex()
+      .id(id)
+      .h(26)
+      .px(8)
+      .gap(5)
+      .rounded(6)
+      .border(1)
+      .border_color(t.border)
+      .bg(t.raised)
+      .items_center()
+      .cursor_pointer()
+      .text_size(11.5)
+      .text_color(t.muted)
+      .tooltip(tip)
+      .hover((h) => h.bg(t.hover).text_color(t.foreground))
+      .when(!inert, (el) => el.on_click(act))
+      .child(svg(icon).size(12).flex_none())
+      .child(label);
+  }
+
+  /** Detects the machine's editor CLI once (cursor/code/zed/subl); pump calls it. */
+  maybeDetectEditor(machine, cx) {
+    const key = machine ?? "";
+    if (this.editors.has(key)) return;
+    this.editors.set(key, { path: null, busy: true });
+    cx.spawn(async (cx) => {
+      let path = null;
+      try {
+        const r = await exec(
+          "sh",
+          ["-c", "command -v cursor || command -v code || command -v zed || command -v subl"],
+          { on: machine }
+        );
+        path = r.code === 0 ? r.stdout.trim().split("\n")[0] || null : null;
+      } catch {}
+      this.editors.set(key, { path, busy: false });
+      cx.notify();
+    });
+  }
+
+  /** The Push action: push HEAD to origin, then refresh git and the PR. */
+  async pushBranch(cx) {
+    if (this.push.busy) return;
+    const s = this.session();
+    const top = this.git.summary?.top;
+    if (!top) return;
+    this.push = { busy: true, err: null };
+    cx.notify();
+    try {
+      const r = await exec("git", ["push", "-u", "origin", "HEAD"], { cwd: top, on: s.machine, timeout: 60000 });
+      if (r.code === 0) {
+        this.push = { busy: false, err: null };
+        this.pushAt = Date.now();
+        cx.timer.after(1500, (cx) => cx.notify());
+        this.refreshGit(cx);
+        this.pr.dirty = true; // the pump's PR path picks this up
+      } else {
+        this.push = { busy: false, err: (r.stderr ?? "").split("\n").find((l) => l.trim()) ?? "Push failed" };
+      }
+    } catch {
+      this.push = { busy: false, err: "Push failed" };
+    }
+    cx.notify();
   }
 
   // ---- card building blocks ---------------------------------------------
@@ -889,7 +1101,8 @@ export default class RanchSession extends View {
     if (pr.base) byline.push(`into ${pr.base}`);
     if (pr.updatedAt) byline.push(`updated ${relativeTime(now - pr.updatedAt)}`);
     if (byline.length) {
-      card.child(div().text_size(11).text_color(t.dim).truncate().child(byline.join(" · ")));
+      // Wraps like the title rather than cutting "updated 14m ago" off.
+      card.child(div().text_size(11).text_color(t.dim).child(byline.join(" · ")));
     }
 
     const pills = [];
@@ -898,6 +1111,9 @@ export default class RanchSession extends View {
     if (pr.behind) pills.push(this.pill(t, "Behind base", "blocked"));
     if (pills.length) card.child(h_flex().gap(4).flex_wrap().children(pills));
 
+    if (pr.approvedBy?.length) {
+      card.child(div().text_size(11).text_color(t.done).child(`Approved by ${pr.approvedBy.join(", ")}`));
+    }
     if (pr.reviewers?.length) {
       card.child(div().text_size(11).text_color(t.dim).child(`Waiting on ${pr.reviewers.join(", ")}`));
     }
@@ -971,9 +1187,28 @@ export default class RanchSession extends View {
     const storeSubs = this.tasks.parsed?.ok ? this.tasks.parsed.store.subagents : [];
     if (!herdrSubs.length && !storeSubs.length) return null;
     const card = this.cardShell(t);
-    card.child(this.cardTitle(t, `Sub-agents \u00b7 ${herdrSubs.length + storeSubs.length}`));
+    // Header counts from the display status (subStatus), not the raw word.
+    let running = 0;
+    let done = 0;
     for (const k of herdrSubs) {
-      const st = herdrSubStatus(k);
+      const st = this.subAgentStatus(k);
+      if (st === "working") running++;
+      else if (st === "done") done++;
+    }
+    for (const sub of storeSubs) {
+      if (sub.status === "running") running++;
+      else done++;
+    }
+    card.child(
+      this.cardTitle(
+        t,
+        running || done
+          ? `Sub-agents \u00b7 ${running} running${done ? ` \u00b7 ${done} done` : ""}`
+          : `Sub-agents \u00b7 ${herdrSubs.length + storeSubs.length}`
+      )
+    );
+    for (const k of herdrSubs) {
+      const st = this.subAgentStatus(k);
       const pic = this.programIcon(k.program, 14, t.foreground);
       const row = h_flex()
         .id(`sub-${k.address}`)
@@ -1047,7 +1282,7 @@ export default class RanchSession extends View {
         .child(prog.total ? `${label} ${prog.done}/${prog.total}` : label)
     );
     head.child(div().flex_1().min_w(0));
-    const status = isMain ? s.chosen.status : herdrSubStatus(sub);
+    const status = isMain ? s.chosen.status : this.subAgentStatus(sub);
     if (status) head.child(this.pill(t, stateWord(status), status));
     head.child(
       h_flex()
@@ -1083,8 +1318,12 @@ export default class RanchSession extends View {
         if (this.setupResult) card.child(this.setupResultRow(t));
         return card;
       }
-    } else if (!parsed?.ok || !parsed.store.tasks.length) {
-      return null; // only called for sub-agents with tasks
+    } else if (!parsed?.ok) {
+      return null; // no parsed store yet: no card
+    } else if (!parsed.store.tasks.length) {
+      // A sub-agent with a parsed store but no plan still gets its card.
+      card.child(div().text_size(12).text_color(t.muted).child("No plan yet."));
+      return card;
     }
 
     // Progress bar: working-coloured while something runs, done when not.
@@ -1128,12 +1367,15 @@ export default class RanchSession extends View {
       .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(task.title));
   }
 
-  /** Tasks cards for the Herdr sub-agents that have tasks. */
+  /**
+   * Tasks cards for the Herdr sub-agents that have a parsed store; a store
+   * with no tasks shows its "No plan yet." empty state.
+   */
   subTaskCards(t, s) {
     const cards = [];
     for (const k of this.subTerminals(s)) {
       const entry = this.subTasks.get(k.address);
-      if (!entry?.parsed?.ok || !entry.parsed.store.tasks.length) continue;
+      if (!entry?.parsed?.ok) continue;
       const card = this.tasksCard(t, s, k);
       if (card) cards.push(card);
     }

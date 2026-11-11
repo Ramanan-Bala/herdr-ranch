@@ -7,6 +7,10 @@
     "ctrl-alt-1": "ranch-topbar.panel:session",
     "ctrl-alt-2": "ranch-topbar.panel:files",
     "ctrl-alt-3": "ranch-topbar.panel:changes",
-    "ctrl-alt-4": "ranch-topbar.panel:settings"
+    "ctrl-alt-4": "ranch-topbar.panel:settings",
+    "cmd-alt-j": "ranch-topbar.attention:next",
+    "ctrl-alt-j": "ranch-topbar.attention:next",
+    "cmd-alt-n": "ranch-topbar.launch",
+    "ctrl-alt-n": "ranch-topbar.launch"
   }
 }
