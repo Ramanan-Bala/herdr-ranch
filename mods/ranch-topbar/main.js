@@ -266,7 +266,7 @@ export default class RanchTopbar extends View {
         .child(div().max_w(260).truncate().font_semibold().text_color(t.foreground).child(name))
         .when(Boolean(pane?.branch), el => el.child(
           // The focused pane's branch, as a pill.
-          div().id(`branch-${tab.id}`).h(18).px(6).gap(4).flex_none().items_center().rounded(4).bg(t.raised)
+          h_flex().id(`branch-${tab.id}`).h(18).px(6).gap(4).flex_none().items_center().rounded(4).bg(t.raised)
             .text_size(11).text_color(t.muted)
             .child(svg("mods/ranch-topbar/git-branch.svg").size(11).flex_none().text_color(t.muted))
             .child(div().max_w(220).truncate().child(pane.branch))))
