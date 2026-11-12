@@ -34,7 +34,7 @@ import {
   PR_JSON_FIELDS,
 } from "./lib/git.js";
 import { TASKS_DIR, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
-import { PRS_FILE, parsePrRegistry, prsFor } from "./lib/prs.js";
+import { PRS_FILE, parsePrRegistry, prsFor, registryPrBelongs, repoOfWebBase } from "./lib/prs.js";
 import {
   listLifecycle,
   listVisible,
@@ -1529,7 +1529,7 @@ export default class RanchSession extends View {
         const repo = prRepoText(p.url) ?? p.url;
         card.child(
           h_flex()
-            .id(`agent-pr-${p.number}`)
+            .id(`agent-pr-${p.url}`)
             .gap(6)
             .items_center()
             .min_w(0)
@@ -1579,13 +1579,17 @@ export default class RanchSession extends View {
     }
     // The shared registry (…): PRs any terminal's agent opened on this repo
     // top + branch (refreshGit stores the top in this.git.top), merged with
-    // the store records above, deduped, branch PR excluded.
+    // the store records above, deduped, branch PR excluded. Registry records
+    // for another repository (PR url vs this checkout's web host) are skipped.
     const top = this.git.top ?? this.git.summary?.top ?? null;
     const branch = this.git.summary?.branch ?? null;
-    for (const p of top && branch ? prsFor(this.prRegistry.parsed, top, branch) : []) {
-      if (!p?.url || seenUrls.has(p.url)) continue;
-      seenUrls.add(p.url);
-      out.push(p);
+    if (top && branch) {
+      const checkoutRepo = repoOfWebBase(this.git.summary?.host?.base);
+      for (const p of prsFor(this.prRegistry.parsed, top, branch)) {
+        if (!p?.url || !registryPrBelongs(p.url, checkoutRepo) || seenUrls.has(p.url)) continue;
+        seenUrls.add(p.url);
+        out.push(p);
+      }
     }
     return out;
   }

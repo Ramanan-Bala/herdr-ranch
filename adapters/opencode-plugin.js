@@ -124,7 +124,13 @@ function normalizeStore(raw, terminal) {
           ? { activity: { state: raw.session.activity.state, at: raw.session.activity.at } }
           : {}),
         ...(raw.session.turn && typeof raw.session.turn.tasks === "string"
-          ? { turn: { tasks: raw.session.turn.tasks, tools: raw.session.turn.tools === true } }
+          ? {
+              turn: {
+                tasks: raw.session.turn.tasks,
+                tools: raw.session.turn.tools === true,
+                ...(raw.session.turn.aborted === true ? { aborted: true } : {}),
+              },
+            }
           : {}),
       }
     : null;
@@ -323,19 +329,22 @@ export function reduceOpencode(store, event) {
   const state = opencodeActivity(next ?? store, event);
   let base = next ?? store;
   // Missed turns (§3.7): the session did work this turn but the task list did
-  // not change since the prompt. Counted once; the turn is consumed so
-  // repeated idle events do not recount.
+  // not change since the prompt. Judged once at the turn's end; interrupted
+  // or failed turns are consumed without counting, and the turn is always
+  // consumed so repeated idle events never recount.
+  const props = event?.properties && typeof event.properties === "object" ? event.properties : {};
   const turn = base.session?.turn;
-  if (turn) {
-    if (state === "working" && !turn.tools) {
-      base = { ...base, session: { ...base.session, turn: { ...turn, tools: true } } };
-    } else if (state === "done" && turn.tools && fingerprint(base.tasks) === turn.tasks) {
-      base = {
-        ...base,
-        missed_turns: (Number.isInteger(base.missed_turns) ? base.missed_turns : 0) + 1,
-        session: { ...base.session, turn: { ...turn, tools: false } },
-      };
-    }
+  if (state === "done" && turn) {
+    const missed = turn.tools && !turn.aborted
+      && props.outcome !== "interrupted" && props.outcome !== "failed"
+      && fingerprint(base.tasks) === turn.tasks;
+    base = {
+      ...base,
+      missed_turns: missed
+        ? (Number.isInteger(base.missed_turns) ? base.missed_turns : 0) + 1
+        : base.missed_turns,
+      session: { ...base.session, turn: undefined },
+    };
   }
   if (!state) return base;
   // Only write when the state changes: events arrive many times a second.
@@ -353,6 +362,9 @@ function hashId(text) {
   return Math.abs(hash).toString(36);
 }
 
+/** Tools that mean the agent did real work this turn (§3.7). */
+const WORK_TOOLS = new Set(["bash", "edit", "write", "patch", "multiedit", "apply_patch"]);
+
 function reduceOpencodeCore(store, event) {
   if (!event || typeof event !== "object") return store;
   const type = event.type;
@@ -362,6 +374,7 @@ function reduceOpencodeCore(store, event) {
 
   if (type === "todo.updated") {
     if (props.sessionID && store.session?.id && props.sessionID !== store.session.id) return store;
+    const before = fingerprint(store.tasks);
     // Replace tasks; cancelled ones are kept and struck through by the mod.
     // Tasks without an id get a stable position+title-hash id (I13).
     const todos = Array.isArray(props.todos) ? props.todos : [];
@@ -378,6 +391,8 @@ function reduceOpencodeCore(store, event) {
         active_form: null,
       }];
     });
+    // Any task-list change clears the missed-turn nudge (§3.7).
+    if (fingerprint(next.tasks) !== before) next.missed_turns = 0;
     return next;
   }
 
@@ -407,6 +422,7 @@ function reduceOpencodeCore(store, event) {
       if (different) {
         next.tasks = [];
         next.subagents = [];
+        next.missed_turns = 0;
         session = { id: info.id, title: null, title_source: null, first_prompt: null, state: "running" };
       } else {
         session = { id: null, title: null, title_source: null, first_prompt: null, state: "running", ...(store.session ?? {}), id: info.id };
@@ -455,6 +471,29 @@ function reduceOpencodeCore(store, event) {
     if (!session.first_prompt) session.first_prompt = text.slice(0, 500);
     next.session = session;
     return next;
+  }
+
+  if (type === "tool.used") {
+    // The turn did real work (§3.7): only write/edit/shell tools count.
+    if (props.sessionID && store.session?.id && props.sessionID !== store.session.id) return store;
+    const turn = store.session?.turn;
+    const tool = typeof props.tool === "string" ? props.tool.toLowerCase() : null;
+    // Already marked: return the same store so recordEvent skips the write.
+    if (turn && !turn.tools && tool && WORK_TOOLS.has(tool)) {
+      return { ...next, session: { ...next.session, turn: { ...turn, tools: true } } };
+    }
+    return store;
+  }
+
+  if (type === "session.error") {
+    // v1 interrupt: the open turn failed mid-flight; it is never judged as
+    // missed (the wrapper drops it at idle).
+    if (props.sessionID && store.session?.id && props.sessionID !== store.session.id) return store;
+    const turn = store.session?.turn;
+    if (turn) {
+      return { ...next, session: { ...next.session, turn: { ...turn, aborted: true } } };
+    }
+    return store;
   }
 
   return store;
@@ -696,7 +735,7 @@ function recordEvent(event) {
  * Maps a v2 bus event onto the v1 event shapes reduceOpencode already
  * understands. Returns null when the event says nothing worth recording.
  */
-function normalizeV2(event) {
+export function normalizeV2(event) {
   const type = typeof event?.type === "string" ? event.type
     : typeof event?.name === "string" ? event.name : null;
   if (!type) return null;
@@ -728,9 +767,11 @@ function normalizeV2(event) {
     case "session.execution.started":
       return { type: "session.status", properties: { sessionID: sid, status: { type: "busy" } } };
     case "session.execution.succeeded":
-    case "session.execution.failed":
-    case "session.execution.interrupted":
       return { type: "session.idle", properties: { sessionID: sid } };
+    case "session.execution.failed":
+      return { type: "session.idle", properties: { sessionID: sid, outcome: "failed" } };
+    case "session.execution.interrupted":
+      return { type: "session.idle", properties: { sessionID: sid, outcome: "interrupted" } };
     case "permission.asked":
     case "permission.replied":
     case "session.idle":
@@ -797,6 +838,25 @@ export const RanchTasks = async () => ({
       // Never break the host: task reporting fails silently.
     }
   },
+
+  // Missed-turn detection (§3.7): any tool other than todowrite marks the
+  // open turn as having done real work.
+  "tool.execute.after": async (input) => {
+    try {
+      if (input?.tool === "todowrite") return;
+      // A tool event without a usable name says nothing.
+      if (typeof input?.tool !== "string" || !input.tool) return;
+      recordEvent({
+        type: "tool.used",
+        properties: {
+          sessionID: typeof input?.sessionID === "string" ? input.sessionID : null,
+          tool: input.tool,
+        },
+      });
+    } catch {
+      // Never break the host: task reporting fails silently.
+    }
+  },
 });
 
 /** Hook registration returns a promise on v2: swallow its rejection. */
@@ -829,16 +889,29 @@ const RanchTasksPlugin = {
     try {
       // Tool results: todowrite replaces the task list. The todo tool carries
       // its session id on the event; a sub-agent's todowrite is dropped by the
-      // reducer once the main session is known.
+      // reducer once the main session is known. Every other tool marks the
+      // open turn as having done real work (missed-turn detection, §3.7).
       quiet(ctx?.tool?.hook?.("execute.after", safeCall((event) => {
-        if (event?.tool !== "todowrite") return;
-        const todos = event?.input && typeof event.input === "object" ? event.input.todos : null;
-        if (!Array.isArray(todos)) return;
+        if (event?.tool === "todowrite") {
+          const todos = event?.input && typeof event.input === "object" ? event.input.todos : null;
+          if (!Array.isArray(todos)) return;
+          recordEvent({
+            type: "todo.updated",
+            properties: {
+              sessionID: typeof event.sessionID === "string" ? event.sessionID : null,
+              todos,
+            },
+          });
+          return;
+        }
+        // A tool event without a usable name says nothing; recording it
+        // would only touch the store directory.
+        if (typeof event?.tool !== "string" || !event.tool) return;
         recordEvent({
-          type: "todo.updated",
+          type: "tool.used",
           properties: {
-            sessionID: typeof event.sessionID === "string" ? event.sessionID : null,
-            todos,
+            sessionID: typeof event?.sessionID === "string" ? event.sessionID : null,
+            tool: event.tool,
           },
         });
       })));
