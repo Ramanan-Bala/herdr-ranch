@@ -12,7 +12,7 @@ import { buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials, diff
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent } from "./lib/format.js";
 import { repoSummary, parsePr, createTtlCache, runGh, PR_JSON_FIELDS } from "./lib/git.js";
 import { SETTINGS_KEY, FILTER_KEY, resolveSettings } from "./lib/settings.js";
-import { PRS_FILE, parsePrRegistry, prsFor } from "./lib/prs.js";
+import { PRS_FILE, parsePrRegistry, prsFor, registryPrBelongs, repoOfWebBase, samePr } from "./lib/prs.js";
 import { progress } from "./lib/tasks.js";
 import { TabNamer, ACTIVITY_KEY } from "./namer.js";
 
@@ -248,13 +248,15 @@ export default class RanchSidebar extends View {
    * filtered like the branch badge shows them: open/draft always, merged or
    * closed only when updated in the last 24 h. Missing lookups are enqueued
    * (prCache keyed by url); the branch PR itself never duplicates a badge.
+   * Registry records for another repository (checkoutRepo, the "owner/repo"
+   * of the checkout's web host) are skipped.
    */
-  recordedResolved(registry, machine, top, branch, cwd, active, now, jobs, jobKeys, branchPr) {
+  recordedResolved(registry, machine, top, branch, cwd, active, now, jobs, jobKeys, branchPr, checkoutRepo) {
     if (!top || !branch) return [];
     const out = [];
     for (const r of prsFor(registry, top, branch)) {
-      if (!r?.url) continue;
-      if (branchPr && (branchPr.number === r.number || branchPr.url === r.url)) continue;
+      if (!r?.url || !registryPrBelongs(r.url, checkoutRepo)) continue;
+      if (branchPr && samePr(branchPr, r)) continue;
       let parsed = this.prCache.get(r.url, now);
       if (parsed === undefined && !this.prBusy.has(r.url) && !jobKeys.has(r.url)) {
         jobKeys.add(r.url);
@@ -948,7 +950,7 @@ export default class RanchSidebar extends View {
           // prCache, drawn after the branch badge, never duplicating it.
           if (branch) {
             c.recorded = this.recordedResolved(wantRegistry(c.machine), c.machine,
-              c.top, branch, c.cwd, c.spaceActive, now, jobs, jobKeys, c.pr ?? null);
+              c.top, branch, c.cwd, c.spaceActive, now, jobs, jobKeys, c.pr ?? null, repoOfWebBase(c.summary?.host?.base));
           }
         }
       }
@@ -969,7 +971,7 @@ export default class RanchSidebar extends View {
           const pk = `${g.machine ?? ""}|${sp.checkout.top}|${sp.checkout.branch}`;
           const branchPr = sp.pr ?? this.prCache.get(pk, now) ?? null;
           sp.recorded = this.recordedResolved(wantRegistry(g.machine), g.machine,
-            sp.checkout.top, sp.checkout.branch, sp.cards[0]?.cwd ?? null, sp.active, now, jobs, jobKeys, branchPr);
+            sp.checkout.top, sp.checkout.branch, sp.cards[0]?.cwd ?? null, sp.active, now, jobs, jobKeys, branchPr, repoOfWebBase(sp.checkout?.host?.base));
         }
         this.checkoutBySpace.set(sp.space, sp.checkout);
       }

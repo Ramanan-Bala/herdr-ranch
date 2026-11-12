@@ -69,6 +69,7 @@ function applyCodexCore(store, payload) {
       next.session = { id: sid, title: null, title_source: null, first_prompt: null, state: "running" };
       next.tasks = [];
       next.subagents = [];
+      next.missed_turns = 0;
     } else if (sid && !next.session?.id) {
       // Keep session.id in sync on every event (I12).
       ensureSession(next).id = sid;
@@ -81,6 +82,7 @@ function applyCodexCore(store, payload) {
       (id && id !== next.session?.id && payload.source !== "compact");
     if (fresh) {
       next.session = { id, title: null, title_source: null, first_prompt: null, state: "running" };
+      next.missed_turns = 0;
     } else {
       const session = ensureSession(next);
       if (id) session.id = id;
@@ -105,6 +107,7 @@ function applyCodexCore(store, payload) {
 
   if (event === "PostToolUse") {
     if (payload.tool_name === "Bash" || payload.tool_name === "shell") recordCreatedPr(next, payload);
+    const before = tasksFingerprint(next.tasks);
     const plan = payload.tool_name === "update_plan" ? payload.tool_input?.plan : null;
     if (Array.isArray(plan)) {
       // Replace tasks entirely from the plan's steps.
@@ -119,15 +122,26 @@ function applyCodexCore(store, payload) {
         }];
       });
     }
+    // A plan that changed the list clears the missed-turn nudge (fixes 3.7);
+    // any other tool means the turn did real work.
+    if (tasksFingerprint(next.tasks) !== before) next.missed_turns = 0;
+    else if (payload.tool_name !== "update_plan") {
+      const turn = next.session?.turn;
+      if (turn) next.session = { ...next.session, turn: { ...turn, tools: true } };
+    }
     return next;
   }
 
   if (event === "Stop") {
-    // Miss detection (fixes §3.7). Codex exposes no transcript or tool
-    // stream, so a turn that left the task list unchanged counts as missed.
+    // Miss detection (fixes §3.7). Codex exposes no transcript, so a turn is
+    // judged by the tools it ran: one that worked but left the task list
+    // unchanged counts as missed. The turn is consumed either way.
     const session = ensureSession(next);
-    if (session.turn && tasksFingerprint(next.tasks) === session.turn.tasks) {
-      next.missed_turns = (Number.isInteger(store.missed_turns) ? store.missed_turns : 0) + 1;
+    if (session.turn) {
+      if (session.turn.tools && tasksFingerprint(next.tasks) === session.turn.tasks) {
+        next.missed_turns = (Number.isInteger(store.missed_turns) ? store.missed_turns : 0) + 1;
+      }
+      delete session.turn;
     }
     return next;
   }

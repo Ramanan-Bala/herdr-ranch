@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import { hookError, recordSharedPr, updateStore } from "./store.js";
 import { applyClaude } from "./claude.js";
 import { applyCodex } from "./codex.js";
-import { detectCreatedPr } from "../lib/prs.js";
+import { detectCreatedPr, effectiveDir, prCommandOf, prCreateHead, prRepoOf, remoteReposOf } from "../lib/prs.js";
 import { gcStores, install, statusSummary, uninstall } from "./install.js";
 import { reminderFor } from "./instructions.js";
 import { doctor } from "./doctor.js";
@@ -75,10 +75,11 @@ function runHook(agent, apply) {
 }
 
 /**
- * Repo facts of a `gh pr create` run: its top-level dir and current branch,
+ * Repo facts of a `gh pr create` run: its top-level dir, current branch
+ * (null when HEAD is detached) and the "owner/repo" list of its remotes,
  * resolved in the payload's cwd (else the hook's cwd). execFileSync with a
  * short timeout; stderr ignored, output never printed. Null when the cwd is
- * not a checkout or HEAD is detached.
+ * not a checkout.
  */
 function repoFacts(cwd) {
   const dir = typeof cwd === "string" && cwd ? cwd : process.cwd();
@@ -94,21 +95,32 @@ function repoFacts(cwd) {
   const top = git(["rev-parse", "--show-toplevel"]);
   if (!top) return null; // not a checkout
   const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]);
-  return branch && branch !== "HEAD" ? { top, branch } : null;
+  return { top, branch: branch && branch !== "HEAD" ? branch : null, remotes: remoteReposOf(git(["remote", "-v"])) };
 }
 
 /**
  * Shares a created PR in ~/.herdr/ranch/prs.json (keyed repoTop|branch), so
  * every terminal on that checkout lists it — not just this one's store (I4).
- * Best effort: any failure is one hookError line, nothing on stdout.
+ * The record is only shared when the PR's repo can be confirmed to belong to
+ * the checkout the command ran in (that checkout's remotes contain it, and
+ * the branch comes from --head or the checkout's HEAD); otherwise it is not
+ * shared at all (the creator's own store still has it). Best effort: any
+ * failure is one hookError line, nothing on stdout.
  */
 function recordSharedPrFromPayload(payload) {
   if (payload?.hook_event_name !== "PostToolUse") return;
   const found = detectCreatedPr(payload);
   if (!found) return;
-  const facts = repoFacts(payload.cwd);
-  if (!facts) return;
-  recordSharedPr(facts.top, facts.branch, { ...found, at: new Date().toISOString() });
+  const repo = prRepoOf(found.url);
+  if (!repo) return;
+  const cmd = prCommandOf(payload.tool_input);
+  const dir = effectiveDir(cmd, payload.cwd, payload.tool_input?.workdir, process.platform);
+  if (!dir) return;
+  const facts = repoFacts(dir);
+  if (!facts || !facts.remotes.includes(repo)) return;
+  const branch = prCreateHead(cmd) ?? facts.branch;
+  if (!branch) return;
+  recordSharedPr(facts.top, branch, { ...found, at: new Date().toISOString() });
 }
 
 function parseArgs(rest) {

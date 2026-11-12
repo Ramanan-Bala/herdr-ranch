@@ -231,6 +231,7 @@ function applyClaudeCore(store, payload) {
       next.session = { id: sid, title: null, title_source: null, first_prompt: null, state: "running" };
       next.tasks = [];
       next.subagents = [];
+      next.missed_turns = 0;
     } else if (sid && !next.session?.id) {
       // Keep session.id in sync on every event (I12).
       ensureSession(next).id = sid;
@@ -243,6 +244,7 @@ function applyClaudeCore(store, payload) {
       (id && id !== next.session?.id && payload.source !== "compact");
     if (fresh) {
       next.session = { id, title: null, title_source: null, first_prompt: null, state: "running" };
+      next.missed_turns = 0;
     } else {
       const session = ensureSession(next);
       if (id) session.id = id;
@@ -285,17 +287,24 @@ function applyClaudeCore(store, payload) {
     session.turn = { tasks: tasksFingerprint(next.tasks), tools: false };
   }
   if (event === "PostToolUse") {
+    const before = tasksFingerprint(next.tasks);
     applyTool(next, payload);
-    const session = next.session;
-    if (session?.turn) session.turn.tools = true;
+    // Any task-list change clears the missed-turn nudge (fixes 3.7).
+    if (tasksFingerprint(next.tasks) !== before) next.missed_turns = 0;
+    const turn = next.session?.turn;
+    if (turn) next.session = { ...next.session, turn: { ...turn, tools: true } };
   }
   if (event === "Stop") {
-    // Miss detection (fixes §3.7): the turn used write/edit/shell tools but
-    // the task list did not change -> count a missed turn.
+    // Miss detection (fixes 3.7): the turn used write/edit/shell tools but
+    // the task list did not change -> count a missed turn. The turn is
+    // consumed either way, so a second Stop never recounts.
     const session = ensureSession(next);
-    if (session.turn && transcriptWorkTools(payload.transcript)
-      && tasksFingerprint(next.tasks) === session.turn.tasks) {
-      next.missed_turns = (Number.isInteger(store.missed_turns) ? store.missed_turns : 0) + 1;
+    if (session.turn) {
+      if (transcriptWorkTools(payload.transcript)
+        && tasksFingerprint(next.tasks) === session.turn.tasks) {
+        next.missed_turns = (Number.isInteger(store.missed_turns) ? store.missed_turns : 0) + 1;
+      }
+      delete session.turn;
     }
   }
   if (event === "SessionEnd") ensureSession(next).state = "ended";
