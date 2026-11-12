@@ -42,16 +42,22 @@ export function blockFor(agent) {
 /** The line Claude's CLAUDE.md gets: an import of ~/.claude/RANCH.md. */
 export const CLAUDE_IMPORT = `${BEGIN}\n@RANCH.md\n${END}\n`;
 
-/** Removes every marked Ranch block (and the blank line before it) from text. */
+/** Removes every marked Ranch block (and the blank line before it) from text,
+ * keeping the file's own line endings (CRLF files stay CRLF). */
 export function stripBlock(text) {
-  const re = new RegExp(`\\n?${escape(BEGIN)}[\\s\\S]*?${escape(END)}\\n?`, "g");
-  return text.replace(re, "\n").replace(/\n{3,}$/, "\n\n");
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  const re = new RegExp(`(?:\\r?\\n)?${escape(BEGIN)}[\\s\\S]*?${escape(END)}(?:\\r?\\n)?`, "g");
+  return text.replace(re, eol).replace(/\n{3,}$/, "\n\n");
 }
 
-/** Text with the block appended once (replacing an older Ranch block). */
+/** Text with the block appended once (replacing an older Ranch block), in the
+ * file's line endings so uninstall restores it byte-for-byte. */
 export function withBlock(text, block) {
+  const crlf = (text ?? "").includes("\r\n");
   const base = stripBlock(text ?? "").replace(/\s*$/, "");
-  return base ? `${base}\n\n${block}` : block;
+  const body = crlf ? block.replace(/\r?\n/g, "\r\n") : block;
+  const sep = crlf ? "\r\n\r\n" : "\n\n";
+  return base ? `${base}${sep}${body}` : body;
 }
 
 function escape(s) {

@@ -264,6 +264,33 @@ export function storeCandidates(address, terminalText = null) {
 }
 
 /**
+ * Reader-side overlay for two terminals sharing one session: when the
+ * terminal text is a pointer, the pointer's terminal + start time are this
+ * terminal's live identity — the session store's own values may belong to
+ * the other terminal and would hide this one's list. Returns `parsed`
+ * unchanged when it is not a valid store or the text is not a pointer with
+ * a string terminal_started_at.
+ */
+export function withPointerIdentity(parsed, terminalText) {
+  if (!parsed?.ok || !parsed.store || !pointerSession(terminalText)) return parsed;
+  let pointer;
+  try {
+    pointer = JSON.parse(terminalText);
+  } catch {
+    return parsed; // pointerSession already accepted it; stay unchanged
+  }
+  if (typeof pointer?.terminal_started_at !== "string") return parsed;
+  return {
+    ...parsed,
+    store: {
+      ...parsed.store,
+      terminal: typeof pointer.terminal === "string" ? pointer.terminal : parsed.store.terminal,
+      terminal_started_at: pointer.terminal_started_at,
+    },
+  };
+}
+
+/**
  * Whether a parsed store belongs to the agent run now live in the terminal
  * (fixes §3.3/F4): the terminal must be live, its start time must match the
  * store's terminal_started_at, and the agent app must match. `live` comes

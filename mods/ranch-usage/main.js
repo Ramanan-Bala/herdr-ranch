@@ -9,11 +9,12 @@
 // Apache-2.0); see THIRD_PARTY.md at the repo root for the licence and changes.
 import { View, div, image, svg } from "gpui-kit";
 import { HoverCard, h_flex, v_flex } from "gpui-base";
-import { exec, focused, theme, props, shared, setShared, appHome, window } from "herdr";
+import { exec, focused, spaces, theme, props, shared, setShared, appHome, window } from "herdr";
 import { PROVIDERS } from "./providers/index.js";
 import { barModel, cardModel, chooseDensity, panelOnEnter } from "./usage/view.js";
 import { effectivePrefs, isOnBar, isShown, toggleOnBar, toggleProvider, toggleShowBars, toggleShowRemaining, toggleShowResetTime, toggleWindow } from "./usage/prefs.js";
 import { parseSession, sessionOnBar, sessionView } from "./usage/session.js";
+import { sessionUsageSupport } from "./usage/session-support.js";
 import { nextState } from "./usage/state.js";
 import { UNREPORTED } from "./usage/unreported.js";
 
@@ -65,7 +66,8 @@ export default class UsageLimits extends View {
     this.panel = "limits"; // or "settings"
     this.leftAt = null;    // ms, when the pointer left the bar and the panel
     this.terminal = null;  // the focused terminal the session below belongs to
-    this.session = null;   // { data: Session, title } or null
+    this.machine = null;   // that terminal's machine, null on this computer
+    this.session = null;   // { data: Session, title } | { unsupported, title } | null
     this.sessionAt = 0;    // ms, last session read
     this.sessionBusy = false;
     this.lastFetch = {};   // providerId → epoch s of last attempt
@@ -138,6 +140,8 @@ export default class UsageLimits extends View {
   readSession(cx) {
     if (this.sessionBusy) return; // a hung hc mustn't pile up; it re-reads below if focus moved
     const terminal = this.terminal;
+    const remote = this.machine != null;
+    const platform = window()?.platform;
     this.sessionAt = Date.now();
     if (!terminal) {
       this.session = null;
@@ -150,13 +154,20 @@ export default class UsageLimits extends View {
         const info = JSON.parse((await exec("hc", ["get", terminal])).stdout);
         const app = AGENTS[info.status?.app];
         const pid = info.foreground?.pid;
-        if (app && pid) {
+        // Decided before any helper runs (finding 17): the helpers match the
+        // PID against this machine's session files, which lies for a remote
+        // terminal and can't work for Codex on Windows (pgrep/lsof).
+        const support = sessionUsageSupport({ remote, agent: app, platform });
+        const title = (info.cwd ?? "").split("/").pop();
+        if (app && pid && support.ok) {
           // Node helper (fixes doc F11); sh fallback when node is not on PATH.
           let r = null;
           try { r = await exec("node", [`${appHome()}/mods/${MOD}/helpers/session.mjs`, app, String(pid)]); } catch {}
           if (!r || r.code === 127) r = await exec("sh", [`${appHome()}/mods/${MOD}/helpers/session.sh`, app, String(pid)]);
           const data = r.code === 0 ? parseSession(r.stdout, app) : null;
-          if (data) next = { data, title: (info.cwd ?? "").split("/").pop() };
+          if (data) next = { data, title };
+        } else if (app && pid && !support.ok) {
+          next = { unsupported: support.reason, title };
         }
       } catch {
         next = null;
@@ -336,7 +347,10 @@ export default class UsageLimits extends View {
             .on_click((_e, cx) => { cx.stop_propagation(); this.openUrl(u.url); })
             .child("Open usage ↗")))));
     }
-    const session = sessionView(this.session?.data, this.session?.title);
+    const unsupported = this.session?.unsupported ?? null;
+    const session = unsupported ? null : sessionView(this.session?.data, this.session?.title);
+    if (unsupported) body.child(v_flex().pt(10).border_t(1).border_color(t.border)
+      .child(div().text_size(11).text_color(t.dim).child(`Session usage: ${unsupported}`)));
     if (session) body.child(v_flex().pt(10).border_t(1).border_color(t.border).child(this.sessionBlock(session, t)));
     const cooling = this.cooling();
     return body.child(h_flex().gap(2).items_center()
@@ -399,9 +413,14 @@ export default class UsageLimits extends View {
   }
 
   render(cx) {
-    const terminal = focused()?.terminal ?? null;
+    const focus = focused();
+    const terminal = focus?.terminal ?? null;
+    // The terminal's machine, like ranch-session: its space's machine field,
+    // null on this computer. Same terminal never changes space.
+    const machine = spaces().find((sp) => sp.id === focus?.space)?.machine ?? null;
     if (terminal !== this.terminal) {
       this.terminal = terminal;
+      this.machine = machine;
       this.session = null;
       this.readSession(cx);
     }

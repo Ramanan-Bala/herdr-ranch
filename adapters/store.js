@@ -6,7 +6,7 @@
 // Legacy flat stores (tasks/<terminal>.json, schema 1) are still read.
 // Writes are atomic and refuse to overwrite a newer `seq`.
 import { execFileSync } from "node:child_process";
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { STORE_VERSION, agentApp, emptyStore, parseStore, storeFileName } from "../lib/tasks.js";
@@ -102,6 +102,42 @@ export function readStore(path, agent, terminal) {
     quarantine(path);
   }
   return emptyStore(terminal, agent);
+}
+
+/**
+ * Writer-side loader for a store that is about to be overwritten: unlike
+ * readStore() it refuses to destroy data it cannot understand. A missing
+ * file starts empty; an unreadable or newer-schema file throws so nothing
+ * is written; an invalid one is quarantined beside itself. A store owned by
+ * another agent app reads as empty (I10) without touching its file.
+ */
+function loadForWrite(path, agent, terminal) {
+  let text = null;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    if (err?.code === "ENOENT") return { store: emptyStore(terminal, agent), exists: false };
+    throw new Error(`store unreadable, not overwritten: ${path}`);
+  }
+  const parsed = parseStore(text);
+  if (parsed.ok) {
+    const owner = agentApp(parsed.store.agent);
+    if (owner && agent && owner !== agent) return { store: emptyStore(terminal, agent), exists: false };
+    return { store: parsed.store, exists: true };
+  }
+  if (parsed.reason === "newer") throw new Error(`store has a newer schema, not overwritten: ${path}`);
+  hookError(`quarantined invalid task store: ${path}`);
+  quarantine(path);
+  return { store: emptyStore(terminal, agent), exists: false };
+}
+
+/** Sentinel for "a lock could not be taken": updateStore retries once. */
+const LOCK_BUSY = new Error("store lock busy");
+
+/** The session id a store is bound to (legacy schema-1 agent block too). */
+function storeSessionId(store) {
+  const sid = store?.session?.id;
+  return typeof sid === "string" && sid ? sid : store?.agent?.session ?? null;
 }
 
 const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
@@ -204,10 +240,32 @@ export function recordSharedPr(top, branch, record) {
     let text = null;
     try {
       text = readFileSync(path, "utf8");
-    } catch {
-      // missing or unreadable: start an empty registry
+    } catch (err) {
+      if (err?.code !== "ENOENT") throw new Error(`pr registry unreadable, not overwritten: ${path}`);
     }
-    writeStore(path, addPr(parsePrRegistry(text), top, branch, record));
+    let registry = null;
+    if (text != null) {
+      let raw;
+      let bad = false;
+      try {
+        raw = JSON.parse(text);
+      } catch {
+        bad = true;
+      }
+      if (bad || !raw || typeof raw !== "object" || Array.isArray(raw)) {
+        // Malformed: keep the bytes beside the file, start from empty.
+        hookError(`quarantined invalid pr registry: ${path}`);
+        quarantine(path);
+      } else {
+        // A registry written by a newer build is never overwritten.
+        const supported = parsePrRegistry(null).version;
+        if (typeof raw.version === "number" && raw.version > supported) {
+          throw new Error(`pr registry has a newer schema, not overwritten: ${path}`);
+        }
+        registry = parsePrRegistry(text);
+      }
+    }
+    writeStore(path, addPr(registry, top, branch, record));
   } finally {
     release();
   }
@@ -232,97 +290,137 @@ export function updateStore(agent, fn, lookupStartedAt = terminalStartedAt) {
   const tPath = terminalPath(home, terminal);
   if (!tPath) return null;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const release = takeLock(tPath);
-    if (!release) {
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
-      continue;
-    }
     try {
-      const raw = readJson(tPath);
-      let sessionFile = null;
-      let current;
-      let legacySession = null;
-      if (raw && typeof raw.session === "string" && raw.session) {
-        sessionFile = sessionPath(home, raw.session);
-        current = readStore(sessionFile ?? tPath, agent, terminal);
-      } else if (raw) {
-        current = readStore(tPath, agent, terminal); // no session yet: the terminal file is the store
-      } else {
-        // First event in this terminal: adopt the legacy flat store if present
-        // (a session resumed in a new terminal keeps its tasks), else start empty.
-        const legacy = storePath(home, terminal);
-        const candidate = legacy ? readStore(legacy, agent, terminal) : null;
-        current = candidate && agentApp(candidate.agent) === agent ? candidate : emptyStore(terminal, agent);
-        if (current === candidate) legacySession = candidate.session?.id ?? candidate.agent?.session ?? null;
-        current.terminal = terminal;
-      }
-      if (!current || typeof current !== "object") current = emptyStore(terminal, agent);
-      let next = fn(current);
-      const incomingSession = next?.session && typeof next.session === "object" ? next.session.id : null;
-      if (legacySession && incomingSession && legacySession !== incomingSession) {
-        current = emptyStore(terminal, agent);
-        next = fn(current);
-      }
-      // A session resumed in a NEW terminal (no pointer file, or the terminal
-      // file is still the store): adopt the existing session-keyed store
-      // instead of starting from empty (fixes §3.3). Never adopt over real
-      // in-terminal data, and only when the session file exists on disk.
-      if (
-        sessionFile === null &&
-        typeof incomingSession === "string" && incomingSession &&
-        !current.tasks?.length && !current.prs?.length
-      ) {
-        const incomingPath = sessionPath(home, incomingSession);
-        if (incomingPath && existsSync(incomingPath)) {
-          const adopted = readStore(incomingPath, agent, terminal);
-          if (agentApp(adopted.agent) === agent) {
-            // The new terminal's start time must be looked up again: the UI
-            // identity check compares it to the live terminal start.
-            adopted.terminal = terminal;
-            adopted.terminal_started_at = null;
-            current = adopted;
-            next = fn(current);
-          }
-        }
-      }
-      if (!next || typeof next !== "object") return current;
-
-      // Identity (§3.3): schema 2, this terminal, this agent run, monotonic seq.
-      next.version = STORE_VERSION;
-      next.terminal = terminal;
-      const sid = next.session && typeof next.session === "object" && typeof next.session.id === "string"
-        ? next.session.id
-        : null;
-      next.agent = { app: agent, session: sid, pid: process.pid };
-      const diskSeq = Number.isInteger(current.seq) ? current.seq : 0;
-      const nextSeq = Number.isInteger(next.seq) ? next.seq : 0;
-      next.seq = Math.max(nextSeq, diskSeq) + 1; // refuses to overwrite a newer seq
-      next.terminal_started_at = current.terminal_started_at
-        ?? lookupStartedAt(terminal)
-        ?? (typeof next.terminal_started_at === "string" ? next.terminal_started_at : null)
-        ?? (raw ? current.terminal_started_at ?? null : new Date().toISOString());
-      next.updated_at = new Date().toISOString();
-
-      if (sid) {
-        // Always the incoming session's file: after /clear the id changes and
-        // the pointer below must lead to where this store was written.
-        writeStore(sessionPath(home, sid) ?? sessionFile, next);
-        writeStore(tPath, {
-          version: STORE_VERSION,
-          terminal,
-          terminal_started_at: next.terminal_started_at,
-          agent: next.agent,
-          session: sid,
-          updated_at: next.updated_at,
-        });
-      } else {
-        writeStore(tPath, next); // store lives in the terminal file until the session is known
-      }
-      recordHealth(agent);
-      return next;
-    } finally {
-      release();
+      return writeOnce(home, tPath, terminal, agent, fn, lookupStartedAt);
+    } catch (err) {
+      if (err !== LOCK_BUSY) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
     }
   }
   throw new Error(`store lock busy: ${tPath}`);
+}
+
+/**
+ * One read-modify-write attempt (fixes I9): the terminal lock first, then at
+ * most ONE session lock at a time — the session file actually being written
+ * is always the one locked, so two terminals on one session serialize.
+ * Reads the store with loadForWrite inside that lock; a bind to a different
+ * session switches the lock before any data is carried over. Locks are
+ * released in reverse order in the finally block below; on throw nothing is
+ * written and no lock file is left behind.
+ */
+function writeOnce(home, tPath, terminal, agent, fn, lookupStartedAt) {
+  const releases = []; // stack: released in reverse order in finally
+  try {
+    const releaseTerminal = takeLock(tPath);
+    if (!releaseTerminal) throw LOCK_BUSY;
+    releases.push(releaseTerminal);
+    const raw = readJson(tPath);
+    const pointed = raw && typeof raw.session === "string" && raw.session ? raw.session : null;
+    const pointedPath = pointed ? sessionPath(home, pointed) : null;
+    if (pointedPath) {
+      const releaseSession = takeLock(pointedPath);
+      if (!releaseSession) throw LOCK_BUSY;
+      releases.push(releaseSession);
+    }
+    let heldSessionPath = pointedPath;
+    let current;
+    if (pointedPath) {
+      current = loadForWrite(pointedPath, agent, terminal).store;
+    } else if (raw) {
+      current = readStore(tPath, agent, terminal); // no session yet: the terminal file is the store
+    } else {
+      // First event in this terminal: adopt the legacy flat store if present
+      // (a session resumed in a new terminal keeps its tasks), else start empty.
+      const legacy = storePath(home, terminal);
+      const candidate = legacy ? readStore(legacy, agent, terminal) : null;
+      current = candidate && agentApp(candidate.agent) === agent ? candidate : emptyStore(terminal, agent);
+      current.terminal = terminal;
+    }
+    if (!current || typeof current !== "object") current = emptyStore(terminal, agent);
+    // The session the loaded store is bound to: the pointer's target when
+    // there is one, else the store's own id (a legacy flat store carries it).
+    const loadedSid = pointed ?? storeSessionId(current);
+
+    let next = fn(current);
+    const incoming = storeSessionId(next);
+    if (incoming && incoming !== loadedSid) {
+      // Bind to a different session (fixes §3.3): the old store's data must
+      // never bleed into it, so lock the incoming session first and rebuild
+      // the base from THAT store.
+      if (heldSessionPath) {
+        releases.pop()(); // release the old session's lock before taking the new one
+        heldSessionPath = null;
+      }
+      const incomingPath = sessionPath(home, incoming);
+      const releaseIncoming = takeLock(incomingPath);
+      if (!releaseIncoming) throw LOCK_BUSY;
+      releases.push(releaseIncoming);
+      heldSessionPath = incomingPath;
+      const bound = loadForWrite(incomingPath, agent, terminal);
+      let base;
+      if (bound.exists) {
+        // The incoming session keeps its own data; this terminal's start
+        // time is looked up again (the UI compares it to the live terminal).
+        base = bound.store;
+        base.terminal = terminal;
+        base.terminal_started_at = null;
+      } else if (!loadedSid && (current.tasks?.length || current.prs?.length)) {
+        // First binding of in-terminal data recorded before the agent
+        // reported a session id: keep it (today's behaviour).
+        base = current;
+      } else {
+        // A genuinely new session: complete reset, nothing carries over.
+        base = emptyStore(terminal, agent);
+      }
+      current = base;
+      next = fn(base);
+    }
+    if (!next || typeof next !== "object") return current;
+
+    // Identity (§3.3): schema 2, this terminal, this agent run, monotonic
+    // seq — incremented from the value read inside the held session lock.
+    next.version = STORE_VERSION;
+    next.terminal = terminal;
+    const sid = incoming;
+    next.agent = { app: agent, session: sid, pid: process.pid };
+    const diskSeq = Number.isInteger(current.seq) ? current.seq : 0;
+    const nextSeq = Number.isInteger(next.seq) ? next.seq : 0;
+    next.seq = Math.max(nextSeq, diskSeq) + 1; // refuses to overwrite a newer seq
+    // This terminal's own start time: a shared session file holds whichever
+    // terminal wrote it last, so the pointer's value wins (finding 3).
+    const pointerStarted = pointed && typeof raw.terminal_started_at === "string" ? raw.terminal_started_at : null;
+    next.terminal_started_at = (pointed && incoming === pointed ? pointerStarted : current.terminal_started_at)
+      ?? lookupStartedAt(terminal)
+      ?? (typeof next.terminal_started_at === "string" ? next.terminal_started_at : null)
+      ?? (raw ? current.terminal_started_at ?? null : new Date().toISOString());
+    next.updated_at = new Date().toISOString();
+
+    if (sid) {
+      // Always the incoming session's file: after /clear the id changes and
+      // the pointer below must lead to where this store was written. The
+      // session's lock is held (taken here if no rebind needed one).
+      const target = sessionPath(home, sid) ?? tPath;
+      if (target !== heldSessionPath) {
+        const releaseSession = takeLock(target);
+        if (!releaseSession) throw LOCK_BUSY;
+        releases.push(releaseSession);
+      }
+      writeStore(target, next);
+      writeStore(tPath, {
+        version: STORE_VERSION,
+        terminal,
+        terminal_started_at: next.terminal_started_at,
+        agent: next.agent,
+        session: sid,
+        updated_at: next.updated_at,
+      });
+    } else {
+      writeStore(tPath, next); // store lives in the terminal file until the session is known
+    }
+    recordHealth(agent);
+    return next;
+  } finally {
+    while (releases.length) releases.pop()();
+  }
 }

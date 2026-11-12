@@ -47,6 +47,26 @@ export function worktreePath(home, repoTop, branch) {
 }
 
 /**
+ * What pressing Enter should do in the start-agent dialog:
+ *  - "plain"          worktree mode off: launch a normal tab
+ *  - "wait"           worktree mode on, the repo probe is still running
+ *  - "error:<reason>" worktree mode on but a worktree launch cannot happen:
+ *                     no-repo (folder not in git), probe (git check failed),
+ *                     home (the machine's home directory is unreachable)
+ *  - "worktree"       create a worktree
+ * `probe` is the dialog's probe state, `homeOk` whether the (remote) home
+ * lookup answered; unknown homeOk defers the check to the caller.
+ */
+export function launchDecision({ worktree, probe, homeOk } = {}) {
+  if (!worktree) return "plain";
+  if (!probe || probe === "pending") return "wait";
+  if (probe === "none") return "error:no-repo";
+  if (probe === "error") return "error:probe";
+  if (homeOk === false) return "error:home";
+  return "worktree";
+}
+
+/**
  * The agent keys to offer, in Ranch settings order, excluding "terminal",
  * keeping only keys present in `known` with installed !== false. If that
  * leaves nothing, all installed known agents with agent:true.

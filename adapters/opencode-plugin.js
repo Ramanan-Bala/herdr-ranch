@@ -10,12 +10,13 @@
 // an object ({ id, setup, server }) and calls setup(ctx); v1 calls server(),
 // which returns the classic hooks object.
 import { execFileSync } from "node:child_process";
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
 const STORE_VERSION = 2;
 const TASKS_DIR = ".herdr/ranch/tasks";
+const LOG_MAX = 1024 * 1024;
 const TASK_STATUS = new Set(["pending", "in_progress", "completed", "cancelled"]);
 // The marked block the installer writes to ~/.config/opencode/AGENTS.md; when
 // it is there, the plugin does not also inject its rule (fixes F13: one
@@ -72,6 +73,7 @@ function emptyStore(terminal) {
     session: null,
     tasks: [],
     subagents: [],
+    prs: [],
   };
 }
 
@@ -103,6 +105,13 @@ function normalizeStore(raw, terminal) {
       ...(typeof s.parent_terminal === "string" && s.parent_terminal ? { parent_terminal: s.parent_terminal } : {}),
       ...(typeof s.parent_session === "string" && s.parent_session ? { parent_session: s.parent_session } : {}),
     }));
+  // Recorded PRs (I4): unusable entries are dropped, never fatal. The shape
+  // mirrors lib/tasks.js normalizePrRecord without importing it.
+  const prs = (Array.isArray(raw.prs) ? raw.prs : []).flatMap((p) => {
+    const url = typeof p?.url === "string" ? p.url.trim() : "";
+    if (!url.startsWith("https://") || !Number.isInteger(p.number)) return [];
+    return [{ url, number: p.number, ...(typeof p.at === "string" ? { at: p.at } : {}) }];
+  });
   const session = raw.session && typeof raw.session === "object"
     ? {
         id: typeof raw.session.id === "string" ? raw.session.id : null,
@@ -133,7 +142,41 @@ function normalizeStore(raw, terminal) {
     session,
     tasks,
     subagents,
+    prs,
   };
+}
+
+/**
+ * A malformed store is renamed beside itself with a .error suffix (fixes
+ * §3.2), so the broken content stays inspectable and is never re-parsed.
+ */
+function quarantine(path) {
+  try {
+    renameSync(path, `${path}.error`);
+  } catch {
+    // Keep the original file; parsing already rejected it.
+  }
+}
+
+/**
+ * One line per error to ~/.herdr/ranch/logs/adapter.log (fixes §3.8), rotated
+ * to adapter.log.1 when it passes 1 MB — never to stdout, which the agent
+ * would read as context.
+ */
+function logError(err) {
+  try {
+    const dir = join(homeDir(), ".herdr", "ranch", "logs");
+    mkdirSync(dir, { recursive: true });
+    const log = join(dir, "adapter.log");
+    try {
+      if (statSync(log).size > LOG_MAX) renameSync(log, `${log}.1`);
+    } catch {
+      // no log yet (or unrotatable): just append
+    }
+    appendFileSync(log, `${new Date().toISOString()} ${err?.stack ?? String(err)}\n`);
+  } catch {
+    // out of options; stay silent
+  }
 }
 
 function readJsonFile(path) {
@@ -146,9 +189,45 @@ function readJsonFile(path) {
 
 const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
 
-function loadStore(path) {
-  const raw = readJsonFile(path);
-  return raw ? normalizeStore(raw, process.env.HC_TERMINAL_ID) : emptyStore(process.env.HC_TERMINAL_ID);
+/**
+ * Writer-side load (fixes §3.2, I9): an existing store is never silently
+ * replaced. Missing -> empty (exists false); unreadable or newer-schema ->
+ * throws (the caller logs and the file is left untouched); malformed ->
+ * quarantined as <path>.error, logged, empty returned; another agent's store
+ * -> empty, exists false (the file is not touched here). Otherwise the
+ * normalized store with exists true.
+ */
+function loadForWrite(path, terminal) {
+  let text;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    if (err?.code === "ENOENT") return { store: emptyStore(terminal), exists: false };
+    throw new Error(`store unreadable, not overwritten: ${path}`);
+  }
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    logError(`quarantined invalid task store: ${path}`);
+    quarantine(path);
+    return { store: emptyStore(terminal), exists: false };
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    logError(`quarantined invalid task store: ${path}`);
+    quarantine(path);
+    return { store: emptyStore(terminal), exists: false };
+  }
+  if (typeof raw.version === "number" && raw.version > STORE_VERSION) {
+    throw new Error(`store has a newer schema, not overwritten: ${path}`);
+  }
+  // Terminal reuse by another agent (I10): never continue its session, tasks
+  // or sub-agents, and leave the file for its owner.
+  const owner = typeof raw.agent === "string" ? raw.agent : raw.agent?.app;
+  if (typeof owner === "string" && owner && owner !== "opencode") {
+    return { store: emptyStore(terminal), exists: false };
+  }
+  return { store: normalizeStore(raw, terminal), exists: true };
 }
 
 function saveStore(path, store) {
@@ -200,29 +279,6 @@ function takeLock(path) {
     }
   }
   return null;
-}
-
-/**
- * Runs one read-modify-write under the store lock. When the lock cannot be
- * taken it is retried once; failing that the write is skipped, so the store
- * is never written without the lock (I9). Write errors propagate to the
- * caller, which catches everything.
- */
-function withLock(path, fn) {
-  if (!path) return;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const release = takeLock(path);
-    if (!release) {
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
-      continue;
-    }
-    try {
-      fn();
-      return;
-    } finally {
-      release();
-    }
-  }
 }
 
 /**
@@ -411,7 +467,7 @@ const TASK_RULE = "Task reporting is mandatory (Ranch): for EVERY user message, 
 /** True when the installer's marked rule block is already in AGENTS.md (F13). */
 function agentsBlockInstalled() {
   try {
-    return readFileSync(join(homedir(), ".config", "opencode", "AGENTS.md"), "utf8").includes(BLOCK_MARK);
+    return readFileSync(join(homeDir(), ".config", "opencode", "AGENTS.md"), "utf8").includes(BLOCK_MARK);
   } catch {
     return false;
   }
@@ -464,66 +520,175 @@ function adoptSession(store, event) {
   return { ...store, session };
 }
 
-/** One store read → reduce → conditional atomic write, shared by both hosts. */
+/** The store's seq, when it is a usable non-negative integer. */
+function seqOf(store) {
+  return Number.isInteger(store?.seq) && store.seq >= 0 ? store.seq : 0;
+}
+
+/**
+ * Read-reduce-write for one event while the terminal pointer's lock is held
+ * (fixes §3.3). The session store being read or written is locked too: at
+ * most one session lock is held at a time, always taken after the terminal
+ * one. Returns false when a needed session lock could not be taken, so the
+ * caller can retry the whole read-modify-write once (I9).
+ */
+function recordUnderTerminalLock(event, terminal, tPath) {
+  const raw = readJsonFile(tPath);
+  // The event's MAIN session id; child (sub-agent) events never bind one.
+  const incomingMain = pickParentID(event) ? null : pickSessionID(event);
+  let sessionFile = null;
+  let loaded = null;
+  let releaseSession = null;
+
+  try {
+    if (raw && typeof raw.session === "string" && raw.session) {
+      // Terminal pointer → the store lives in sessions/<session>.json.
+      sessionFile = sessionPath(raw.session);
+      if (sessionFile) {
+        releaseSession = takeLock(sessionFile);
+        if (!releaseSession) return false;
+        loaded = loadForWrite(sessionFile, terminal).store;
+      } else {
+        loaded = loadForWrite(tPath, terminal).store; // unusable pointer name
+      }
+    } else if (raw) {
+      // No session id yet: the terminal file itself is the store.
+      loaded = loadForWrite(tPath, terminal).store;
+    } else {
+      // First event in this terminal: adopt a legacy flat store if one exists
+      // (e.g. the session was resumed in a new terminal).
+      const legacy = legacyPath();
+      const legacyRaw = legacy ? readJsonFile(legacy) : null;
+      const legacyApp = typeof legacyRaw?.agent === "string" ? legacyRaw.agent : legacyRaw?.agent?.app;
+      const candidate = legacyRaw ? normalizeStore(legacyRaw, terminal) : null;
+      const legacySession = candidate?.session?.id ?? candidate?.agent?.session ?? null;
+      const sameSession = !legacySession || !incomingMain || legacySession === incomingMain;
+      loaded = candidate && legacyApp === "opencode" && sameSession ? candidate : emptyStore(terminal);
+      loaded.terminal = terminal;
+    }
+
+    const loadedId = typeof loaded.session?.id === "string" && loaded.session.id ? loaded.session.id : null;
+    const knownSubagent = Array.isArray(loaded.subagents) && loaded.subagents.some((s) => s.id === incomingMain);
+    // An event whose main session id differs from the loaded store's belongs
+    // to the incoming session (resume in a new terminal, /clear, a newly
+    // created session). Events that merely mention another session for
+    // activity/todo purposes keep today's reducer semantics: they switch
+    // stores only when the incoming session already has a store on disk, or
+    // when no main session is known yet, or when the event defines a new one.
+    const incomingPath = incomingMain ? sessionPath(incomingMain) : null;
+    const switchNeeded = Boolean(
+      incomingPath &&
+      incomingMain !== loadedId &&
+      !knownSubagent &&
+      (existsSync(incomingPath) ||
+        !loadedId ||
+        event?.type === "session.created" ||
+        (event?.type === "session.updated" && loaded.session?.state === "ended")),
+    );
+
+    if (switchNeeded) {
+      if (releaseSession) {
+        releaseSession();
+        releaseSession = null;
+      }
+      releaseSession = takeLock(incomingPath);
+      if (!releaseSession) return false;
+      const incoming = loadForWrite(incomingPath, terminal);
+      if (incoming.exists) {
+        // Resume (§3.3): keep the session's tasks, sub-agents, PRs and seq;
+        // the start time is re-looked-up for this terminal.
+        loaded = incoming.store;
+        loaded.terminal = terminal;
+        loaded.terminal_started_at = null;
+      } else if (!loadedId && Array.isArray(loaded.tasks) && loaded.tasks.length) {
+        // The id was only learned now: keep what this terminal already
+        // recorded before it knew which session it served.
+      } else {
+        loaded = emptyStore(terminal); // complete reset for a new session
+      }
+      sessionFile = incomingPath;
+    }
+
+    const adopted = adoptSession(loaded, event);
+    const next = reduceOpencode(adopted, event);
+    // Nothing changed: no write, and never rebind the pointer for an event
+    // the reducer ignored.
+    if (next === adopted && adopted === loaded) return true;
+
+    // Identity (§3.3): schema 2, monotonic seq, this agent run.
+    const updated = { ...next };
+    updated.version = STORE_VERSION;
+    updated.terminal = terminal;
+    const sid = typeof updated.session?.id === "string" && updated.session.id ? updated.session.id : null;
+    updated.agent = { app: "opencode", session: sid, pid: process.pid };
+    updated.seq = Math.max(seqOf(loaded), seqOf(updated)) + 1;
+    // This terminal's own start time: a shared session file holds whichever
+    // terminal wrote it last, so the pointer's value wins (finding 3).
+    const pointed = raw && typeof raw.session === "string" && raw.session ? raw.session : null;
+    const ownPointer = Boolean(pointed) && pointed === sid;
+    const pointerStarted = ownPointer && typeof raw.terminal_started_at === "string" ? raw.terminal_started_at : null;
+    updated.terminal_started_at = (ownPointer ? pointerStarted : loaded.terminal_started_at)
+      ?? terminalStartedAt(terminal) ?? new Date().toISOString();
+    updated.updated_at = new Date().toISOString();
+    if (sid) {
+      // The incoming session's file, written under its own lock, so the
+      // pointer below matches after a session change. Never write a session
+      // file without holding its lock (legacy adoption, or an event naming
+      // two sessions): switch to that file's lock first.
+      const target = sessionPath(sid) ?? sessionFile;
+      if (target !== sessionFile || !releaseSession) {
+        if (releaseSession) releaseSession();
+        releaseSession = takeLock(target);
+        if (!releaseSession) return false;
+      }
+      saveStore(target, updated);
+      // Terminal pointer so the mod can find the session store again.
+      saveStore(tPath, {
+        version: STORE_VERSION,
+        terminal,
+        terminal_started_at: updated.terminal_started_at,
+        agent: updated.agent,
+        session: sid,
+        updated_at: updated.updated_at,
+      });
+    } else {
+      saveStore(tPath, updated);
+    }
+    return true;
+  } finally {
+    if (releaseSession) releaseSession();
+  }
+}
+
+/**
+ * Runs one read-modify-write under the terminal pointer's lock, then at most
+ * one session lock at a time (I9). When a lock cannot be taken the whole
+ * thing is retried once; failing that the write is skipped and logged, so a
+ * store is never written without its lock. Never throws to the host.
+ */
 function recordEvent(event) {
   try {
-    withLock(terminalPath(), () => {
-      const terminal = process.env.HC_TERMINAL_ID;
-      const tPath = terminalPath();
-      if (!terminal || !tPath) return;
-      const raw = readJsonFile(tPath);
-      let sessionFile = null;
-      let loaded;
-      if (raw && typeof raw.session === "string" && raw.session) {
-        // Terminal pointer → the store lives in sessions/<session>.json.
-        sessionFile = sessionPath(raw.session) ?? tPath;
-        loaded = loadStore(sessionFile);
-      } else if (raw) {
-        // No session id yet: the terminal file itself is the store.
-        loaded = loadStore(tPath);
-      } else {
-        // First event in this terminal: adopt a legacy flat store if one exists
-        // (e.g. the session was resumed in a new terminal).
-        const legacy = legacyPath();
-        const legacyRaw = legacy ? readJsonFile(legacy) : null;
-        const legacyApp = typeof legacyRaw?.agent === "string" ? legacyRaw.agent : legacyRaw?.agent?.app;
-        const candidate = legacyRaw ? normalizeStore(legacyRaw, terminal) : null;
-        const legacySession = candidate?.session?.id ?? candidate?.agent?.session ?? null;
-        const incomingSession = pickSessionID(event);
-        const sameSession = !legacySession || !incomingSession || legacySession === incomingSession;
-        loaded = candidate && legacyApp === "opencode" && sameSession ? candidate : emptyStore(terminal);
-        loaded.terminal = terminal;
+    const terminal = process.env.HC_TERMINAL_ID;
+    const tPath = terminalPath();
+    if (!terminal || !tPath) return;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const releaseTerminal = takeLock(tPath);
+      if (!releaseTerminal) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        continue;
       }
-      const adopted = adoptSession(loaded, event);
-      const next = reduceOpencode(adopted, event);
-      if (next === adopted && adopted === loaded) return;
-
-      // Identity (§3.3): schema 2, monotonic seq, this agent run.
-      const updated = { ...next };
-      updated.version = STORE_VERSION;
-      updated.terminal = terminal;
-      const sid = typeof updated.session?.id === "string" && updated.session.id ? updated.session.id : null;
-      updated.agent = { app: "opencode", session: sid, pid: process.pid };
-      updated.seq = Math.max(Number.isInteger(loaded.seq) ? loaded.seq : 0, Number.isInteger(updated.seq) ? updated.seq : 0) + 1;
-      updated.terminal_started_at = loaded.terminal_started_at ?? terminalStartedAt(terminal) ?? new Date().toISOString();
-      updated.updated_at = new Date().toISOString();
-      if (sid) {
-        saveStore(sessionPath(sid) ?? sessionFile, updated); // the incoming session's file, so the pointer matches after a session change
-        // Terminal pointer so the mod can find the session store again.
-        saveStore(tPath, {
-          version: STORE_VERSION,
-          terminal,
-          terminal_started_at: updated.terminal_started_at,
-          agent: updated.agent,
-          session: sid,
-          updated_at: updated.updated_at,
-        });
-      } else {
-        saveStore(tPath, updated);
+      let busy = false;
+      try {
+        busy = !recordUnderTerminalLock(event, terminal, tPath);
+      } finally {
+        releaseTerminal();
       }
-    });
-  } catch {
-    // Never break the host: task reporting fails silently.
+      if (!busy) return;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+    logError(`store lock busy: ${tPath}`);
+  } catch (err) {
+    logError(err);
   }
 }
 

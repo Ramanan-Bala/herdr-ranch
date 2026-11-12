@@ -67,10 +67,19 @@ test("fixture: OpenCode todowrite tool hook replaces tasks", () => {
 
 test("fixture: OpenCode v2 bus todo.updated is recorded (3.1)", async () => {
   const home = mkdtempSync(join(tmpdir(), "ranch-fixtures-"));
-  const saved = { HOME: process.env.HOME, RANCH_HOME: process.env.RANCH_HOME, HC_TERMINAL_ID: process.env.HC_TERMINAL_ID };
+  const saved = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    RANCH_HOME: process.env.RANCH_HOME,
+    HC_TERMINAL_ID: process.env.HC_TERMINAL_ID,
+  };
   process.env.RANCH_HOME = home;
   process.env.HC_TERMINAL_ID = "fx";
-  process.env.HOME = home; // no AGENTS.md block: the rule hook stays silent
+  // HOME and USERPROFILE both: on Windows os.homedir() reads USERPROFILE, so
+  // the isolation must cover it too (no AGENTS.md block: the rule hook stays
+  // silent).
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
   try {
     const plugin = await RanchTasks({});
     await plugin.event({ event: load("opencode-todo-updated.json") });

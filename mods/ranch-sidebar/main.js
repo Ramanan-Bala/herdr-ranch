@@ -8,9 +8,13 @@ import {
   spaces, machines, agents, panes, setAgentOrder, exec, watchFolder, run,
   openOverlay, theme, shared, setShared, nextCommand, window, home, readTextFile,
 } from "herdr";
-import { buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials, diffSquares } from "./model.js";
+import {
+  buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials, diffSquares,
+  normalizeCollapsed, topOfFresh, cardRows,
+} from "./model.js";
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent } from "./lib/format.js";
 import { repoSummary, parsePr, createTtlCache, runGh, PR_JSON_FIELDS } from "./lib/git.js";
+import { homeCache } from "./lib/home.js";
 import { SETTINGS_KEY, FILTER_KEY, resolveSettings } from "./lib/settings.js";
 import { PRS_FILE, parsePrRegistry, prsFor } from "./lib/prs.js";
 import { progress } from "./lib/tasks.js";
@@ -35,7 +39,7 @@ export default class RanchSidebar extends View {
     this.collapsed = this.loadCollapsed();
 
     // Git: repos `${machine}|${top}` -> {summary, at}; topOf `${machine}|${cwd}`
-    // -> top|null (null = known not a repo).
+    // -> { top: string|null, at } (top null = no repository found at `at`).
     this.repos = new Map();
     this.topOf = new Map();
     this.pendingRepos = new Map(); // key -> {machine, cwd}, drained off-render
@@ -52,9 +56,9 @@ export default class RanchSidebar extends View {
     this.prBusy = new Set();
     this.healthAt = 0;
     // Recorded PRs (shared registry, …): `~/.herdr/ranch/prs.json` read per
-    // machine (cached, refreshed on the sweep tick), plus the per-machine
-    // home dirs the read needs on a remote machine.
-    this.homes = new Map(); // machine (null excepted) -> home dir
+    // machine (cached, refreshed on the sweep tick); remote home dirs come
+    // from lib/home.js (sh, then cmd.exe; failed lookups back off).
+    this.homeFor = homeCache(exec, home);
     this.prRegistries = new Map(); // machineKey -> { parsed, at }
     this.prRegistryBusy = new Set();
     this.pendingRegistries = new Map(); // machineKey -> machine, drained off-render
@@ -79,7 +83,7 @@ export default class RanchSidebar extends View {
 
   loadCollapsed() {
     try {
-      return { m: {}, s: {}, w: {}, settled: {}, ...JSON.parse(localStorage.getItem(COLLAPSE_KEY) ?? "{}") };
+      return normalizeCollapsed(JSON.parse(localStorage.getItem(COLLAPSE_KEY) ?? "{}"));
     } catch {
       return { m: {}, s: {}, w: {}, settled: {} };
     }
@@ -123,12 +127,13 @@ export default class RanchSidebar extends View {
     this.busy.add(busyKey);
     try {
       const summary = await repoSummary(this.gitCmd(machine, cwd));
+      // One entry shape for both outcomes: null top = no repository found
+      // (timeout, unreachable machine or plain not-a-repo); trusted only
+      // inside the TOP_OF_RETRY_MS window (model.js topOfFresh).
+      this.topOf.set(`${machine ?? ""}|${cwd}`, { top: summary?.top ?? null, at: Date.now() });
       if (summary) {
         this.repos.set(`${machine ?? ""}|${summary.top}`, { summary, at: Date.now() });
-        this.topOf.set(`${machine ?? ""}|${cwd}`, summary.top);
         if (!machine) this.watchRepo(summary.top, cx);
-      } else {
-        this.topOf.set(`${machine ?? ""}|${cwd}`, null);
       }
     } finally {
       this.busy.delete(busyKey);
@@ -208,19 +213,6 @@ export default class RanchSidebar extends View {
   }
 
   // ---- recorded PRs (shared registry) ----
-
-  /** Home dir on a machine: home() locally; asked once per remote machine. */
-  async homeFor(machine) {
-    if (!machine) return home();
-    if (this.homes.has(machine)) return this.homes.get(machine);
-    let out = null;
-    try {
-      const r = await exec("sh", ["-c", 'printf %s "$HOME"'], { on: machine });
-      if (r.code === 0) out = r.stdout.trim() || null;
-    } catch {}
-    if (out) this.homes.set(machine, out); // failures retry on the next tick
-    return out;
-  }
 
   /** One registry read per machine (cached in prRegistries, best effort). */
   async refreshRegistry(machine, cx) {
@@ -541,6 +533,13 @@ export default class RanchSidebar extends View {
       ? (wt.checkout.detached ? `detached @${wt.checkout.head ?? ""}` : wt.checkout.branch ?? wt.name)
       : wt.name;
     const stat = wt.checkout?.stat ?? null;
+    // Stats follow card.line3, PR badges card.pr alone (finding 19).
+    const rows = cardRows({
+      line3: this.settings.card.line3,
+      pr: this.settings.card.pr,
+      hasDiff: (stat?.files ?? 0) > 0,
+      hasPr: Boolean(wt.pr || wt.recorded?.length),
+    });
     return h_flex().id(`worktree-${foldKey}`).h(24).mt(2).flex_none().pl(10).pr(8).gap(8).items_center()
       .cursor_pointer().hover((s) => s.bg(t.hover))
       .on_hover((isIn, cx) => {
@@ -562,11 +561,11 @@ export default class RanchSidebar extends View {
       .child(div().flex_1().min_w(0).truncate().text_size(11).font_semibold()
         .text_color(wt.active ? t.foreground : t.muted).child(truncateMiddle(label, 28)))
       .when(primary, (e) => e.child(div().flex_none().text_size(10).text_color(t.dim).child("primary")))
-      .when(this.settings.card.line3 && stat?.files > 0, (e) => e
+      .when(rows.stats, (e) => e
         .child(div().flex_none().text_size(10).text_color(t.ansi2).child(`+${stat.add}`))
         .when(stat.del > 0, (el) => el.child(div().flex_none().text_size(10).text_color(t.ansi1).child(`\u2212${stat.del}`))))
-      .when(Boolean(this.settings.card.pr && wt.pr), (e) => e.child(this.prBadge(`pr-wt-${foldKey}`, wt.pr)))
-      .when(Boolean(this.settings.card.pr && wt.recorded?.length), (e) => e.child(
+      .when(Boolean(rows.pr && wt.pr), (e) => e.child(this.prBadge(`pr-wt-${foldKey}`, wt.pr)))
+      .when(Boolean(rows.pr && wt.recorded?.length), (e) => e.child(
         h_flex().flex_none().gap(3).children(this.recordedBadges(`rec-wt-${foldKey}`, wt.recorded))))
       .when(this.hoveredSpace === foldKey, (e) => e.child(this.plusBtn(wt.space, foldKey)).child(this.sparkBtn(wt.space, foldKey)))
       .when(folded && Boolean(wt.status), (e) => e.child(this.ring(wt.status, 9)))
@@ -717,7 +716,17 @@ export default class RanchSidebar extends View {
       : null;
 
     const parts3 = [];
-    if (this.settings.card.line3 && !settled && !grouped) {
+    // Diff statistics follow card.line3; PR badges follow card.pr alone, so
+    // they still show with line3 off (a compact badge-only row). Grouped and
+    // settled cards draw neither (layout, not a setting).
+    const line3Allowed = !settled && !grouped;
+    const rows3 = cardRows({
+      line3: this.settings.card.line3,
+      pr: this.settings.card.pr,
+      hasDiff: line3Allowed && (c.summary?.stat?.files ?? 0) > 0,
+      hasPr: line3Allowed && Boolean(c.pr || c.recorded?.length),
+    });
+    if (rows3.stats) {
       const stat = c.summary?.stat ?? null;
       if (stat && stat.files > 0) {
         parts3.push(div().flex_none().text_size(10.5).text_color(t.muted)
@@ -730,13 +739,13 @@ export default class RanchSidebar extends View {
               .bg(kind === "add" ? t.ansi2 : kind === "del" ? t.ansi1 : t.border))
         ));
       }
-      if (this.settings.card.pr && c.pr) {
-        parts3.push(this.prBadge(`pr-${c.tabId}`, c.pr));
-      }
-      // Recorded PRs the agent opened (…), after the branch PR badge.
-      if (this.settings.card.pr && c.recorded?.length) {
-        parts3.push(h_flex().flex_none().gap(3).children(this.recordedBadges(`rec-${c.tabId}`, c.recorded)));
-      }
+    }
+    if (rows3.pr && c.pr) {
+      parts3.push(this.prBadge(`pr-${c.tabId}`, c.pr));
+    }
+    // Recorded PRs the agent opened (…), after the branch PR badge.
+    if (rows3.pr && c.recorded?.length) {
+      parts3.push(h_flex().flex_none().gap(3).children(this.recordedBadges(`rec-${c.tabId}`, c.recorded)));
     }
     // Line 3 renders only when there is something to show (diff stats, PR);
     // the card's height follows, so there is no empty slot any more. Line 2
@@ -921,7 +930,8 @@ export default class RanchSidebar extends View {
           const m = c.machine ?? "";
           const ck = `${m}|${c.cwd}`;
           this.wanted.add(ck);
-          c.top = this.topOf.get(ck);
+          const topEntry = this.topOf.get(ck);
+          c.top = topOfFresh(topEntry, now) ? (topEntry.top ?? null) : undefined;
           if (c.top) {
             const tk = `${m}|${c.top}`;
             this.wanted.add(tk);
@@ -931,7 +941,7 @@ export default class RanchSidebar extends View {
           }
         }
         // Settled tabs too: the PR badge now lives on the space/worktree row.
-        if (s.card.line3 && s.card.pr && c.top && c.summary && !c.summary.detached) {
+        if (s.card.pr && c.top && c.summary && !c.summary.detached) {
           const branch = c.branch ?? c.summary.branch;
           // The branch's own PR: never looked up on the default branch.
           if (branch && branch !== c.summary.default) {
@@ -965,7 +975,7 @@ export default class RanchSidebar extends View {
         sp.checkout = all.find((c) => c.summary)?.summary ?? null;
         sp.pr = all.find((c) => c.pr && c.top === sp.checkout?.top)?.pr ?? null;
         // The checkout row (worktreeRow) shows its recorded PRs too (…).
-        if (s.card.line3 && s.card.pr && sp.checkout?.top && sp.checkout.branch && !sp.checkout.detached) {
+        if (s.card.pr && sp.checkout?.top && sp.checkout.branch && !sp.checkout.detached) {
           const pk = `${g.machine ?? ""}|${sp.checkout.top}|${sp.checkout.branch}`;
           const branchPr = sp.pr ?? this.prCache.get(pk, now) ?? null;
           sp.recorded = this.recordedResolved(wantRegistry(g.machine), g.machine,

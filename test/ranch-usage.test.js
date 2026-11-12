@@ -6,17 +6,27 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 // lib/ must be inside the mod folders before imports resolve.
 execFileSync("sh", [join(root, "scripts/sync-lib.sh")]);
 
-const { parse: parseClaude } = await import(join(root, "mods/ranch-usage/providers/claude.js"));
-const { parse: parseCodex } = await import(join(root, "mods/ranch-usage/providers/codex.js"));
-const { parse: parseCopilot } = await import(join(root, "mods/ranch-usage/providers/copilot.js"));
-const { parse: parseOpenCode } = await import(join(root, "mods/ranch-usage/providers/opencode.js"));
-const { level } = await import(join(root, "mods/ranch-usage/usage/format.js"));
+const { parse: parseClaude } = await import(
+  pathToFileURL(join(root, "mods/ranch-usage/providers/claude.js")).href
+);
+const { parse: parseCodex } = await import(
+  pathToFileURL(join(root, "mods/ranch-usage/providers/codex.js")).href
+);
+const { parse: parseCopilot } = await import(
+  pathToFileURL(join(root, "mods/ranch-usage/providers/copilot.js")).href
+);
+const { parse: parseOpenCode } = await import(
+  pathToFileURL(join(root, "mods/ranch-usage/providers/opencode.js")).href
+);
+const { level } = await import(
+  pathToFileURL(join(root, "mods/ranch-usage/usage/format.js")).href
+);
 
 const NOW = Math.floor(Date.parse("2026-11-11T10:00:00Z") / 1000);
 
@@ -297,11 +307,13 @@ test("opencode-usage.mjs prints the reply with \"data\"; 1 without one, 127 with
   assert.equal(silent.status, 1);
   assert.equal(silent.stdout, "");
 
-  // HOME is overridden too: without it the helper's ~/.opencode/bin fallback
-  // would find a really installed opencode instead of exiting 127.
+  // HOME and USERPROFILE are overridden too: without them the helper's
+  // ~/.opencode/bin fallback would find a really installed opencode instead
+  // of exiting 127. USERPROFILE because Windows homedir() ignores HOME.
   const missing = runHelper("opencode-usage.mjs", {
     HERDR_USAGE_OPENCODE_BIN: join(fakes, "no-such-oc"),
     HOME: fakes,
+    USERPROFILE: fakes,
   });
   assert.equal(missing.status, 127);
 });

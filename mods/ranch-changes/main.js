@@ -1,6 +1,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, home } from "herdr";
+import { headerLabel, requestGate } from "./model.js";
 
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
@@ -34,6 +35,7 @@ function diffRows(lines) {
 export default class Changes extends View {
   init(_props, cx) {
     this.files = []; this.rows = []; this.diffWidth = 0; this.message = ""; this.handle = cx.focus_handle();
+    this.gate = requestGate(); this.loading = 0; this.label = null;
     this.input = InputState.new({ placeholder: "Commit message" });
     this.input.on("change", (_e, cx) => {
       const hadMessage = Boolean(this.message.trim());
@@ -61,19 +63,27 @@ export default class Changes extends View {
   }
 
   refresh(cx) {
-    if (this.loading || this.busy) return;
     const { cwd, on } = location(), context = key();
+    // Wipe the old context's data BEFORE anything else, so a switch never
+    // shows A's files/diff/message while B is loading or queued.
     if (context !== this.context) {
-      this.context = context; this.root = null; this.files = []; this.open = null;
+      this.context = context; this.root = null; this.files = []; this.open = null; this.label = null;
       this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.closed = false; this.limited = false;
     }
-    if (!cwd) return;
-    this.loading = true;
+    if (!cwd) { this.loading = 0; return; }
+    const plan = this.gate.plan(context, this.busy);
+    if (plan.action !== "start") {
+      // Loading or queued: keep the loading state of the read that will apply.
+      if (plan.token) this.loading = plan.token;
+      return;
+    }
+    const token = plan.token;
+    this.loading = token;
     cx.spawn(async (cx) => {
       try {
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
         if (key() !== context) return;
-        if (top.code !== 0) { this.root = null; this.files = []; this.setLines([]); this.open = null; this.error = "Not a git repository"; return; }
+        if (top.code !== 0) { this.root = null; this.files = []; this.setLines([]); this.open = null; this.label = null; this.error = "Not a git repository"; return; }
         const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
         const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
         if (status.code !== 0) throw new Error(status.stderr);
@@ -100,6 +110,7 @@ export default class Changes extends View {
         }
         if (key() !== context) return;
         this.root = root; this.on = on; this.hasHead = head.code === 0; this.files = files; this.limited = entries.length > 1000; this.error = null;
+        this.label = headerLabel(root, on, home());
         this.watch(root, cx);
         if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.setLines([]); }
         // The first file's diff shows until you pick another.
@@ -109,7 +120,14 @@ export default class Changes extends View {
           catch { if (key() === context) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
         }
       } catch (e) { if (key() === context) this.error = String(e); }
-      finally { this.loading = false; cx.notify(); }
+      finally {
+        // Only the latest token applies results and clears loading; an older
+        // completion must not touch a newer request's state.
+        const { apply, restart } = this.gate.settle(token, key());
+        if (apply) this.loading = 0;
+        if (restart) this.refresh(cx);
+        cx.notify();
+      }
     });
   }
 
@@ -186,6 +204,7 @@ export default class Changes extends View {
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().child("Changes"))
         .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${this.files.length} files`))
+        .when(Boolean(this.label), (e) => e.child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(this.label)))
         .child(div().flex_1()).child(div().text_size(11).text_color(t.ansi2).child(`+${add}`)).child(div().text_size(11).text_color(t.ansi1).child(`−${del}`)))
       // overflow_y_scrollbar() wraps the list, so its flex sizing never reached the panel's layout.
       .child(div().flex_1().min_h(44).max_h(this.files.length * 28 + 12).relative().border_b(1).border_color(t.border)

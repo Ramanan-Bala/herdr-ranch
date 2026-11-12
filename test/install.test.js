@@ -44,8 +44,13 @@ test("hookCommand calls node on the .js entry with forward slashes on win32", ()
   assert.ok(command.startsWith('node "'), command);
   assert.ok(command.endsWith("/.herdr/ranch/bin/ranch-tasks.js\" claude"), command);
   assert.ok(!command.includes("\\"), command);
-  // macOS/Linux keep the plain sh launcher command.
-  assert.equal(hookCommand("codex", "darwin"), `${homeDir()}/.herdr/ranch/bin/ranch-tasks codex`);
+  // macOS/Linux keep the plain sh launcher command. The expected path is
+  // built with the same join() the code under test uses, so it holds with
+  // native separators on any host (backslashes on a Windows host).
+  assert.equal(
+    hookCommand("codex", "darwin"),
+    `${join(homeDir(), ".herdr", "ranch", "bin", "ranch-tasks")} codex`,
+  );
 });
 
 // ------------------------------------------------------------ backupLabel
@@ -112,8 +117,10 @@ test("statusSummary reports broken for hooks that cannot run on this OS", async 
   assert.equal(statusSummary("win32").agents.claude, "broken");
   assert.equal(statusSummary("darwin").agents.claude, "broken");
 
-  // POSIX sh-launcher command: fine at home, unrunnable on win32.
-  doc.hooks.PostToolUse = [{ hooks: [{ type: "command", command: `${home}/.herdr/ranch/bin/ranch-tasks claude` }] }];
+  // POSIX sh-launcher command: fine at home, unrunnable on win32. The
+  // simulated POSIX home is written with forward slashes even on a Windows
+  // host, because a backslash in the command is what "broken" means.
+  doc.hooks.PostToolUse = [{ hooks: [{ type: "command", command: `${home.replace(/\\/g, "/")}/.herdr/ranch/bin/ranch-tasks claude` }] }];
   writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
   assert.equal(statusSummary("win32").agents.claude, "broken");
   assert.notEqual(statusSummary("darwin").agents.claude, "broken");

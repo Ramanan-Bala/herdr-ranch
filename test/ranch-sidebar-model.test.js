@@ -3,14 +3,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 // lib/ must be inside the mod folder before its imports resolve.
 execFileSync("sh", [join(root, "scripts/sync-lib.sh")]);
 
 const { buildTree, nestWorktrees, BADGE_COLORS, initials, badgeColorIndex, diffSquares } =
-  await import(join(root, "mods/ranch-sidebar/model.js"));
+  await import(pathToFileURL(join(root, "mods/ranch-sidebar/model.js")).href);
 
 const NOW = Date.parse("2026-11-11T10:00:00Z");
 const MIN = 60_000;

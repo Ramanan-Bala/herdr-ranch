@@ -693,13 +693,14 @@ test("opencode 2.x context hook adds the task rule exactly once", async (t) => {
 });
 
 test("opencode skips its rule when the installer block is in AGENTS.md (fixes F13)", async (t) => {
+  // The block is looked up under RANCH_HOME (the same home the stores use).
   const home = tempHome();
   mkdirSync(join(home, ".config", "opencode"), { recursive: true });
   writeFileSync(
     join(home, ".config", "opencode", "AGENTS.md"),
     "# rules\n\n<!-- ranch-tasks:begin -->\nranch block\n<!-- ranch-tasks:end -->\n",
   );
-  withEnv(t, { RANCH_HOME: tempHome(), HC_TERMINAL_ID: "t99", HOME: home });
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t99", HOME: tempHome() });
   const { ctx, hooks } = fakeV2Ctx();
   await opencodePlugin.setup(ctx);
   const out = { system: [{ type: "text", text: "base" }] };
