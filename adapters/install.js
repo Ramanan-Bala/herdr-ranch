@@ -8,9 +8,10 @@ import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
-import { STALE } from "../lib/tasks.js";
+import { STALE, pointerSession } from "../lib/tasks.js";
 
 const AGENTS = ["claude", "codex", "opencode"];
 import { rulesFor, blockFor, CLAUDE_IMPORT, withBlock, stripBlock } from "./instructions.js";
@@ -38,11 +39,45 @@ function runningFromRepo() {
   return resolve(here) !== resolve(join(homeDir(), ".herdr", "ranch", "adapters"));
 }
 
-function installedCliDiffers() {
+/**
+ * The exact src/dest list copyRuntime copies (also the drift check's list);
+ * mode is applied to the copied file when set.
+ */
+function runtimeFiles() {
+  const root = repoRoot();
+  const ranch = join(homeDir(), ".herdr", "ranch");
+  // The node entry is installed as bin/ranch-tasks.js; when install runs from
+  // the installed copy, its entry is already ranch-tasks.js.
+  const entry = existsSync(join(root, "bin", "ranch-tasks.js")) ? join(root, "bin", "ranch-tasks.js") : join(root, "bin", "ranch-tasks");
+  return [
+    { src: entry, dest: join(ranch, "bin", "ranch-tasks.js"), mode: 0o755 },
+    ...readdirSync(join(root, "adapters"))
+      .filter((f) => f.endsWith(".js"))
+      .map((f) => ({ src: join(root, "adapters", f), dest: join(ranch, "adapters", f) })),
+    { src: join(root, "lib", "tasks.js"), dest: join(ranch, "lib", "tasks.js") },
+    { src: join(root, "lib", "prs.js"), dest: join(ranch, "lib", "prs.js") },
+  ];
+}
+
+/** True when any copied runtime file (or the OpenCode plugin) is missing or
+ * differs from this build. */
+function installedRuntimeDiffers() {
+  for (const { src, dest } of runtimeFiles()) {
+    try {
+      if (!readFileSync(src).equals(readFileSync(dest))) return true;
+    } catch {
+      return true;
+    }
+  }
+  // A differing installed plugin also means outdated; a missing one does not
+  // (the opencode agent reports "missing" for that anyway).
   try {
-    return !readFileSync(join(here, "cli.js")).equals(readFileSync(join(homeDir(), ".herdr", "ranch", "adapters", "cli.js")));
+    const installed = readFileSync(join(homeDir(), ".config", "opencode", "plugins", "ranch-tasks.js"));
+    // Only Ranch's own plugin counts; a person's file at that path is not drift.
+    if (!installed.toString("utf8").includes(PLUGIN_MARKER)) return false;
+    return !readFileSync(join(here, "opencode-plugin.js")).equals(installed);
   } catch {
-    return true;
+    return false;
   }
 }
 
@@ -53,6 +88,30 @@ const normPath = (command) => String(command ?? "").replace(/\\/g, "/");
 function isRanchGroup(group) {
   return Array.isArray(group?.hooks) &&
     group.hooks.some((h) => typeof h?.command === "string" && normPath(h.command).includes(RANCH_MARK));
+}
+
+/** One hook of a group is Ranch's when its command runs the ranch-tasks bin. */
+function isRanchHook(hook) {
+  return typeof hook?.command === "string" && normPath(hook.command).includes(RANCH_MARK);
+}
+
+/**
+ * A group's list with only Ranch's own hooks removed (fixes §integrity: a
+ * mixed group keeps the person's other hooks); empty result drops the group.
+ */
+function withoutRanchHooks(groups) {
+  const kept = [];
+  let changed = false;
+  for (const group of Array.isArray(groups) ? groups : []) {
+    if (!Array.isArray(group?.hooks) || !group.hooks.some(isRanchHook)) {
+      kept.push(group);
+      continue;
+    }
+    changed = true;
+    const rest = group.hooks.filter((h) => !isRanchHook(h));
+    if (rest.length) kept.push({ ...group, hooks: rest });
+  }
+  return { kept, changed };
 }
 
 /**
@@ -99,6 +158,7 @@ function backupFile(file, label, backups) {
   const dest = join(dir, `${label}.${stamp}${ext}`);
   copyFileSync(file, dest);
   backups.push(dest);
+  return dest;
 }
 
 function matchingBackup(label, doc) {
@@ -119,6 +179,10 @@ function matchingBackup(label, doc) {
   }
 }
 
+function sha256Of(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
 function readInstallManifest() {
   try {
     const doc = JSON.parse(readFileSync(join(homeDir(), ".herdr", "ranch", "install.json"), "utf8"));
@@ -126,17 +190,49 @@ function readInstallManifest() {
       createdFiles: Array.isArray(doc.createdFiles) ? doc.createdFiles : [],
       createdDirs: Array.isArray(doc.createdDirs) ? doc.createdDirs : [],
       opencodeTodo: doc.opencodeTodo && typeof doc.opencodeTodo === "object" ? doc.opencodeTodo : null,
+      owned: doc.owned && typeof doc.owned === "object" && !Array.isArray(doc.owned) ? doc.owned : {},
     };
   } catch {
-    return { createdFiles: [], createdDirs: [], opencodeTodo: null };
+    return { createdFiles: [], createdDirs: [], opencodeTodo: null, owned: {} };
   }
+}
+
+function writeManifest(manifest) {
+  const file = join(homeDir(), ".herdr", "ranch", "install.json");
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify(manifest, null, 2) + "\n");
 }
 
 function recordInstallCreated(file, directory) {
   const manifest = readInstallManifest();
   if (file && !manifest.createdFiles.includes(file)) manifest.createdFiles.push(file);
   if (directory && !manifest.createdDirs.includes(directory)) manifest.createdDirs.push(directory);
-  writeFileSync(join(homeDir(), ".herdr", "ranch", "install.json"), JSON.stringify(manifest, null, 2) + "\n");
+  writeManifest(manifest);
+}
+
+/**
+ * Records the exact bytes Ranch wrote at a path (fixes §integrity): sha256 of
+ * what we wrote plus the pre-existing file's backup, so uninstall can restore
+ * (not delete) a file that existed before install. `backup` undefined keeps
+ * the previously recorded backup (a plain upgrade of Ranch's own bytes).
+ */
+function recordOwned(path, sha256, backup) {
+  const manifest = readInstallManifest();
+  manifest.owned[path] = { sha256, backup: backup === undefined ? manifest.owned[path]?.backup ?? null : backup };
+  writeManifest(manifest);
+}
+
+function removeOwned(path) {
+  const manifest = readInstallManifest();
+  if (!manifest.owned[path]) return;
+  delete manifest.owned[path];
+  writeManifest(manifest);
+}
+
+/** True when the file's current bytes are exactly the ones Ranch recorded. */
+function ownedMatches(manifest, path, bytes) {
+  const entry = manifest.owned?.[path];
+  return !!entry && typeof entry.sha256 === "string" && entry.sha256 === sha256Of(bytes);
 }
 
 // ------------------------------------------------------------------ JSONC
@@ -326,9 +422,7 @@ export function opencodeTodoEnabled() {
 function recordOpencodeTodo(entry) {
   const manifest = readInstallManifest();
   manifest.opencodeTodo = entry;
-  const file = join(homeDir(), ".herdr", "ranch", "install.json");
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify(manifest, null, 2) + "\n");
+  writeManifest(manifest);
 }
 
 function readConfig(file) {
@@ -348,21 +442,18 @@ function readConfig(file) {
 function addRanchHooks(doc, events, command, matchers) {
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) return null;
   const hooks = doc.hooks && typeof doc.hooks === "object" && !Array.isArray(doc.hooks) ? doc.hooks : {};
-  // Also drop ranch groups for events no longer in the list (I14: the old
+  // Also drop ranch hooks for events no longer in the list (I14: the old
   // matcher-less Claude PreToolUse hook must go on reinstall).
   const wanted = new Set(events);
   for (const event of Object.keys(hooks)) {
     if (wanted.has(event)) continue;
-    const groups = hooks[event];
-    if (!Array.isArray(groups)) continue;
-    const kept = groups.filter((g) => !isRanchGroup(g));
-    if (kept.length !== groups.length) {
-      if (kept.length) hooks[event] = kept;
-      else delete hooks[event];
-    }
+    const { kept, changed } = withoutRanchHooks(hooks[event]);
+    if (!changed) continue;
+    if (kept.length) hooks[event] = kept;
+    else delete hooks[event];
   }
   for (const event of events) {
-    const kept = Array.isArray(hooks[event]) ? hooks[event].filter((g) => !isRanchGroup(g)) : [];
+    const { kept } = withoutRanchHooks(hooks[event]);
     const group = { hooks: [{ type: "command", command, timeout: 5 }] };
     if (matchers[event]) group.matcher = matchers[event];
     hooks[event] = [...kept, group];
@@ -371,20 +462,17 @@ function addRanchHooks(doc, events, command, matchers) {
   return JSON.stringify(doc, null, 2) + "\n";
 }
 
-/** Removes Ranch's hook groups and empty event keys they leave behind. */
+/** Removes Ranch's own hooks (keeping others in mixed groups) and empty event keys. */
 function stripRanchHooks(doc) {
   const hooks = doc?.hooks;
   if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) return { doc, removed: false };
   let removed = false;
   for (const event of Object.keys(hooks)) {
-    const groups = hooks[event];
-    if (!Array.isArray(groups)) continue;
-    const kept = groups.filter((g) => !isRanchGroup(g));
-    if (kept.length !== groups.length) {
-      removed = true;
-      if (kept.length) hooks[event] = kept;
-      else delete hooks[event];
-    }
+    const { kept, changed } = withoutRanchHooks(hooks[event]);
+    if (!changed) continue;
+    removed = true;
+    if (kept.length) hooks[event] = kept;
+    else delete hooks[event];
   }
   return { doc, removed };
 }
@@ -438,25 +526,12 @@ function writeCmdShim(dest, results) {
 function copyRuntime(results, platform = process.platform) {
   const root = repoRoot();
   const ranch = join(homeDir(), ".herdr", "ranch");
-  // The node entry is installed as bin/ranch-tasks.js; bin/ranch-tasks becomes a
-  // small sh launcher that finds node itself (nvm/volta/Homebrew installs are
-  // often missing from the PATH that hooks and Herdr's exec get). When install
-  // runs from the installed copy, its entry is already ranch-tasks.js.
-  const entry = existsSync(join(root, "bin", "ranch-tasks.js")) ? join(root, "bin", "ranch-tasks.js") : join(root, "bin", "ranch-tasks");
   writeLauncher(join(ranch, "bin", "ranch-tasks"), results);
   if (platform === "win32") writeCmdShim(join(ranch, "bin", "ranch-tasks.cmd"), results);
   // The installed files are ES modules; say so, or node warns on every hook.
   const pkg = join(ranch, "package.json");
   if (!existsSync(pkg)) writeFileSync(pkg, '{ "type": "module", "private": true }\n');
-  const files = [
-    { src: entry, dest: join(ranch, "bin", "ranch-tasks.js"), mode: 0o755 },
-    ...readdirSync(join(root, "adapters"))
-      .filter((f) => f.endsWith(".js"))
-      .map((f) => ({ src: join(root, "adapters", f), dest: join(ranch, "adapters", f) })),
-    { src: join(root, "lib", "tasks.js"), dest: join(ranch, "lib", "tasks.js") },
-    { src: join(root, "lib", "prs.js"), dest: join(ranch, "lib", "prs.js") },
-  ];
-  for (const { src, dest, mode } of files) {
+  for (const { src, dest, mode } of runtimeFiles()) {
     mkdirSync(dirname(dest), { recursive: true });
     if (sameFile(src, dest)) {
       results.push({ path: dest, action: "unchanged" });
@@ -569,11 +644,18 @@ function installOpencode(results, backups) {
   const dest = join(homeDir(), ".config", "opencode", "plugins", "ranch-tasks.js");
   const existed = existsSync(dest);
   if (existed && sameFile(src, dest)) {
+    recordOwned(dest, sha256Of(readFileSync(dest)));
     results.push({ path: dest, action: "unchanged" });
   } else {
-    if (existed) backupFile(dest, "opencode-plugin", backups);
+    // Own the copied bytes; a file that is not Ranch's right now keeps its
+    // backup recorded (or gets one) so uninstall can restore it.
+    const manifest = readInstallManifest();
+    const ours = existed && ownedMatches(manifest, dest, readFileSync(dest));
+    let ownedBackup = manifest.owned[dest]?.backup ?? null;
+    if (existed && !ours) ownedBackup = backupFile(dest, "opencode-plugin", backups);
     mkdirSync(dirname(dest), { recursive: true });
     copyFileSync(src, dest);
+    recordOwned(dest, sha256Of(readFileSync(src)), ownedBackup);
     results.push({ path: dest, action: existed ? "replaced" : "copied" });
   }
   installOpencodeConfig(results, backups);
@@ -630,28 +712,72 @@ function installInstructions(agents, results, backups) {
     const before = existed ? readFileSync(f.path, "utf8") : "";
     const after = f.whole ?? withBlock(before, f.block);
     if (after === before) {
+      // Unchanged whole file: still own the bytes on record (legacy installs).
+      if (f.whole) recordOwned(f.path, sha256Of(readFileSync(f.path)));
       results.push({ path: f.path, action: "unchanged" });
       continue;
     }
-    if (existed && !f.whole) backupFile(f.path, `instructions-${backupLabel(f.path)}`, backups);
+    let ownedBackup;
+    if (f.whole) {
+      // Own only the exact bytes we write (fixes §integrity): a file that is
+      // not Ranch's right now is backed up first; a plain upgrade of our own
+      // bytes keeps the recorded backup of the person's original.
+      const manifest = readInstallManifest();
+      const ours = existed && ownedMatches(manifest, f.path, readFileSync(f.path));
+      ownedBackup = manifest.owned[f.path]?.backup ?? null;
+      if (existed && !ours) ownedBackup = backupFile(f.path, `instructions-${backupLabel(f.path)}`, backups);
+    } else if (existed) {
+      backupFile(f.path, `instructions-${backupLabel(f.path)}`, backups);
+    }
     mkdirSync(dirname(f.path), { recursive: true });
     writeFileSync(f.path, after);
+    if (f.whole) recordOwned(f.path, sha256Of(Buffer.from(after, "utf8")), ownedBackup);
     if (!existed) recordInstallCreated(f.path, null);
     results.push({ path: f.path, action: existed ? "added task-reporting rules" : "created" });
   }
 }
 
+/** Restores or deletes a whole-file rules doc Ranch owns; never touches one
+ * the person has edited since (fixes §integrity). */
+function uninstallWholeFile(path, manifest, results) {
+  const bytes = readFileSync(path);
+  const entry = manifest.owned[path];
+  const ours = ownedMatches(manifest, path, bytes) || (!entry && bytes.equals(Buffer.from(rulesFor("claude"), "utf8")));
+  if (!ours) {
+    results.push({ path, action: "changed since install, left as is" });
+    return;
+  }
+  const backup = entry?.backup;
+  if (backup && existsSync(backup)) {
+    copyFileSync(backup, path);
+    results.push({ path, action: "restored original" });
+  } else {
+    // No recorded backup (or it is gone): the current bytes are exactly
+    // Ranch's rules, so deleting them loses nothing of the person's.
+    unlinkSync(path);
+    results.push({ path, action: "deleted (Ranch's copy)" });
+  }
+  removeOwned(path);
+}
+
 function uninstallInstructions(agents, results) {
-  const created = readInstallManifest().createdFiles;
+  const manifest = readInstallManifest();
+  const created = manifest.createdFiles;
   for (const f of instructionFiles(agents)) {
     if (!existsSync(f.path)) continue;
+    if (f.whole) {
+      uninstallWholeFile(f.path, manifest, results);
+      continue;
+    }
     const before = readFileSync(f.path, "utf8");
-    const stripped = f.whole ? "" : stripBlock(before);
+    const stripped = stripBlock(before);
     if (created.includes(f.path) && stripped.trim() === "") {
       unlinkSync(f.path);
       results.push({ path: f.path, action: "deleted (Ranch created it)" });
     } else if (stripped !== before) {
-      writeFileSync(f.path, stripped.replace(/\n+$/, "\n"));
+      // Collapse the trailing blank line(s) stripping left behind, keeping the
+      // file's own line endings.
+      writeFileSync(f.path, stripped.replace(/(?:\r?\n)+$/, (m) => (m.includes("\r\n") ? "\r\n" : "\n")));
       results.push({ path: f.path, action: "removed task-reporting rules" });
     }
   }
@@ -750,6 +876,7 @@ export async function uninstall(opts = {}) {
     }
   }
   const results = [];
+  const backups = [];
   uninstallInstructions(agents, results);
 
   if (agents.includes("claude")) {
@@ -815,23 +942,54 @@ export async function uninstall(opts = {}) {
     const file = join(home, ".config", "opencode", "plugins", "ranch-tasks.js");
     if (!existsSync(file)) {
       results.push({ path: file, action: "not present" });
-    } else if (readFileSync(file, "utf8").includes(PLUGIN_MARKER)) {
-      unlinkSync(file);
-      results.push({ path: file, action: "deleted" });
     } else {
-      results.push({ path: file, action: "unchanged (not Ranch's)" });
+      const bytes = readFileSync(file);
+      const manifest = readInstallManifest();
+      // Ours = the exact bytes we recorded (or, for legacy installs without
+      // an owned record, the shipped plugin unmodified).
+      const ours = ownedMatches(manifest, file, bytes) ||
+        (!manifest.owned[file] && bytes.equals(shippedPlugin()));
+      const backup = manifest.owned[file]?.backup;
+      if (ours) {
+        if (backup && existsSync(backup)) {
+          copyFileSync(backup, file);
+          results.push({ path: file, action: "restored original" });
+        } else {
+          unlinkSync(file);
+          results.push({ path: file, action: "deleted" });
+        }
+        removeOwned(file);
+      } else if (bytes.toString("utf8").includes(PLUGIN_MARKER)) {
+        // Ranch's plugin changed since install (edited, or an older Ranch
+        // version): keep a copy, then take ours out.
+        const saved = backupFile(file, "opencode-plugin", backups);
+        unlinkSync(file);
+        removeOwned(file);
+        results.push({ path: file, action: `deleted (backed up to ${saved})` });
+      } else {
+        results.push({ path: file, action: "unchanged (not Ranch's)" });
+      }
     }
     uninstallOpencodeConfig(results);
   }
 
-  printResults(results, []);
+  printResults(results, backups);
+}
+
+/** The plugin bytes this build ships (null when unreadable). */
+function shippedPlugin() {
+  try {
+    return readFileSync(join(here, "opencode-plugin.js"));
+  } catch {
+    return null;
+  }
 }
 
 /** { node, version, agents: { claude, codex, opencode } } per §7 status. */
 export function statusSummary(platform = process.platform) {
   const home = homeDir();
   const binExists = existsSync(join(home, ".herdr", "ranch", "bin", "ranch-tasks"));
-  const outdated = runningFromRepo() && installedCliDiffers();
+  const outdated = runningFromRepo() && installedRuntimeDiffers();
   const hookStatus = (file) => {
     let doc = null;
     try {
@@ -1017,28 +1175,35 @@ function pruneCodexTrust(results, backups) {
   }
 }
 
-/**
- * Deletes store files for terminals that no longer exist (via `hc ls --json
- * --all`, 5 s timeout): a gone terminal is cleaned after 2 minutes, a finished
- * one once its store has been idle that long; session files untouched for
- * 14 days are pruned (fixes §3.5). Without a working `hc`, only the 14-day
- * rule applies. Reads both the session-keyed layout (terminals/, sessions/)
- * and legacy flat stores, and removes `*.json.tmp-*` leftovers older than a
- * minute in each (I8). Returns the removed file paths.
- */
-export function gcStores() {
-  const dir = join(homeDir(), ".herdr", "ranch", "tasks");
-  const pruneCutoff = Date.now() - STALE.PRUNE_MS;
-  const goneCutoff = Date.now() - STALE.GONE_MS;
-  let states = null; // terminal address -> state, when hc works
+/** Terminal address -> state from `hc ls --json --all` (5 s timeout), or null
+ * when hc is unavailable (liveness unknown). */
+function hcTerminals() {
   try {
     const out = execFileSync("hc", ["ls", "--json", "--all"], { timeout: 5000, encoding: "utf8" });
     const data = JSON.parse(out);
     const terminals = Array.isArray(data?.terminals) ? data.terminals : [];
-    states = new Map(terminals.filter((t) => t?.address).map((t) => [t.address, t.state]));
+    return new Map(terminals.filter((t) => t?.address).map((t) => [t.address, t.state]));
   } catch {
-    states = null;
+    return null;
   }
+}
+
+/**
+ * Deletes store files for terminals that no longer exist (via `hc ls --json
+ * --all`, injected as `listTerminals` for tests): a gone terminal is cleaned
+ * after 2 minutes, a finished one once its store has been idle that long, and
+ * a live (or otherwise active) one never — and when hc is unavailable nothing
+ * is deleted for age at all (fixes §integrity: liveness unknown means keep).
+ * Session files are pruned only after 14 days AND when no surviving terminal
+ * pointer references them. Reads both the session-keyed layout (terminals/,
+ * sessions/) and legacy flat stores, and removes `*.json.tmp-*` leftovers
+ * older than a minute in each (I8). Returns the removed file paths.
+ */
+export function gcStores(listTerminals = hcTerminals) {
+  const dir = join(homeDir(), ".herdr", "ranch", "tasks");
+  const pruneCutoff = Date.now() - STALE.PRUNE_MS;
+  const goneCutoff = Date.now() - STALE.GONE_MS;
+  const states = listTerminals();
   const removed = [];
   const sweep = (subdir, kind) => {
     let names = [];
@@ -1061,6 +1226,7 @@ export function gcStores() {
       }
       if (!name.endsWith(".json")) continue;
       const path = join(sub, name);
+      const key = name.slice(0, -".json".length);
       let old = false;
       try {
         old = statSync(path).mtimeMs < pruneCutoff;
@@ -1069,14 +1235,16 @@ export function gcStores() {
       }
       let dead = false;
       if (kind === "session") {
-        dead = old; // 14-day prune
+        dead = old && !referenced.has(key); // 14-day prune, unless a surviving pointer needs it
+      } else if (kind === "legacy") {
+        dead = states !== null
+          ? old || existsSync(join(dir, "terminals", name)) // migrated or stale
+          : existsSync(join(dir, "terminals", name)); // migrated; age says nothing without hc
+      } else if (states === null) {
+        dead = false; // liveness unknown: keep the pointer
       } else {
-        const address = name.slice(0, -".json".length);
-        const state = states?.get(address);
-        if (states !== null && state === undefined) dead = statMtime(path) < goneCutoff; // terminal gone
-        else if (state === "finished") dead = statMtime(path) < goneCutoff; // finished for over 2 min
-        else if (kind === "legacy") dead = old || existsSync(join(dir, "terminals", name)); // migrated or stale
-        else dead = old;
+        const state = states.get(key);
+        dead = (state === undefined || state === "finished") && statMtime(path) < goneCutoff;
       }
       if (dead) {
         try {
@@ -1088,9 +1256,21 @@ export function gcStores() {
       }
     }
   };
+  // Terminals and legacy first: the surviving pointers define what sessions
+  // are still needed.
   sweep("terminals", "terminal");
-  sweep("sessions", "session");
   sweep("", "legacy");
+  const referenced = new Set();
+  try {
+    for (const name of readdirSync(join(dir, "terminals"))) {
+      if (!name.endsWith(".json") || /\.json\.tmp-/.test(name)) continue;
+      try {
+        const sid = pointerSession(readFileSync(join(dir, "terminals", name), "utf8"));
+        if (sid) referenced.add(sid);
+      } catch {}
+    }
+  } catch {}
+  sweep("sessions", "session");
   return removed;
 }
 

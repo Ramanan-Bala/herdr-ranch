@@ -10,6 +10,7 @@ import {
 } from "herdr";
 import { AUTONAMES_KEY, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
 import { effectiveStatus, attentionQueue } from "./lib/format.js";
+import { readPanels } from "./state.js";
 
 // The right-panel stack ids this bar can toggle, in layout "panel-body".
 const PANELS = ["session", "files", "changes", "settings"];
@@ -29,7 +30,10 @@ function cap(key) {
 
 export default class RanchTopbar extends View {
   init(_props, cx) {
-    this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
+    // localStorage access itself can throw (privacy mode, corrupted store).
+    let storedPanels = null;
+    try { storedPanels = localStorage.getItem("panels"); } catch {}
+    this.panels = readPanels(storedPanels, PANELS);
     // knownAgents(), null until the first check lands; the cached answer shows at once.
     this.agents = shared("ranch.knownAgents") ?? null;
     const loadAgents = async (cx) => {

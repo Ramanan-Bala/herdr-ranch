@@ -42,6 +42,7 @@ import {
   orderTasks,
   progress,
   storeCandidates,
+  withPointerIdentity,
 } from "./lib/tasks.js";
 import { tasksCommand, looksWindows } from "./lib/tasks-command.js";
 import {
@@ -241,7 +242,7 @@ export default class RanchSession extends View {
         if (session) {
           try {
             const sessionText = await readTextFile(`${homeDir}/${TASKS_DIR}/${session}`, { on: machine });
-            if (sessionText != null) return { parsed: parseStore(sessionText), text: sessionText };
+            if (sessionText != null) return { parsed: withPointerIdentity(parseStore(sessionText), text), text: sessionText };
           } catch {}
           return { parsed: { ok: false, reason: "missing" }, text: null };
         }

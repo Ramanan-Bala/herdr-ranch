@@ -531,6 +531,7 @@ test("I14: install drops the matcher-less ranch PreToolUse hook on reinstall", a
   process.env.RANCH_HOME = home;
   try {
     const mark = `${home}/.herdr/ranch/bin/ranch-tasks`;
+    const norm = (s) => s.replace(/\\/g, "/");
     const settings = join(home, ".claude", "settings.json");
     // A previous install wrote the matcher-less PreToolUse hook.
     writeFileSync(settings, JSON.stringify({
@@ -543,10 +544,10 @@ test("I14: install drops the matcher-less ranch PreToolUse hook on reinstall", a
     const merged = JSON.parse(readFileSync(settings, "utf8"));
     assert.equal(merged.hooks.PreToolUse, undefined);
     // The other event still has its ranch hook and the third-party hook survives.
-    assert.ok(JSON.stringify(merged.hooks.SessionStart).includes(mark));
+    assert.ok(norm(JSON.stringify(merged.hooks.SessionStart)).includes(norm(mark)));
     assert.ok(JSON.stringify(merged.hooks.SessionStart).includes("other-hook"));
     for (const event of ["UserPromptSubmit", "PostToolUse", "PermissionRequest", "Notification", "SubagentStart", "SubagentStop", "SessionEnd", "Stop"]) {
-      assert.ok(JSON.stringify(merged.hooks[event]).includes(mark), `ranch handler for ${event}`);
+      assert.ok(norm(JSON.stringify(merged.hooks[event])).includes(norm(mark)), `ranch handler for ${event}`);
     }
   } finally {
     delete process.env.RANCH_HOME;

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 // lib/ must be inside the mod folder before its imports resolve.
@@ -28,8 +28,10 @@ const {
   prStateToken,
   prStateLabel,
   prRepoText,
-} = await import(join(root, "mods/ranch-session/model.js"));
-const { ACTIVITY_STALE_MS } = await import(join(root, "mods/ranch-session/lib/format.js"));
+} = await import(pathToFileURL(join(root, "mods/ranch-session/model.js")).href);
+const { ACTIVITY_STALE_MS } = await import(
+  pathToFileURL(join(root, "mods/ranch-session/lib/format.js")).href
+);
 
 const agent = (address, status) => ({ address, status });
 

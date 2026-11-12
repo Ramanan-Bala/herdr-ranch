@@ -8,11 +8,12 @@ import {
 import {
   decide, exitAction, rememberSession, recallSession, ownership, cleanTitle,
 } from "./lib/naming.js";
-import { listVisible, parseStore, storeCandidates } from "./lib/tasks.js";
+import { listVisible, parseStore, storeCandidates, withPointerIdentity } from "./lib/tasks.js";
 import {
   SETTINGS_KEY, AUTONAMES_KEY, SESSIONS_KEY, TASKS_DIR, resolveSettings,
 } from "./lib/settings.js";
 import { folderLabel } from "./lib/format.js";
+import { homeCache } from "./lib/home.js";
 import { agentShort, collectInputs, buildModelPrompt } from "./namer-model.js";
 
 const STORE_TTL = 2000;
@@ -30,7 +31,9 @@ function paneAgent(panesAll, tabId) {
 export class TabNamer {
   constructor() {
     this.stores = new Map(); // agent address -> { store, at }
-    this.homes = new Map(); // machine name -> home dir
+    // Remote home lookup via lib/home.js (sh, then cmd.exe; failures back
+    // off and retry). Local machines answer straight from herdr's home().
+    this.homeFor = homeCache(exec, home);
     this.prev = new Map(); // tab id -> { agent, state, cwd, tasks } from last tick
     this.locked = new Map(); // tab id -> latest candidate while user-locked
     this.modelTitles = new Map(); // session id -> model summary
@@ -286,7 +289,7 @@ export class TabNamer {
         const text = terminalText == null || session
           ? await readTextFile(`${dir}/${TASKS_DIR}/${file}`, { on: machine })
           : terminalText;
-        const parsed = parseStore(text);
+        const parsed = withPointerIdentity(parseStore(text), terminalText);
         if (listVisible(parsed, { app })) store = parsed.store;
       }
     } catch (err) {
@@ -296,20 +299,6 @@ export class TabNamer {
     return store;
   }
 
-  async homeFor(machine) {
-    if (!machine) return home();
-    const cached = this.homes.get(machine);
-    if (cached) return cached;
-    try {
-      const r = await exec("sh", ["-c", "printf %s \"$HOME\""], { on: machine });
-      const dir = r.stdout.trim();
-      if (dir) {
-        this.homes.set(machine, dir);
-        return dir;
-      }
-    } catch (err) {
-      this.logOnce(err);
-    }
-    return null;
-  }
+  // Remote home lookup lives in this.homeFor (lib/home.js cache, set up in
+  // the constructor).
 }

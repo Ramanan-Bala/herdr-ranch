@@ -232,3 +232,60 @@ export function diffSquares(add = 0, del = 0) {
   while (squares.length < 5) squares.push("none");
   return squares;
 }
+
+/**
+ * How long a repo-root discovery that found no repository is trusted before
+ * it is tried again (audit finding 16). lib/git.js cannot distinguish a
+ * definite "not a repo" from a timeout/unreachable machine (both come back
+ * null), so one window covers all negatives.
+ */
+export const TOP_OF_RETRY_MS = 30 * 1000;
+
+/**
+ * Whether a topOf entry may still be used without a new discovery.
+ * Entries are `{ top: string|null, at: number }`: a positive result (top
+ * truthy) is kept as today, a negative one is trusted only inside the
+ * TOP_OF_RETRY_MS window so an offline machine is not asked every frame and
+ * a "not a repo" is re-checked once the window passes.
+ * @param {{top: string|null, at: number}|undefined} entry
+ * @param {number} now
+ * @returns {boolean}
+ */
+export function topOfFresh(entry, now) {
+  if (!entry || typeof entry.at !== "number") return false;
+  if (entry.top) return true;
+  return now - entry.at < TOP_OF_RETRY_MS;
+}
+
+/**
+ * Normalizes the persisted folding state (audit finding 12): each of the
+ * four maps must be a plain object, anything else (null, array, string) is
+ * replaced with {} while usable neighbours are preserved. Unknown keys are
+ * dropped.
+ * @param {unknown} parsed the JSON.parse result from storage
+ * @returns {{m: object, s: object, w: object, settled: object}}
+ */
+export function normalizeCollapsed(parsed) {
+  const out = { m: {}, s: {}, w: {}, settled: {} };
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return out;
+  const plain = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+  for (const key of Object.keys(out)) {
+    if (plain(parsed[key])) out[key] = parsed[key];
+  }
+  return out;
+}
+
+/**
+ * What the checkout row (line 3 of an ordinary card, grouped tab or
+ * worktree row) shows (audit finding 19): diff statistics follow
+ * `line3`, PR badges follow `pr` alone, and the row renders when either
+ * has something to show. `hasDiff`/`hasPr` already fold in the layout's own
+ * suppression (grouped tabs draw neither) and in whether there is content.
+ * @param {{line3: boolean, pr: boolean, hasDiff: boolean, hasPr: boolean}} o
+ * @returns {{stats: boolean, pr: boolean, row: boolean}}
+ */
+export function cardRows({ line3, pr, hasDiff, hasPr }) {
+  const stats = !!line3 && !!hasDiff;
+  const showPr = !!pr && !!hasPr;
+  return { stats, pr: showPr, row: stats || showPr };
+}

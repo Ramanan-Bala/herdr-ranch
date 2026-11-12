@@ -34,6 +34,8 @@ export default class RanchSettings extends View {
     this.setup = null; // output of the last "Set up" run
     this.health = { git: "checking", herdr: "checking" };
     this.report = null; // agent -> last_event_at, from ~/.herdr/ranch/health.json
+    this.healthBusy = false; // a health load in flight: skip ticks until done
+    this.versionsAt = 0;     // ms, when git/herdr versions were last checked
     cx.spawn(async (cx) => {
       try {
         this.known = await knownAgents();
@@ -46,9 +48,15 @@ export default class RanchSettings extends View {
     this.loadTasks(cx);
     cx.timer.every(60_000, (cx) => this.loadTasks(cx));
     this.loadHealth(cx);
+    // Task-reporting health (the report file) refreshes every 30 s; the version
+    // checks spawn processes, so those wait for refreshHealth's 5-min gate.
+    cx.timer.every(30_000, (cx) => this.refreshHealth(cx));
     if (shared("ranch.health.gh") !== "ok") this.checkGh(cx);
     cx.spawn(async (cx) => {
-      for (;;) if ((await nextCommand()) === "focus") this.handle.focus();
+      for (;;) if ((await nextCommand()) === "focus") {
+        this.handle.focus();
+        this.refreshHealth(cx); // shown again: catch up on the report file
+      }
     });
   }
 
@@ -101,30 +109,55 @@ export default class RanchSettings extends View {
     });
   }
 
+  // One read of the per-agent report file: cheap, no processes spawned.
+  async loadReport() {
+    try {
+      const raw = await readTextFile(`${home()}/.herdr/ranch/health.json`);
+      const agents = JSON.parse(raw || "{}")?.agents ?? {};
+      this.report = Object.fromEntries(
+        Object.entries(agents)
+          .filter(([, v]) => v && typeof v.last_event_at === "string")
+          .map(([k, v]) => [k, v.last_event_at])
+      );
+    } catch {
+      this.report = null;
+    }
+  }
+
   loadHealth(cx) {
+    if (this.healthBusy) return; // never overlapping loads
+    this.healthBusy = true;
+    this.versionsAt = Date.now();
     cx.spawn(async (cx) => {
-      const git = await exec("git", ["--version"]).then((r) => (r.code === 0 ? "ok" : "missing")).catch(() => "missing");
-      const herdr = await exec("herdr-app", ["--version"])
-        .then((r) => {
-          const v = semver(r.stdout);
-          return r.code === 0 && v && cmp(v, HERDR_MIN) < 0 ? "old" : "ok";
-        })
-        .catch(() => "missing");
-      this.health = { git, herdr };
-      // Per-agent last event time (fixes 3.8), written by the adapters.
       try {
-        const raw = await readTextFile(`${home()}/.herdr/ranch/health.json`);
-        const agents = JSON.parse(raw || "{}")?.agents ?? {};
-        this.report = Object.fromEntries(
-          Object.entries(agents)
-            .filter(([, v]) => v && typeof v.last_event_at === "string")
-            .map(([k, v]) => [k, v.last_event_at])
-        );
-      } catch {
-        this.report = null;
+        const git = await exec("git", ["--version"]).then((r) => (r.code === 0 ? "ok" : "missing")).catch(() => "missing");
+        const herdr = await exec("herdr-app", ["--version"])
+          .then((r) => {
+            const v = semver(r.stdout);
+            return r.code === 0 && v && cmp(v, HERDR_MIN) < 0 ? "old" : "ok";
+          })
+          .catch(() => "missing");
+        this.health = { git, herdr };
+        // Per-agent last event time (fixes 3.8), written by the adapters.
+        await this.loadReport();
+      } finally {
+        this.healthBusy = false;
       }
       cx.notify();
     });
+  }
+
+  // The health tick: the report file every time; version checks only every
+  // 5 min, so a 30 s tick stays a single cheap file read.
+  refreshHealth(cx) {
+    if (this.healthBusy) return;
+    if (Date.now() - this.versionsAt < 5 * 60_000) {
+      this.healthBusy = true;
+      cx.spawn(async (cx) => {
+        try { await this.loadReport(); } finally { this.healthBusy = false; }
+        cx.notify();
+      });
+    } else this.loadHealth(cx);
   }
 
   checkGh(cx) {

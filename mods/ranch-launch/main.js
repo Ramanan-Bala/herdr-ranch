@@ -20,7 +20,8 @@ import {
   knownAgents,
 } from "herdr";
 import { SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
-import { branchFromPrompt, worktreePath, launchOrder } from "./lib/launch.js";
+import { branchFromPrompt, worktreePath, launchOrder, launchDecision } from "./lib/launch.js";
+import { homeCache } from "./lib/home.js";
 
 // Where a space is now: its first terminal's live folder, else where it was
 // made — the worktree mod's place().
@@ -76,7 +77,10 @@ export default class RanchLaunch extends View {
     this.picked = localStorage.getItem("lastAgent");
 
     // Worktree state: is the space's folder in a git repo, and is that on?
-    this.repoTop = undefined; // undefined: looking, null: not in git
+    // probe: pending (looking) | repo | none | error, decided by launchDecision.
+    this.probe = "pending";
+    this.probeGen = 0;
+    this.homeOk = undefined; // false once the remote home lookup failed
     this.worktree = localStorage.getItem("worktree") === "1";
     this.branchEdited = false;
     this.branch = InputState.new({ value: branchFromPrompt("", Date.now()) });
@@ -89,14 +93,37 @@ export default class RanchLaunch extends View {
     this.busy = false;
     this.error = "";
 
+    // The home lookup for the target machine, cached per view (lib/home.js):
+    // sh first, cmd.exe on a Windows remote, failures remembered for a while.
+    this.homeFor = homeCache(exec, () => home());
+    this.probeRepo(cx, space);
+  }
+
+  /**
+   * Finds the target folder's git toplevel. The generation token ignores a
+   * completion from an older run; calling this again (target moved) bumps it
+   * and resets the state, so a stale probe can't decide a new launch.
+   */
+  probeRepo(cx, space) {
+    const gen = ++this.probeGen;
+    this.probe = "pending";
+    this.homeOk = undefined;
+    cx.notify();
     cx.spawn(async (cx) => {
       const folder = place(space);
-      if (!folder) { this.repoTop = null; cx.notify(); return; }
+      if (!folder) { this.probe = "none"; cx.notify(); return; }
       try {
         const r = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: folder, on: this.machine });
+        if (gen !== this.probeGen) return; // stale probe
         this.repoTop = r.code === 0 ? r.stdout.trim() : null;
+        this.probe = this.repoTop ? "repo" : "none";
+        if (this.probe === "repo") {
+          try { this.homeOk = (await this.homeFor(this.machine)) != null; }
+          catch { this.homeOk = false; }
+        }
       } catch {
         this.repoTop = null;
+        this.probe = "error";
       }
       cx.notify();
     });
@@ -119,13 +146,6 @@ export default class RanchLaunch extends View {
   chosen(offered) {
     const list = offered ?? this.offered();
     return list.find((a) => a.key === this.picked) ?? list[0] ?? null;
-  }
-
-  /** The checked-out worktree folder to run git in. */
-  async homeFor(machine) {
-    if (!machine) return home();
-    const r = await exec("sh", ["-c", 'printf %s "$HOME"'], { on: machine });
-    return r.code === 0 ? r.stdout.trim().replace(/\\/g, "/") : null;
   }
 
   toggleWorktree(cx) {
@@ -155,7 +175,23 @@ export default class RanchLaunch extends View {
     const text = this.text.trim();
     localStorage.setItem("lastAgent", agent.key);
 
-    if (!this.worktree || !this.repoTop) {
+    const decision = launchDecision({ worktree: this.worktree, probe: this.probe, homeOk: this.homeOk });
+    if (decision === "wait") {
+      // Worktree mode on but the repo probe hasn't finished: never guess.
+      this.error = "Checking repository…";
+      cx.notify();
+      return;
+    }
+    if (decision.startsWith("error:")) {
+      this.error = {
+        "error:no-repo": "This folder isn't in a git repository — turn off New worktree to start here.",
+        "error:probe": "Couldn't check for a git repository.",
+        "error:home": "Couldn't get the machine's home directory.",
+      }[decision] ?? "Cannot start in a worktree.";
+      cx.notify();
+      return;
+    }
+    if (decision === "plain") {
       closeOverlay(props().overlay);
       run("tab.new", { space: this.spaceId, argv: agent.run, ...(text ? { task: text } : {}) });
       return;
@@ -169,6 +205,7 @@ export default class RanchLaunch extends View {
         const branch = this.branch.value().trim();
         if (!branch) throw new Error("Name the new branch.");
         const userHome = await this.homeFor(this.machine);
+        if (!userHome) throw new Error("Couldn't get the machine's home directory.");
         const path = worktreePath(userHome, this.repoTop, branch);
         const git = (args) =>
           exec("git", args, { cwd: this.repoTop, on: this.machine, timeout: 600000 });
@@ -216,7 +253,7 @@ export default class RanchLaunch extends View {
   render() {
     const t = theme();
     const offered = this.offered();
-    const inRepo = Boolean(this.repoTop);
+    const inRepo = this.probe === "repo";
     return v_flex()
       .id("ranch-launch")
       .track_focus(this.handle)

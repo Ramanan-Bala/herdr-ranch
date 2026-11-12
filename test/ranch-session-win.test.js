@@ -3,11 +3,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const { isWinHome, whereFirstPath, editorLaunch, windowsHome } = await import(
-  join(root, "mods/ranch-session/win.js")
+  pathToFileURL(join(root, "mods/ranch-session/win.js")).href
 );
 
 // ------------------------------------------------------------------- isWinHome
