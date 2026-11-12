@@ -203,7 +203,11 @@ test("I4: recorded PRs dedupe by URL across repositories", () => {
   const otherUrl = "https://github.com/acme/other/pull/12";
   const thirdUrl = "https://github.com/acme/third/pull/12";
   const view = Object.assign(Object.create(RecordedPrs.prototype), {
-    git: { summary: { host: { kind: "github", base: "https://github.com/acme/ranch" } } },
+    // The per-context Git cache (gitctx) the panel reads its host/top from.
+    ctx: (() => {
+      const entry = { top: null, summary: { host: { kind: "github", base: "https://github.com/acme/ranch" } } };
+      return { gitReady: () => true, gitEntry: () => entry };
+    })(),
     tasksReady: () => true,
     tasks: { parsed: { ok: true, store: { prs: [
       { url: branchUrl, number: 12 },
