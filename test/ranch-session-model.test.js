@@ -25,6 +25,9 @@ const {
   subDuration,
   herdrSubStatus,
   activityStatus,
+  nativeActivity,
+  nativeActivityText,
+  nativeFor,
   prStateToken,
   prStateLabel,
   prRepoText,
@@ -145,7 +148,7 @@ test("taskEmptyState", () => {
   const ok = (tasks) => ({ ok: true, store: { tasks } });
   assert.equal(taskEmptyState(ok([{ title: "x" }]), "claude-code"), null);
   assert.deepEqual(taskEmptyState(ok([]), "claude-code"), { text: "No plan yet." });
-  assert.deepEqual(taskEmptyState(ok([]), "pi"), { text: "This agent doesn't report tasks." });
+  assert.deepEqual(taskEmptyState(ok([]), "pi"), { text: "No detailed steps reported for this session." });
   assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, "claude"), { text: "No plan yet." });
   assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, "codex"), { text: "No plan yet." });
   assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, "opencode"), { text: "No plan yet." });
@@ -159,7 +162,7 @@ test("taskEmptyState", () => {
     text: "Task reporting isn't set up", setup: true,
   });
   assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, "gemini-cli"), {
-    text: "This agent doesn't report tasks.",
+    text: "No detailed steps reported for this session.",
   });
   assert.deepEqual(taskEmptyState({ ok: false, reason: "newer" }, "claude-code"), {
     text: "Update Ranch to see tasks.",
@@ -220,4 +223,60 @@ test("prRepoText pulls owner/repo out of a PR URL", () => {
   assert.equal(prRepoText("https://github.com/only"), null);
   assert.equal(prRepoText("not a url"), null);
   assert.equal(prRepoText(null), null);
+});
+
+test("nativeActivity reads Herdr's OSC 7501 report, or null with nothing known", () => {
+  for (const t of [undefined, null, {}, { report: null }, { report: "x" }]) {
+    assert.equal(nativeActivity(t), null);
+  }
+  assert.deepEqual(nativeActivity({ report: { progress: 42, msg: "Running tests" } }), {
+    progress: 42,
+    msg: "Running tests",
+  });
+  // 0 stays 0 (known), 100 stays 100, >100 clamps to 100, fractional passes through.
+  assert.deepEqual(nativeActivity({ report: { progress: 0, msg: "x" } }), { progress: 0, msg: "x" });
+  assert.deepEqual(nativeActivity({ report: { progress: 100, msg: "x" } }), { progress: 100, msg: "x" });
+  assert.deepEqual(nativeActivity({ report: { progress: 150, msg: "x" } }), { progress: 100, msg: "x" });
+  assert.deepEqual(nativeActivity({ report: { progress: 12.5, msg: "x" } }), { progress: 12.5, msg: "x" });
+  // Non-finite / negative / non-number progress stays unknown.
+  for (const p of [NaN, Infinity, -Infinity, -1, "50", null, true]) {
+    assert.deepEqual(nativeActivity({ report: { progress: p, msg: "x" } }), { progress: null, msg: "x" });
+  }
+  // Whitespace (including newlines) collapses to single spaces; empty -> null.
+  assert.deepEqual(nativeActivity({ report: { msg: "  a\n  b  " } }), { progress: null, msg: "a b" });
+  for (const m of ["", "   ", 7]) {
+    assert.deepEqual(nativeActivity({ report: { progress: 42, msg: m } }), { progress: 42, msg: null });
+  }
+  // Over 200 chars: first 199 + "…" (200 total).
+  const long = "x".repeat(201);
+  const trimmed = nativeActivity({ report: { msg: long } });
+  assert.equal(trimmed.msg.length, 200);
+  assert.equal(trimmed.msg, "x".repeat(199) + "…");
+  // Nothing known at all -> null.
+  assert.equal(nativeActivity({ report: { progress: NaN, msg: "" } }), null);
+});
+
+test("nativeActivity does not mutate its input", () => {
+  const t = { report: { progress: 42, msg: "  a  " } };
+  const before = structuredClone(t);
+  nativeActivity(t);
+  assert.deepEqual(t, before);
+});
+
+test("nativeActivityText joins msg and rounded percent with a middle dot", () => {
+  assert.equal(nativeActivityText(null), null);
+  assert.equal(nativeActivityText({ progress: 42.4, msg: "x" }), "x · 42%");
+  assert.equal(nativeActivityText({ progress: 0, msg: null }), "0%");
+  assert.equal(nativeActivityText({ progress: null, msg: "x" }), "x");
+  assert.equal(nativeActivityText({ progress: 99.6, msg: null }), "100%");
+});
+
+test("nativeFor matches terminal addresses exactly", () => {
+  const list = [{ address: "t3" }, { address: "mac/t3" }];
+  assert.equal(nativeFor(list, "t3"), list[0]);
+  assert.equal(nativeFor(list, "mac/t3"), list[1]);
+  assert.equal(nativeFor(list, "t"), null);
+  assert.equal(nativeFor(null, "t3"), null);
+  assert.equal(nativeFor(undefined, "t3"), null);
+  assert.equal(nativeFor(list, null), null);
 });

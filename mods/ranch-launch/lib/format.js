@@ -184,3 +184,48 @@ export function effectiveStatus(tab, activity, now) {
   }
   return { status: activity.state, since: age };
 }
+
+/**
+ * Whether closing a tab needs the confirm dialog, using the same rule as the
+ * displayed status: a native working/blocked agent, else the tab's hook
+ * activity while fresh, else an agent pane with stale-but-blocked activity.
+ * Stale hook activity alone never makes a plain shell count as a busy agent.
+ * @param {{tabId?: string, tab?: {id: string, status: string|null}|null, agents?: Array<{tab: string, status: string}>, panes?: Array<{tab: string, program?: {agent?: boolean}}>, activity?: {state: string, at: number}|null, now: number}} args
+ * @returns {boolean}
+ */
+export function closeNeedsConfirm({ tabId, tab, agents, panes, activity, now }) {
+  const id = tab?.id ?? tabId;
+  if (!id) return false;
+  if ((agents ?? []).some((a) => a.tab === id && (a.status === "working" || a.status === "blocked"))) return true;
+  if (tab?.status) return false;
+  const { status } = effectiveStatus(tab ?? { status: null }, activity, now);
+  if (status !== "working" && status !== "blocked") return false;
+  if (typeof activity?.at === "number" && now - activity.at <= ACTIVITY_STALE_MS) return true;
+  return (panes ?? []).some((p) => p.tab === id && p.program?.agent === true);
+}
+
+/**
+ * Props for the close-confirm dialog: last tab takes its space with it.
+ * @param {string} tabId
+ * @param {boolean} lastTab
+ * @returns {{title: string, detail: string, command: {name: string, args: {id: string, confirmed: boolean}}}}
+ */
+export function closeConfirmProps(tabId, lastTab) {
+  return {
+    title: "Close this tab?",
+    detail: lastTab ? "An agent here is still working, and this is the space's last tab: the space closes with it." : "An agent here is still working. Its terminal closes with the tab.",
+    command: { name: "tab.close", args: { id: tabId, confirmed: true } },
+  };
+}
+
+/**
+ * One agent's status for display: its native Herdr status, else its tab's
+ * hook activity with the stale rule (see effectiveStatus).
+ * @param {string|null} nativeStatus
+ * @param {{state: string, at: number}|null} activity
+ * @param {number} now ms epoch
+ * @returns {string|null}
+ */
+export function agentStatus(nativeStatus, activity, now) {
+  return effectiveStatus({ status: nativeStatus ?? null }, activity, now).status;
+}

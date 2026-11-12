@@ -167,3 +167,66 @@ test("effectiveStatus prefers Herdr, falls back to hook activity", async () => {
   assert.deepEqual(effectiveStatus({ status: null }, null, now), { status: null, since: null });
   assert.equal(effectiveStatus({ status: null }, { state: "working", at: now - ACTIVITY_STALE_MS - 1 }, now).status, "idle");
 });
+
+test("closeNeedsConfirm", async () => {
+  const { closeNeedsConfirm, ACTIVITY_STALE_MS } = await import("../lib/format.js");
+  const now = 1_000_000_000;
+  const A = { tab: "t1", status: "working" };
+  // a. Native agent in the tab is working/blocked.
+  assert.equal(closeNeedsConfirm({ tabId: "t1", agents: [A], now }), true);
+  assert.equal(closeNeedsConfirm({ tabId: "t1", agents: [{ tab: "t1", status: "blocked" }], now }), true);
+  // b. Two agents in the tab: one done, one working (tab.status done alone would miss it).
+  assert.equal(closeNeedsConfirm({ tabId: "t1", tab: { id: "t1", status: "done" }, agents: [{ tab: "t1", status: "done" }, A], now }), true);
+  // c. Working agent in another tab.
+  assert.equal(closeNeedsConfirm({ tabId: "t1", agents: [{ tab: "t2", status: "working" }], now }), false);
+  // d. Native idle status wins over fresh activity (same as effectiveStatus).
+  assert.equal(closeNeedsConfirm({ tabId: "t1", tab: { id: "t1", status: "idle" }, agents: [], activity: { state: "working", at: now - 5000 }, now }), false);
+  // e. No native status: fresh activity counts.
+  const tab = { id: "t1", status: null };
+  assert.equal(closeNeedsConfirm({ tabId: "t1", tab, agents: [], activity: { state: "working", at: now - 5000 }, now }), true);
+  assert.equal(closeNeedsConfirm({ tabId: "t1", tab, agents: [], activity: { state: "blocked", at: now - 5000 }, now }), true);
+  assert.equal(closeNeedsConfirm({ tabId: "t1", tab, agents: [], activity: { state: "done", at: now - 5000 }, now }), false);
+  assert.equal(closeNeedsConfirm({ tabId: "t1", tab, agents: [], activity: { state: "idle", at: now - 5000 }, now }), false);
+  // f. Stale working activity is not enough by itself.
+  assert.equal(closeNeedsConfirm({ tabId: "t1", tab, agents: [], activity: { state: "working", at: now - ACTIVITY_STALE_MS - 1 }, now }), false);
+  // g. Stale blocked activity alone never makes a plain shell busy.
+  assert.equal(
+    closeNeedsConfirm({ tabId: "t1", tab, agents: [], panes: [{ tab: "t1", program: { agent: false, shell: true } }], activity: { state: "blocked", at: now - ACTIVITY_STALE_MS - 1 }, now }),
+    false,
+  );
+  // h. An agent pane in the tab keeps the confirm even with stale activity.
+  assert.equal(
+    closeNeedsConfirm({ tabId: "t1", tab, agents: [], panes: [{ tab: "t1", program: { agent: true } }], activity: { state: "blocked", at: now - ACTIVITY_STALE_MS - 1 }, now }),
+    true,
+  );
+  // i. Nothing at all.
+  assert.equal(closeNeedsConfirm({ tabId: "t1", agents: [], now }), false);
+  // j. No tab object, but the native agent for tabId is working.
+  assert.equal(closeNeedsConfirm({ tabId: "t1", tab: undefined, agents: [A], now }), true);
+});
+
+test("closeConfirmProps", async () => {
+  const { closeConfirmProps } = await import("../lib/format.js");
+  const last = {
+    title: "Close this tab?",
+    detail: "An agent here is still working, and this is the space's last tab: the space closes with it.",
+    command: { name: "tab.close", args: { id: "t1", confirmed: true } },
+  };
+  const notLast = {
+    title: "Close this tab?",
+    detail: "An agent here is still working. Its terminal closes with the tab.",
+    command: { name: "tab.close", args: { id: "t1", confirmed: true } },
+  };
+  assert.deepEqual(closeConfirmProps("t1", true), last);
+  assert.deepEqual(closeConfirmProps("t1", false), notLast);
+});
+
+test("agentStatus", async () => {
+  const { agentStatus, ACTIVITY_STALE_MS } = await import("../lib/format.js");
+  const now = 1_000_000_000;
+  assert.equal(agentStatus(null, { state: "blocked", at: now - 5000 }, now), "blocked");
+  assert.equal(agentStatus("idle", { state: "working", at: now - 5000 }, now), "idle");
+  assert.equal(agentStatus(null, null, now), null);
+  assert.equal(agentStatus(null, { state: "working", at: now - ACTIVITY_STALE_MS - 1 }, now), "idle");
+  assert.equal(agentStatus("working", null, now), "working");
+});

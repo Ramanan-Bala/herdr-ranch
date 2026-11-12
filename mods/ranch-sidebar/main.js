@@ -12,7 +12,7 @@ import {
   buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials, diffSquares,
   normalizeCollapsed, topOfFresh, cardRows,
 } from "./model.js";
-import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent } from "./lib/format.js";
+import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent, closeNeedsConfirm, closeConfirmProps } from "./lib/format.js";
 import {
   repoSummary, parsePr, createTtlCache, createLimiter, runGh, PR_JSON_FIELDS,
 } from "./lib/git.js";
@@ -833,18 +833,13 @@ export default class RanchSidebar extends View {
 
   /** Same close rule as the top bar: confirm before killing a busy agent. */
   closeTab(c) {
-    const busy = agents().some((a) => a.tab === c.tabId && (a.status === "working" || a.status === "blocked"));
-    if (!busy) { run("tab.close", { id: c.tabId }); return; }
     const sp = spaces().find((s) => s.id === c.spaceId);
+    const tab = sp?.tabs.find((tb) => tb.id === c.tabId);
+    const busy = closeNeedsConfirm({ tabId: c.tabId, tab, agents: agents(), panes: panes(), activity: (shared(ACTIVITY_KEY) ?? {})[c.tabId], now: Date.now() });
+    if (!busy) { run("tab.close", { id: c.tabId }); return; }
     openOverlay({
       mod: "confirm", kind: "dialog", width: 400, height: 170,
-      props: {
-        title: "Close this tab?",
-        detail: sp?.tabs.length === 1
-          ? "An agent here is still working, and this is the space's last tab: the space closes with it."
-          : "An agent here is still working. Its terminal closes with the tab.",
-        command: { name: "tab.close", args: { id: c.tabId, confirmed: true } },
-      },
+      props: closeConfirmProps(c.tabId, sp?.tabs.length === 1),
     });
   }
 

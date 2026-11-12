@@ -23,6 +23,7 @@ import {
   STATUS_LABEL,
   relativeTime,
   truncateMiddle,
+  agentStatus,
 } from "./lib/format.js";
 import {
   repoSnapshot,
@@ -63,6 +64,9 @@ import {
   fileRow,
   herdrSubStatus,
   activityStatus,
+  nativeActivity,
+  nativeActivityText,
+  nativeFor,
   prStateToken,
   prStateLabel,
   prRepoText,
@@ -165,7 +169,7 @@ export default class RanchSession extends View {
     if (!inTab.length && tabId) {
       inTab = panes()
         .filter((p) => p.tab === tabId && p.terminal && (p.app || p.program?.agent))
-        .map((p) => ({ address: p.terminal, pane: p.pane, tab: tabId, app: p.app, program: p.program, status: p.status ?? "idle" }));
+        .map((p) => ({ address: p.terminal, pane: p.pane, tab: tabId, app: p.app, program: p.program, status: p.status ?? null }));
     }
     const chosen = pickAgent(inTab, tabId ? this.remembered.get(tabId) ?? null : null);
     const inPane = tabId ? panes().filter((p) => p.tab === tabId) : [];
@@ -178,6 +182,7 @@ export default class RanchSession extends View {
       machineLabel: space?.machine ?? (isWin() ? "This PC" : "This Mac"),
       inTab,
       chosen,
+      status: chosen ? agentStatus(chosen.status, (shared("ranch.activity") ?? {})[tabId], Date.now()) : null,
       cwd: pane?.cwd ?? null,
     };
   }
@@ -1698,9 +1703,12 @@ export default class RanchSession extends View {
     const open = this.tasksOpen.get(addr) ?? true;
 
     const head = h_flex().gap(6).items_center().min_w(0);
-    const status = isMain ? s.chosen.status : this.subAgentStatus(sub);
+    const status = isMain ? s.status : this.subAgentStatus(sub);
+    // Lifecycle input: an unknown main status (no Herdr status, no hook
+    // activity) still counts as idle, as before, so stale done lists fade out.
+    const lifeStatus = isMain ? status ?? "idle" : status;
     // A stale done list is hidden ("No recent activity"), so no count either.
-    const stale = parsed?.ok && listLifecycle(parsed.store, status, Date.now()).hide;
+    const stale = parsed?.ok && listLifecycle(parsed.store, lifeStatus, Date.now()).hide;
     const prog = read && parsed?.ok && !stale ? progress(this.liveTasks(parsed.store.tasks)) : { done: 0, total: 0 };
     const label = isMain
       ? "Tasks"
@@ -1741,6 +1749,11 @@ export default class RanchSession extends View {
     card.child(head);
     if (!open) return card;
 
+    // Herdr's native activity (OSC 7501 message / %), matched by exact
+    // terminal address: shown with or without a checklist, never stored.
+    const native = nativeActivityText(nativeActivity(nativeFor(terminals(), addr)));
+    if (native) card.child(div().text_size(11.5).text_color(t.muted).min_w(0).truncate().child(native));
+
     if (!read) return card; // the header shows "Refreshing…"
 
     // Identity check (fixes F4): show the list only when the terminal is
@@ -1769,7 +1782,7 @@ export default class RanchSession extends View {
     }
 
     // Lifecycle (fixes 3.5): fade out stale done lists, flag idle-with-work.
-    const lc = listLifecycle(parsed.store, status, Date.now());
+    const lc = listLifecycle(parsed.store, lifeStatus, Date.now());
     if (lc.hide) {
       if (!isMain) return null;
       card.child(div().text_size(12).text_color(t.muted).child("No recent activity."));

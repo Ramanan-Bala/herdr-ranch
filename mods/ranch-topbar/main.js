@@ -9,7 +9,7 @@ import {
   settings, knownAgents, nextCommand, setShared, home,
 } from "herdr";
 import { AUTONAMES_KEY, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
-import { effectiveStatus, attentionQueue } from "./lib/format.js";
+import { effectiveStatus, attentionQueue, closeNeedsConfirm, closeConfirmProps } from "./lib/format.js";
 import { readPanels } from "./state.js";
 
 // The right-panel stack ids this bar can toggle, in layout "panel-body".
@@ -233,17 +233,11 @@ export default class RanchTopbar extends View {
       const auto = shared(AUTONAMES_KEY)?.[tab.id];
       const close = (_e, cx) => {
         cx.stop_propagation();
-        const busy = agents().some(a => a.tab === tab.id && (a.status === "working" || a.status === "blocked"));
+        const busy = closeNeedsConfirm({ tabId: tab.id, tab, agents: agents(), panes: panes(), activity: shared("ranch.activity")?.[tab.id], now: Date.now() });
         if (!busy) { run("tab.close", { id: tab.id }); return; }
         openOverlay({
           mod: "confirm", kind: "dialog", width: 400, height: 170,
-          props: {
-            title: "Close this tab?",
-            detail: space?.tabs.length === 1
-              ? "An agent here is still working, and this is the space's last tab: the space closes with it."
-              : "An agent here is still working. Its terminal closes with the tab.",
-            command: { name: "tab.close", args: { id: tab.id, confirmed: true } },
-          },
+          props: closeConfirmProps(tab.id, space?.tabs.length === 1),
         });
       };
       // Status glyph: spinner while working, filled dot when blocked, check when done,
