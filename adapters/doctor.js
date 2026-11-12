@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseStore } from "../lib/tasks.js";
 import { homeDir } from "./store.js";
-import { codexTrustState, codexUpdatePlanEnabled, opencodeTodoEnabled, statusSummary } from "./install.js";
+import { claudeTodoEnvEnabled, codexTrustState, codexUpdatePlanEnabled, opencodeTodoEnabled, statusSummary } from "./install.js";
 
 const TODO_PAYLOAD = {
   hook_event_name: "PostToolUse",
@@ -165,6 +165,9 @@ export async function doctor() {
   }
   codexChecks(checks, agents, home);
   checks.push(check("opencode experimental.todo", opencodeTodoEnabled(), "opencode config"));
+  // Claude Code's task tools: settings env, or the shell exporting it.
+  const claudeTodo = claudeTodoEnvEnabled(join(home, ".claude", "settings.json")) || process.env.CLAUDE_CODE_ENABLE_TODO_TOOLS === "1";
+  checks.push(check("claude CLAUDE_CODE_ENABLE_TODO_TOOLS", claudeTodo, "~/.claude/settings.json env"));
 
   // Synthetic events in an isolated store.
   const temp = mkdtempSync(join(tmpdir(), "ranch-doctor-"));

@@ -146,3 +146,32 @@ test("uninstall removes legacy backslash ranch hooks and keeps foreign ones", as
   const kept = doc.hooks.PostToolUse.flatMap((g) => g.hooks).filter((h) => h.command === "echo foreign");
   assert.equal(kept.length, 1);
 });
+
+// ------------------------------------------- Claude task tools env (todo tools)
+
+test("install turns on CLAUDE_CODE_ENABLE_TODO_TOOLS in Claude settings; uninstall takes it out", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  mkdirSync(join(home, ".claude"), { recursive: true });
+  const file = join(home, ".claude", "settings.json");
+  writeFileSync(file, JSON.stringify({ env: { FOO: "bar" } }, null, 2) + "\n");
+  await install({ yes: true, agents: ["claude"], platform: "darwin" });
+  let doc = JSON.parse(readFileSync(file, "utf8"));
+  assert.deepEqual(doc.env, { FOO: "bar", CLAUDE_CODE_ENABLE_TODO_TOOLS: "1" });
+  assert.equal(statusSummary().claudeTodoEnv, true);
+  await uninstall({ yes: true, agents: ["claude"] });
+  doc = JSON.parse(readFileSync(file, "utf8"));
+  assert.deepEqual(doc.env, { FOO: "bar" });
+});
+
+test("install leaves a CLAUDE_CODE_ENABLE_TODO_TOOLS value the person set, and uninstall keeps it", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  mkdirSync(join(home, ".claude"), { recursive: true });
+  const file = join(home, ".claude", "settings.json");
+  writeFileSync(file, JSON.stringify({ env: { CLAUDE_CODE_ENABLE_TODO_TOOLS: "1" } }, null, 2) + "\n");
+  await install({ yes: true, agents: ["claude"], platform: "darwin" });
+  await uninstall({ yes: true, agents: ["claude"] });
+  const doc = JSON.parse(readFileSync(file, "utf8"));
+  assert.deepEqual(doc.env, { CLAUDE_CODE_ENABLE_TODO_TOOLS: "1" });
+});

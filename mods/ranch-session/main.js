@@ -105,12 +105,18 @@ function editorName(path) {
 
 /** How long a task-store read may run before a new one replaces it. */
 const TASKS_READ_STALL_MS = 5000;
+/** Last good store kept per agent terminal, so switching back is instant. */
+const TASKS_CACHE_MAX = 32;
 
 export default class RanchSession extends View {
   init(_props, cx) {
     this.remembered = new Map(); // tabId -> chosen agent address
     this.homes = new Map(); // machine (null excepted) -> its home dir
     this.tasks = { key: null, parsed: null, read: false, startedAt: null };
+    // "addr@machine" -> last parsed store read for that agent: shown while a
+    // fresh read for it is in flight, so the card never drops to just the
+    // native % line on a tab switch, a superseded read or a stalled one.
+    this.taskCache = new Map();
     this.tasksBusy = false;
     this.tasksPending = false;
     this.tasksWatchGen = 0;
@@ -302,7 +308,12 @@ export default class RanchSession extends View {
       if (gen !== this.tasksGen) return; // superseded after a stall
       // Stale read (I2): the focused agent changed while the file was read.
       const now = this.session();
-      if (now.chosen?.address !== agent.address || (now.machine ?? null) !== (s.machine ?? null)) return;
+      // Still worth keeping for when that agent is shown again.
+      this.rememberTasks(key, parsed);
+      if (now.chosen?.address !== agent.address || (now.machine ?? null) !== (s.machine ?? null)) {
+        this.tasksPending = true; // read the agent now focused right away
+        return;
+      }
       if (this.tasks.key !== key) this.filesOpen = false;
       this.tasks = { key, parsed, read: true };
       // The terminal's own start time, for the identity check (fixes F4).
@@ -321,6 +332,27 @@ export default class RanchSession extends View {
         }
       }
     }
+  }
+
+  /** Keeps the last parsed store per agent key (bounded, most recent last). */
+  rememberTasks(key, parsed) {
+    if (!key || !parsed) return;
+    this.taskCache.delete(key);
+    this.taskCache.set(key, parsed);
+    while (this.taskCache.size > TASKS_CACHE_MAX) this.taskCache.delete(this.taskCache.keys().next().value);
+  }
+
+  /**
+   * The main agent's store for display: the fresh read when it is for the
+   * agent shown now, else the last one read for that agent (fresh false, the
+   * header shows "Refreshing…"), else nothing yet (read false).
+   * @returns {{parsed: object|null, read: boolean, fresh: boolean}}
+   */
+  mainTasks(s) {
+    if (this.tasksReady(s)) return { parsed: this.tasks.parsed, read: true, fresh: true };
+    const key = s?.chosen ? `${s.chosen.address}@${s.machine ?? ""}` : null;
+    const cached = key ? this.taskCache.get(key) : null;
+    return cached ? { parsed: cached, read: true, fresh: false } : { parsed: null, read: false, fresh: false };
   }
 
   /**
@@ -446,8 +478,9 @@ export default class RanchSession extends View {
   /** The main agent's and each sub-agent's task list (only visible stores). */
   taskLists(s) {
     const lists = [];
-    if (this.tasksReady(s) && this.tasks.parsed?.ok && listVisible(this.tasks.parsed, this.liveFor(s.chosen, s.machine))) {
-      lists.push(this.tasks.parsed.store.tasks);
+    const main = this.mainTasks(s).parsed;
+    if (main?.ok && listVisible(main, this.liveFor(s.chosen, s.machine))) {
+      lists.push(main.store.tasks);
     }
     for (const k of this.subTerminals(s)) {
       const entry = this.subTasks.get(k.address);
@@ -1560,7 +1593,8 @@ export default class RanchSession extends View {
     const seenUrls = new Set(branchUrl ? [branchUrl] : []);
     const out = [];
     const stores = [];
-    if (this.tasksReady(s) && this.tasks.parsed?.ok) stores.push(this.tasks.parsed.store);
+    const main = this.mainTasks(s).parsed;
+    if (main?.ok) stores.push(main.store);
     for (const k of this.subTerminals(s)) {
       const entry = this.subTasks.get(k.address);
       if (entry?.parsed?.ok) stores.push(entry.parsed.store);
@@ -1617,8 +1651,8 @@ export default class RanchSession extends View {
     // Nesting (fixes 3.6): a store sub-agent that belongs to one of the
     // Herdr sub terminals shows in that terminal's card, not twice here.
     const nested = new Set(herdrSubs.map((k) => k.address));
-    const tasksReady = this.tasksReady(s);
-    const storeSubs = (tasksReady && this.tasks.parsed?.ok ? this.tasks.parsed.store.subagents : [])
+    const main = this.mainTasks(s).parsed;
+    const storeSubs = (main?.ok ? main.store.subagents : [])
       .filter((sub) => !sub.parent_terminal || !nested.has(sub.parent_terminal));
     if (!herdrSubs.length && !storeSubs.length) return null;
     const card = this.cardShell(t);
@@ -1696,14 +1730,23 @@ export default class RanchSession extends View {
   tasksCard(t, s, sub) {
     const isMain = !sub;
     const addr = isMain ? s.chosen.address : sub.address;
-    const entry = isMain ? this.tasks : this.subTasks.get(addr) ?? null;
+    const main = isMain ? this.mainTasks(s) : null;
+    const entry = isMain ? main : this.subTasks.get(addr) ?? null;
     const parsed = entry?.parsed ?? null;
-    const read = isMain ? this.tasksReady(s) : Boolean(entry?.read);
+    const read = isMain ? main.read : Boolean(entry?.read);
+    // Shown with the cached list while a fresh read is in flight.
+    const refreshingNow = isMain ? !main.fresh : !read;
     const card = this.cardShell(t);
     const open = this.tasksOpen.get(addr) ?? true;
 
     const head = h_flex().gap(6).items_center().min_w(0);
-    const status = isMain ? s.status : this.subAgentStatus(sub);
+    // The main agent's status, like a sub-agent's: Herdr's own or the tab's
+    // hook activity, else the activity its adapter recorded in the store (an
+    // agent Herdr does not recognise, e.g. a version-named claude, has no
+    // status, and must not read as "stopped" while it is working).
+    const status = isMain
+      ? s.status ?? activityStatus(parsed?.ok ? parsed.store.session?.activity : null, Date.now())
+      : this.subAgentStatus(sub);
     // Lifecycle input: an unknown main status (no Herdr status, no hook
     // activity) still counts as idle, as before, so stale done lists fade out.
     const lifeStatus = isMain ? status ?? "idle" : status;
@@ -1723,7 +1766,7 @@ export default class RanchSession extends View {
         .child(prog.total ? `${label} ${prog.done}/${prog.total}` : label)
     );
     head.child(div().flex_1().min_w(0));
-    if (!read) head.child(this.refreshing(t));
+    if (refreshingNow) head.child(this.refreshing(t));
     if (status) head.child(this.pill(t, stateWord(status), status));
     // "no task updates" badge (fixes F13): the agent kept working but the
     // list stopped changing.
@@ -1754,7 +1797,12 @@ export default class RanchSession extends View {
     const native = nativeActivityText(nativeActivity(nativeFor(terminals(), addr)));
     if (native) card.child(div().text_size(11.5).text_color(t.muted).min_w(0).truncate().child(native));
 
-    if (!read) return card; // the header shows "Refreshing…"
+    if (!read) {
+      // First read for this agent still in flight: say so, never leave the
+      // card at just the native % line.
+      if (isMain) card.child(div().text_size(12).text_color(t.muted).child("Loading tasks\u2026"));
+      return card;
+    }
 
     // Identity check (fixes F4): show the list only when the terminal is
     // still live and its start time matches the store's.

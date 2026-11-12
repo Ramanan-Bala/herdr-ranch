@@ -209,6 +209,7 @@ test("I4: recorded PRs dedupe by URL across repositories", () => {
       return { gitReady: () => true, gitEntry: () => entry };
     })(),
     tasksReady: () => true,
+    mainTasks(s) { return this.tasksReady(s) ? { parsed: this.tasks.parsed, read: true, fresh: true } : { parsed: null, read: false, fresh: false }; },
     tasks: { parsed: { ok: true, store: { prs: [
       { url: branchUrl, number: 12 },
       { url: otherUrl, number: 12 },

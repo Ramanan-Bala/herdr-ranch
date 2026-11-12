@@ -37,28 +37,134 @@ function sessionPath(session) {
   return name ? join(homeDir(), TASKS_DIR, "sessions", name) : null;
 }
 
-function terminalPath() {
-  const name = storeFileName(process.env.HC_TERMINAL_ID);
+function terminalPath(terminal) {
+  const name = storeFileName(terminal);
   return name ? join(homeDir(), TASKS_DIR, "terminals", name) : null;
 }
 
-function legacyPath() {
-  const name = storeFileName(process.env.HC_TERMINAL_ID);
+function legacyPath(terminal) {
+  const name = storeFileName(terminal);
   return name ? join(homeDir(), TASKS_DIR, name) : null;
+}
+
+/** `hc <args>` parsed as JSON, or null (no hc, unknown terminal, bad output). */
+function hcJson(args) {
+  try {
+    const out = execFileSync(process.env.RANCH_HC_BIN || "hc", args, {
+      timeout: 2000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    });
+    return JSON.parse(out);
+  } catch {
+    return null;
+  }
 }
 
 /** When the terminal started, from `hc get --json` (created_ms); best effort. */
 function terminalStartedAt(terminal) {
-  try {
-    const out = execFileSync("hc", ["get", "--json", String(terminal)], {
-      timeout: 2000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
-    });
-    const ms = JSON.parse(out)?.created_ms;
-    if (typeof ms === "number" && ms > 0) return new Date(ms).toISOString();
-  } catch {
-    // No hc on PATH or unknown terminal: keep what the store already had.
+  const ms = hcJson(["get", "--json", String(terminal)])?.created_ms;
+  // No hc on PATH or unknown terminal: keep what the store already had.
+  return typeof ms === "number" && ms > 0 ? new Date(ms).toISOString() : null;
+}
+
+// ---- Which terminal an event belongs to ------------------------------------
+// A standalone TUI runs this plugin in its own process, so HC_TERMINAL_ID is
+// its terminal. Plain `opencode` TUIs (and `opencode run`) hand sessions to
+// one shared `opencode serve --service` process instead; its HC_TERMINAL_ID
+// is whichever terminal first started the service, long since stale. There
+// the terminal is resolved per session from Herdr's live terminals.
+
+/** True when this plugin runs in the shared OpenCode server process. */
+function sharedServer() {
+  const forced = process.env.RANCH_OPENCODE_SHARED;
+  if (forced === "1") return true;
+  if (forced === "0") return false;
+  return process.argv.slice(1).includes("serve");
+}
+
+// session id -> { terminal, at }: a resolved binding, re-checked after TTL.
+const bindings = new Map();
+const BINDING_TTL_MS = 15000;
+
+/** Live terminals whose program is OpenCode, from `hc ls --json`. */
+function liveOpencodeTerminals() {
+  const terminals = hcJson(["ls", "--json"])?.terminals;
+  if (!Array.isArray(terminals)) return null;
+  return terminals.filter((t) =>
+    t && typeof t.address === "string" && t.address && t.state === "live" &&
+    (t.agent === "opencode" || t.status?.app === "opencode"));
+}
+
+/** What a terminal's pointer file says: its session and that session's sub-agents. */
+function pointerInfo(terminal) {
+  const path = terminalPath(terminal);
+  const raw = path ? readJsonFile(path) : null;
+  const session = typeof raw?.session === "string" && raw.session ? raw.session
+    : typeof raw?.session?.id === "string" && raw.session.id ? raw.session.id : null;
+  if (!session) return { session: null, subagents: [] };
+  const store = typeof raw.session === "string" ? readJsonFile(sessionPath(session) ?? "") : raw;
+  const subagents = Array.isArray(store?.subagents) ? store.subagents.map((s) => String(s?.id ?? "")) : [];
+  return { session, subagents };
+}
+
+/** The session's title: from the event, else its saved store. */
+function sessionTitle(sid, event) {
+  const info = pickInfo(pickRaw(event));
+  if (typeof info.title === "string" && info.title.trim() && info.id === sid) return info.title.trim();
+  const saved = readJsonFile(sessionPath(sid) ?? "")?.session?.title;
+  return typeof saved === "string" && saved.trim() ? saved.trim() : null;
+}
+
+/** OpenCode's TUI titles its terminal "OC | <session title>". */
+function tuiSessionTitle(terminal) {
+  const title = hcJson(["get", "--json", terminal])?.title;
+  if (typeof title !== "string") return null;
+  const match = /^OC\s*\|\s*(.+)$/.exec(title.trim());
+  return match ? match[1].trim() : null;
+}
+
+/**
+ * The live terminal showing this session, or null when it cannot be told
+ * (better to skip a write than land it in another terminal's store). Order:
+ * a terminal already bound to the session (or to its parent, for a
+ * sub-agent), the TUI whose title is the session's title, the only live
+ * OpenCode terminal, the only one not yet bound to any session.
+ */
+function resolveSharedTerminal(event) {
+  const sid = pickParentID(event) ?? pickSessionID(event);
+  if (!sid) return null;
+  const now = Date.now();
+  const cached = bindings.get(sid);
+  if (cached && now - cached.at < BINDING_TTL_MS) return cached.terminal;
+  const live = liveOpencodeTerminals();
+  if (!live) return cached?.terminal ?? null;
+  if (!live.length) return null;
+  const addresses = live.map((t) => t.address);
+  const pointers = new Map(addresses.map((a) => [a, pointerInfo(a)]));
+  const bind = (terminal) => {
+    bindings.set(sid, { terminal, at: now });
+    return terminal;
+  };
+
+  if (cached && pointers.has(cached.terminal)) return bind(cached.terminal);
+  const owners = addresses.filter((a) => pointers.get(a).session === sid);
+  if (owners.length === 1) return bind(owners[0]);
+  const parents = addresses.filter((a) => pointers.get(a).subagents.includes(sid));
+  if (parents.length === 1) return bind(parents[0]);
+  const title = sessionTitle(sid, event);
+  if (title) {
+    const titled = addresses.filter((a) => tuiSessionTitle(a) === title);
+    if (titled.length === 1) return bind(titled[0]);
   }
+  if (addresses.length === 1) return bind(addresses[0]);
+  const unbound = addresses.filter((a) => !pointers.get(a).session);
+  if (unbound.length === 1) return bind(unbound[0]);
   return null;
+}
+
+/** The terminal whose store this event updates, or null to skip it. */
+function resolveTerminal(event) {
+  if (!sharedServer()) return process.env.HC_TERMINAL_ID || null;
+  return resolveSharedTerminal(event);
 }
 
 function emptyStore(terminal) {
@@ -596,7 +702,7 @@ function recordUnderTerminalLock(event, terminal, tPath) {
     } else {
       // First event in this terminal: adopt a legacy flat store if one exists
       // (e.g. the session was resumed in a new terminal).
-      const legacy = legacyPath();
+      const legacy = legacyPath(terminal);
       const legacyRaw = legacy ? readJsonFile(legacy) : null;
       const legacyApp = typeof legacyRaw?.agent === "string" ? legacyRaw.agent : legacyRaw?.agent?.app;
       const candidate = legacyRaw ? normalizeStore(legacyRaw, terminal) : null;
@@ -707,8 +813,8 @@ function recordUnderTerminalLock(event, terminal, tPath) {
  */
 function recordEvent(event) {
   try {
-    const terminal = process.env.HC_TERMINAL_ID;
-    const tPath = terminalPath();
+    const terminal = resolveTerminal(event);
+    const tPath = terminalPath(terminal);
     if (!terminal || !tPath) return;
     for (let attempt = 0; attempt < 2; attempt++) {
       const releaseTerminal = takeLock(tPath);

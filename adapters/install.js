@@ -191,10 +191,11 @@ function readInstallManifest() {
       createdFiles: Array.isArray(doc.createdFiles) ? doc.createdFiles : [],
       createdDirs: Array.isArray(doc.createdDirs) ? doc.createdDirs : [],
       opencodeTodo: doc.opencodeTodo && typeof doc.opencodeTodo === "object" ? doc.opencodeTodo : null,
+      claudeTodoEnv: doc.claudeTodoEnv === true,
       owned: doc.owned && typeof doc.owned === "object" && !Array.isArray(doc.owned) ? doc.owned : {},
     };
   } catch {
-    return { createdFiles: [], createdDirs: [], opencodeTodo: null, owned: {} };
+    return { createdFiles: [], createdDirs: [], opencodeTodo: null, claudeTodoEnv: false, owned: {} };
   }
 }
 
@@ -544,14 +545,52 @@ function copyRuntime(results, platform = process.platform) {
   }
 }
 
+// Claude Code's task tools (TaskCreate/TaskUpdate) are what Ranch's
+// PostToolUse matcher reports; this env var turns them on for every session.
+const CLAUDE_TODO_ENV = "CLAUDE_CODE_ENABLE_TODO_TOOLS";
+
+/**
+ * Sets env.CLAUDE_CODE_ENABLE_TODO_TOOLS = "1" in a Claude settings doc unless
+ * the person already set it (any value is theirs and is left alone). Returns
+ * true when Ranch added it.
+ */
+export function enableClaudeTodoEnv(doc) {
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return false;
+  if (doc.env !== undefined && (!doc.env || typeof doc.env !== "object" || Array.isArray(doc.env))) return false;
+  if (doc.env && doc.env[CLAUDE_TODO_ENV] !== undefined) return false;
+  doc.env = { ...(doc.env ?? {}), [CLAUDE_TODO_ENV]: "1" };
+  return true;
+}
+
+/** Undoes enableClaudeTodoEnv: only Ranch's exact "1", and an emptied env block. */
+export function disableClaudeTodoEnv(doc) {
+  const env = doc?.env;
+  if (!env || typeof env !== "object" || Array.isArray(env) || env[CLAUDE_TODO_ENV] !== "1") return false;
+  delete env[CLAUDE_TODO_ENV];
+  if (Object.keys(env).length === 0) delete doc.env;
+  return true;
+}
+
+/** Whether Claude settings turn the task tools on (settings env only). */
+export function claudeTodoEnvEnabled(file = join(homeDir(), ".claude", "settings.json")) {
+  const value = readConfig(file).doc?.env?.[CLAUDE_TODO_ENV];
+  return value === "1" || value === 1 || value === "true" || value === true;
+}
+
 function installClaude(results, backups, platform = process.platform) {
   const file = join(homeDir(), ".claude", "settings.json");
   const command = hookCommand("claude", platform);
   const { text, doc } = readConfig(file);
+  const addedEnv = enableClaudeTodoEnv(doc);
   const next = addRanchHooks(doc, CLAUDE_EVENTS, command, CLAUDE_MATCHERS);
   if (next == null) {
     results.push({ path: file, action: "skipped (not valid JSON)" });
     return;
+  }
+  if (addedEnv) {
+    const manifest = readInstallManifest();
+    manifest.claudeTodoEnv = true;
+    writeManifest(manifest);
   }
   if (next === text) {
     results.push({ path: file, action: "unchanged" });
@@ -678,7 +717,7 @@ function plan(agents, opts = {}) {
     { path: join(home, ".herdr", "ranch", "adapters", "*.js"), action: "copy" },
     { path: join(home, ".herdr", "ranch", "lib", "tasks.js"), action: "copy" },
   ];
-  if (agents.includes("claude")) items.push({ path: join(home, ".claude", "settings.json"), action: "merge ranch hooks (backed up first)" });
+  if (agents.includes("claude")) items.push({ path: join(home, ".claude", "settings.json"), action: "merge ranch hooks and env CLAUDE_CODE_ENABLE_TODO_TOOLS=1 (backed up first)" });
   if (agents.includes("codex")) items.push({ path: join(home, ".codex", "hooks.json"), action: "create or merge hooks (backed up first)" });
   if (agents.includes("opencode")) {
     items.push({ path: join(home, ".config", "opencode", "plugins", "ranch-tasks.js"), action: "copy plugin" });
@@ -886,14 +925,23 @@ export async function uninstall(opts = {}) {
       results.push({ path: file, action: "not present" });
     } else {
       const original = readFileSync(file, "utf8");
-      const { doc, removed } = stripRanchHooks(readConfig(file).doc);
+      const stripped = stripRanchHooks(readConfig(file).doc);
+      const { doc } = stripped;
+      // Take Ranch's task-tools env var out only when Ranch added it.
+      const manifest = readInstallManifest();
+      const removedEnv = manifest.claudeTodoEnv && doc != null ? disableClaudeTodoEnv(doc) : false;
+      if (manifest.claudeTodoEnv) {
+        manifest.claudeTodoEnv = false;
+        writeManifest(manifest);
+      }
+      const removed = stripped.removed || removedEnv;
       if (!removed || doc == null) {
         results.push({ path: file, action: "unchanged" });
       } else {
         const text = matchingBackup("claude-settings", doc) ?? JSON.stringify(doc, null, 2) + "\n";
         if (text !== original) {
           writeFileSync(file, text);
-          results.push({ path: file, action: "removed ranch hooks" });
+          results.push({ path: file, action: stripped.removed ? "removed ranch hooks" : "removed task tools env" });
         } else {
           results.push({ path: file, action: "unchanged" });
         }
@@ -1031,6 +1079,7 @@ export function statusSummary(platform = process.platform) {
       opencode,
     },
     opencodeTodo: opencodeTodoEnabled(),
+    claudeTodoEnv: claudeTodoEnvEnabled(join(home, ".claude", "settings.json")),
   };
 }
 
