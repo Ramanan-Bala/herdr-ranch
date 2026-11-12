@@ -43,6 +43,50 @@ export function herdrSubStatus(t) {
   return STATUS_LABEL[s] ? s : null;
 }
 
+/**
+ * Herdr's native agent activity from a terminals() row's OSC 7501 report
+ * ({ progress: percent 0-100, msg }), display only (never written to the task
+ * store). A missing percentage stays unknown (null), 0 stays 0 (known, not
+ * missing); non-finite, negative or non-number progress is rejected and >100
+ * clamps to 100. The message collapses whitespace, drops empty ones, and is
+ * cut to 200 chars ("…" at 200). Returns null when both are unknown.
+ * @param {{report?: {progress?: number, msg?: string}|null}|null|undefined} t a terminals() row
+ * @returns {{progress: number|null, msg: string|null}|null}
+ */
+export function nativeActivity(t) {
+  const report = t?.report;
+  if (!report || typeof report !== "object") return null;
+  const p = report.progress;
+  const progress = typeof p === "number" && Number.isFinite(p) && p >= 0 ? Math.min(p, 100) : null;
+  const msg = typeof report.msg === "string" ? report.msg.replace(/\s+/g, " ").trim() : "";
+  const text = msg ? (msg.length > 200 ? msg.slice(0, 199) + "…" : msg) : null;
+  return progress == null && text == null ? null : { progress, msg: text };
+}
+
+/**
+ * The native activity as one display line: msg first, then the rounded
+ * percent, joined with " · "; null when there is nothing to show.
+ * @param {{progress: number|null, msg: string|null}|null} a nativeActivity() output
+ * @returns {string|null}
+ */
+export function nativeActivityText(a) {
+  if (!a) return null;
+  const parts = [a.msg, a.progress == null ? null : `${Math.round(a.progress)}%`].filter(Boolean);
+  return parts.length ? parts.join(" · ") : null;
+}
+
+/**
+ * The terminals() row for an exact address, or null (no prefix/substring
+ * matching: "t3" must not match "mac/t3").
+ * @param {Array<{address: string}>|null|undefined} list terminals() rows
+ * @param {string|null|undefined} address
+ * @returns {object|null}
+ */
+export function nativeFor(list, address) {
+  if (!address || !Array.isArray(list)) return null;
+  return list.find((k) => k?.address === address) ?? null;
+}
+
 /** { done, total } summed over task lists (arrays of store tasks). */
 export function totalsOf(lists) {
   let done = 0;
@@ -174,7 +218,7 @@ export function taskEmptyState(parsed, app, adapterState) {
   }
   return TASK_AGENTS.has(app ?? "")
     ? { text: "No plan yet." }
-    : { text: "This agent doesn't report tasks." };
+    : { text: "No detailed steps reported for this session." };
 }
 
 /**
