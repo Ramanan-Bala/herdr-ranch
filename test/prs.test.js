@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   PRS_FILE,
   PR_URL,
@@ -273,4 +274,11 @@ test("detectCreatedPr reads object responses: exit code and stdout only", () => 
     tool_input: input,
     tool_response: { stdout: "https://github.com/o/r/pull/9", exit_code: 0 },
   })?.number, 9);
+});
+
+test("detectCreatedPr parses the Codex exec_command payload fixture", () => {
+  // Codex runs shell commands through exec_command but reports them to hooks
+  // as tool_name "Bash" with the command as ONE string (rust-v0.167.1).
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/codex-exec-command.json", import.meta.url), "utf8"));
+  assert.deepEqual(detectCreatedPr(fixture), { url: "https://github.com/o/r/pull/12", number: 12 });
 });

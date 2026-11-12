@@ -5,9 +5,12 @@
 //   uninstall [--yes]                 take them back out
 //   status [--json]                   what's installed where
 //   gc                                delete store files for dead terminals
+//   plan "<status>: <title>" ...      report the whole task list in one go
 import { readFileSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { hookError, recordSharedPr, updateStore } from "./store.js";
+import { hookError, homeDir, recordSharedPr, terminalPath, updateStore } from "./store.js";
+import { parsePlanArgs, planSummary } from "./plan.js";
+import { agentApp } from "../lib/tasks.js";
 import { applyClaude } from "./claude.js";
 import { applyCodex } from "./codex.js";
 import { detectCreatedPr, effectiveDir, prCommandOf, prCreateHead, prRepoOf, remoteReposOf } from "../lib/prs.js";
@@ -64,7 +67,7 @@ function runHook(agent, apply) {
     // while there are no open tasks). Everything else stays silent.
     const key = agent === "claude-code" ? "claude" : agent;
     if (process.env.RANCH_REMIND !== "0") {
-      const text = reminderFor(key, payload.hook_event_name, next);
+      const text = reminderFor(key, payload.hook_event_name, next, homeDir());
       if (text) process.stdout.write(text + "\n");
     }
     // Shared PR registry, after the store update: same payload, best effort.
@@ -72,6 +75,61 @@ function runHook(agent, apply) {
   } catch (err) {
     hookError(err);
   }
+}
+
+const REFUSAL = "ranch: this terminal is not running a Codex session; refusing to change its task list";
+
+/**
+ * `ranch-tasks plan "<status>: <title>" ...`: the Codex agent reports its
+ * whole task list in one shell command. Writes through the normal store
+ * writer and reducer only; refuses unless the terminal is live and already
+ * running a Codex session (never adopted, no pointer writes, no new locks).
+ */
+function runPlan(args) {
+  if (!process.env.HC_TERMINAL_ID) {
+    console.error("ranch: not inside Herdr (HC_TERMINAL_ID is not set)");
+    process.exitCode = 1;
+    return;
+  }
+  const parsed = parsePlanArgs(args);
+  if (!parsed.ok) {
+    console.error(`ranch: ${parsed.error}`);
+    process.exitCode = 1;
+    return;
+  }
+  // Fast refusal: read the terminal pointer directly and check its agent.
+  let raw = null;
+  try {
+    raw = JSON.parse(readFileSync(terminalPath(homeDir(), process.env.HC_TERMINAL_ID), "utf8"));
+  } catch {
+    // missing or unreadable pointer: refused below
+  }
+  if (agentApp(raw?.agent) !== "codex") {
+    console.error(REFUSAL);
+    process.exitCode = 1;
+    return;
+  }
+  let wrote = false;
+  try {
+    updateStore("codex", (store) => {
+      // Guard 2, inside the lock: covers a race with another writer that
+      // re-pointed the terminal between the check above and this read.
+      if (agentApp(store?.agent) !== "codex" || typeof store?.session?.id !== "string" || !store.session.id) return null;
+      wrote = true;
+      return applyCodex(store, { hook_event_name: "PostToolUse", tool_name: "update_plan", tool_input: { plan: parsed.plan } });
+    });
+  } catch (err) {
+    console.error(`ranch: could not write the task list (${err?.code ?? err?.message}). If Codex runs sandboxed, add ~/.herdr/ranch to sandbox_workspace_write.writable_roots or enable [tools.update_plan] (see RECIPE.md)`);
+    process.exitCode = 1;
+    hookError(err);
+    return;
+  }
+  if (!wrote) {
+    console.error(REFUSAL);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(planSummary(parsed.plan));
 }
 
 /**
@@ -142,7 +200,7 @@ function humanStatus(summary) {
 }
 
 const USAGE =
-  "usage: ranch-tasks <claude|codex|doctor [--json]|install [--yes] [--no-instructions] [--agents claude,codex,opencode]|uninstall [--yes]|status [--json]|gc>";
+  'usage: ranch-tasks <claude|codex|plan "<status>: <title>" ...|doctor [--json]|install [--yes] [--no-instructions] [--agents claude,codex,opencode]|uninstall [--yes]|status [--json]|gc>';
 
 export async function main(argv) {
   const [command = "", ...rest] = argv ?? [];
@@ -152,6 +210,10 @@ export async function main(argv) {
   }
   if (command === "codex") {
     runHook("codex", applyCodex);
+    return;
+  }
+  if (command === "plan") {
+    runPlan(rest);
     return;
   }
   if (command === "install") {
@@ -185,7 +247,8 @@ export async function main(argv) {
 function humanDoctor(report) {
   const lines = [report.ok ? "ranch-tasks doctor: ok" : "ranch-tasks doctor: problems found"];
   for (const check of report.checks) {
-    lines.push(`${check.ok ? "ok  " : "FAIL"}  ${check.name}${check.detail ? ` — ${check.detail}` : ""}`);
+    // "??": passes, but could not be verified from here (e.g. Codex hook trust).
+    lines.push(`${!check.ok ? "FAIL" : check.unknown ? "??  " : "ok  "}  ${check.name}${check.detail ? ` — ${check.detail}` : ""}`);
   }
   return lines.join("\n");
 }

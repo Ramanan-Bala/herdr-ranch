@@ -56,6 +56,7 @@ function runtimeFiles() {
       .map((f) => ({ src: join(root, "adapters", f), dest: join(ranch, "adapters", f) })),
     { src: join(root, "lib", "tasks.js"), dest: join(ranch, "lib", "tasks.js") },
     { src: join(root, "lib", "prs.js"), dest: join(ranch, "lib", "prs.js") },
+    { src: join(root, "lib", "tasks-command.js"), dest: join(ranch, "lib", "tasks-command.js") },
   ];
 }
 
@@ -701,7 +702,7 @@ function instructionFiles(agents) {
     files.push({ path: join(home, ".claude", "RANCH.md"), whole: rulesFor("claude"), planAction: "write task-reporting rules" });
     files.push({ path: join(home, ".claude", "CLAUDE.md"), block: CLAUDE_IMPORT, planAction: "add one marked @RANCH.md import line" });
   }
-  if (agents.includes("codex")) files.push({ path: join(home, ".codex", "AGENTS.md"), block: blockFor("codex"), planAction: "add marked task-reporting block" });
+  if (agents.includes("codex")) files.push({ path: join(home, ".codex", "AGENTS.md"), block: blockFor("codex", home), planAction: "add marked task-reporting block" });
   if (agents.includes("opencode")) files.push({ path: join(home, ".config", "opencode", "AGENTS.md"), block: blockFor("opencode"), planAction: "add marked task-reporting block" });
   return files;
 }
@@ -1017,7 +1018,7 @@ export function statusSummary(platform = process.platform) {
     codexConfigText = readFileSync(join(home, ".codex", "config.toml"), "utf8");
   } catch {}
   const codex = codexBase === "installed" || codexBase === "outdated"
-    ? (codexTrustState(readConfig(join(home, ".codex", "hooks.json")).doc, codexConfigText) === "needs approval"
+    ? (codexTrustState(readConfig(join(home, ".codex", "hooks.json")).doc, codexConfigText, join(home, ".codex", "hooks.json")) === "needs approval"
       ? "needs approval"
       : codexBase)
     : codexBase;
@@ -1035,7 +1036,9 @@ export function statusSummary(platform = process.platform) {
 
 // ---- Codex hook trust (I11) -------------------------------------------------
 // Codex asks you to trust each hook position once; the decisions live as
-// `<event>:<group>:<hook>` keys under [hooks.state] in ~/.codex/config.toml.
+// `<event>:<group>:<hook>` keys under [hooks.state] in ~/.codex/config.toml
+// (legacy format) or as nested `<hooks.json path>:<event>:<group>:<hook>`
+// entries (Codex 0.167 format, see codexNestedTrust).
 // Positions that no longer exist (hooks reordered or removed) are stale and
 // get pruned on install.
 
@@ -1060,6 +1063,178 @@ export function codexTrustEntries(configText) {
   return found ? entries : null;
 }
 
+/** TOML dotted key path (header content or key prefix) split into parts:
+ * bare keys, "basic" strings (escapes decoded) and 'literal' strings.
+ * Returns null for malformed input. */
+function tomlKeyParts(text) {
+  const t = String(text ?? "");
+  const parts = [];
+  let i = 0;
+  while (i < t.length) {
+    if (t[i] === "." || /\s/.test(t[i])) { i++; continue; }
+    if (t[i] === '"') {
+      let s = "";
+      i++;
+      let closed = false;
+      while (i < t.length) {
+        const c = t[i];
+        if (c === "\\") {
+          const n = t[i + 1];
+          if (n === "\\") { s += "\\"; i += 2; }
+          else if (n === '"') { s += '"'; i += 2; }
+          else if (n === "n") { s += "\n"; i += 2; }
+          else if (n === "t") { s += "\t"; i += 2; }
+          else if (n === "u" && /^[0-9a-fA-F]{4}/.test(t.slice(i + 2, i + 6))) {
+            s += String.fromCharCode(parseInt(t.slice(i + 2, i + 6), 16));
+            i += 6;
+          } else i++;
+        } else if (c === '"') { closed = true; i++; break; }
+        else { s += c; i++; }
+      }
+      if (!closed) return null;
+      parts.push(s);
+    } else if (t[i] === "'") {
+      const j = t.indexOf("'", i + 1);
+      if (j === -1) return null;
+      parts.push(t.slice(i + 1, j));
+      i = j + 1;
+    } else {
+      let j = i;
+      while (j < t.length && t[j] !== "." && !/\s/.test(t[j])) j++;
+      parts.push(t.slice(i, j));
+      i = j;
+    }
+  }
+  return parts;
+}
+
+/** Splits "key = value" at the first = outside quotes, or null when there is
+ * none (unterminated quote). */
+function splitTomlKeyValue(line) {
+  let quote = null;
+  let escaped = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (c === "\\" && quote === '"') escaped = true;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") quote = c;
+    else if (c === "=") return [line.slice(0, i), line.slice(i + 1)];
+  }
+  return null;
+}
+
+/** Value text without a trailing # comment (outside quotes). */
+function stripTomlComment(value) {
+  let quote = null;
+  let escaped = false;
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (c === "\\" && quote === '"') escaped = true;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") quote = c;
+    else if (c === "#") return value.slice(0, i);
+  }
+  return value;
+}
+
+/** Fills one field (trusted_hash / enabled) of a nested trust entry. */
+function applyNestedField(entry, field, value) {
+  if (field === "trusted_hash") {
+    const m = /^"((?:[^"\\]|\\.)*)"/.exec(value);
+    if (m) entry.trustedHash = m[1];
+  } else if (field === "enabled") {
+    if (value === "true" || value === "false") entry.enabled = value === "true";
+  }
+}
+
+/**
+ * Nested hook-trust entries of a config.toml text, in the format current
+ * Codex (0.167.x) writes: keys are `<hooks.json path>:<event>:<group>:<hook>`
+ * and values carry `enabled` and `trusted_hash`. Accepts header tables
+ * ([hooks.state."<key>"]), inline tables and dotted keys under [hooks.state].
+ * Skips anything it cannot parse instead of throwing. Pure.
+ */
+export function codexNestedTrust(configText) {
+  const entries = new Map();
+  const entry = (key) => {
+    let e = entries.get(key);
+    if (!e) entries.set(key, (e = { enabled: null, trustedHash: null }));
+    return e;
+  };
+  let section = null; // header key path, parts joined with \0
+  let headerKey = null; // nested key of the [hooks.state."<key>"] table in effect
+  for (const line of String(configText ?? "").split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    if (t.startsWith("[")) {
+      const parts = tomlKeyParts(t.slice(1, t.lastIndexOf("]")));
+      section = parts?.join("\0") ?? null;
+      headerKey = null;
+      if (section?.startsWith("hooks\0state\0") && parts.length > 2) headerKey = parts.slice(2).join("");
+      continue;
+    }
+    const kv = splitTomlKeyValue(t);
+    if (!kv) continue;
+    const parts = tomlKeyParts(kv[0]);
+    if (!parts?.length) continue;
+    const value = stripTomlComment(kv[1]).trim();
+    if (headerKey) {
+      if (parts.length === 1) applyNestedField(entry(headerKey), parts[0], value);
+      continue;
+    }
+    if (section !== "hooks\0state") continue;
+    if (parts.length === 1) {
+      // Inline table spelling: "<key>" = { trusted_hash = "...", enabled = false }
+      if (value.startsWith("{") && completeTomlValue(value)) {
+        const e = entry(parts[0]);
+        const hash = /(?:^|[,{]\s*)trusted_hash\s*=\s*"((?:[^"\\]|\\.)*)"/.exec(value);
+        if (hash) e.trustedHash = hash[1];
+        const enabled = /(?:^|[,{]\s*)enabled\s*=\s*(true|false)(?![\w-])/.exec(value);
+        if (enabled) e.enabled = enabled[1] === "true";
+      }
+      // Single-part keys are otherwise legacy flat entries: not nested.
+      continue;
+    }
+    applyNestedField(entry(parts.slice(0, -1).join("")), parts[parts.length - 1], value);
+  }
+  return entries;
+}
+
+/** Path normalised for trust-key matching: slashes unified, duplicates
+ * collapsed, lower-cased for Windows-looking paths (drive letter or UNC). */
+function normaliseHooksPath(path) {
+  const raw = String(path ?? "");
+  const win = /^[a-z]:/i.test(raw) || raw.startsWith("//") || raw.startsWith("\\\\");
+  const s = raw.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+  return win ? s.toLowerCase() : s;
+}
+
+/** <path> and "<event>:<group>:<hook>" of a nested trust key, or null. */
+function nestedKeyParts(key) {
+  const i1 = key.lastIndexOf(":");
+  const i2 = i1 > 0 ? key.lastIndexOf(":", i1 - 1) : -1;
+  const i3 = i2 > 0 ? key.lastIndexOf(":", i2 - 1) : -1;
+  if (i3 < 0) return null;
+  return { path: key.slice(0, i3), pos: key.slice(i3 + 1) };
+}
+
+/** The nested trust entry for a hooks.json path + position, or undefined. */
+function nestedTrustMatch(nested, home, pos) {
+  for (const [key, e] of nested) {
+    const parts = nestedKeyParts(key);
+    if (parts && parts.pos === pos && normaliseHooksPath(parts.path) === home) return e;
+  }
+  return undefined;
+}
+
 /** TOML event key for a hook event name ("SessionStart" -> "session_start"). */
 function snakeEvent(name) {
   return String(name).replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
@@ -1081,14 +1256,21 @@ function codexPositions(doc) {
 }
 
 /**
- * null when codex has no ranch hooks or no [hooks.state] section (nothing
- * decided yet); "trusted" when every ranch hook position is trusted; else
- * "needs approval" (shown by `ranch-tasks status`).
+ * null when codex has no ranch hooks or nothing is decided yet (no
+ * [hooks.state] section and no nested trust entry for hooksPath);
+ * "trusted" when every ranch hook position is trusted; else
+ * "needs approval" (shown by `ranch-tasks status`). hooksPath is the
+ * absolute path of the hooks.json the doc came from; nested entries
+ * (Codex 0.167 format) are only matched when it is given.
  */
-export function codexTrustState(hooksDoc, configText) {
+export function codexTrustState(hooksDoc, configText, hooksPath) {
   if (!hasRanchHandlers(hooksDoc)) return null;
   const entries = codexTrustEntries(configText);
-  if (entries === null) return null;
+  const nested = codexNestedTrust(configText);
+  const home = hooksPath == null ? null : normaliseHooksPath(hooksPath);
+  // null = nothing decided: no legacy [hooks.state] section and no nested
+  // trust entries at all (matching today's "cannot tell" meaning).
+  if (entries === null && (home === null || nested.size === 0)) return null;
   const hooks = hooksDoc?.hooks;
   for (const [event, groups] of Object.entries(hooks)) {
     if (!Array.isArray(groups)) continue;
@@ -1096,7 +1278,15 @@ export function codexTrustState(hooksDoc, configText) {
       if (!isRanchGroup(groups[gi])) continue;
       const list = Array.isArray(groups[gi]?.hooks) ? groups[gi].hooks : [];
       for (let hi = 0; hi < list.length; hi++) {
-        const value = entries.get(`${snakeEvent(event)}:${gi}:${hi}`);
+        const pos = `${snakeEvent(event)}:${gi}:${hi}`;
+        const nestedEntry = home === null ? undefined : nestedTrustMatch(nested, home, pos);
+        if (nestedEntry) {
+          // Ranch cannot recompute Codex's trusted_hash; a present hash means
+          // "trusted, not re-verified".
+          if (nestedEntry.enabled === false || !nestedEntry.trustedHash) return "needs approval";
+          continue;
+        }
+        const value = entries?.get(pos);
         if (value === undefined || value === "false") return "needs approval";
       }
     }
@@ -1129,7 +1319,9 @@ function completeTomlValue(value) {
 }
 
 /** config.toml text with [hooks.state] entries whose position no longer
- * exists in the given hooks doc, or null when nothing changed. Pure. */
+ * exists in the given hooks doc, or null when nothing changed. Nested trust
+ * entries (keys that are not the legacy `event:g:h` shape) are never touched.
+ * Pure. */
 export function pruneCodexTrustText(configText, hooksDoc) {
   const live = codexPositions(hooksDoc);
   const lines = String(configText ?? "").split(/\r?\n/);
@@ -1144,10 +1336,11 @@ export function pruneCodexTrustText(configText, hooksDoc) {
       continue;
     }
     if (inSection && t && !t.startsWith("#")) {
-      const m = /^(?:"([^"]+)"|'([^']+)'|([^=\s#]+))\s*=\s*(.*)$/.exec(t);
-      if (!m || !completeTomlValue(m[4])) return null;
-      const key = m[1] ?? m[2] ?? m[3];
-      if (!live.has(key)) {
+      const kv = splitTomlKeyValue(t);
+      if (!kv || !completeTomlValue(kv[1])) return null;
+      const parts = tomlKeyParts(kv[0]);
+      const key = parts?.length === 1 ? parts[0] : kv[0];
+      if (/^[a-z_]+:\d+:\d+$/.test(key) && !live.has(key)) {
         changed = true;
         continue;
       }
@@ -1155,6 +1348,37 @@ export function pruneCodexTrustText(configText, hooksDoc) {
     out.push(line);
   }
   return changed ? out.join("\n") : null;
+}
+
+/** True only when config.toml enables codex's update_plan tool (off by
+ * default): [tools.update_plan] + enabled = true, or the equivalent inline /
+ * dotted spellings under [tools] or at the root. [profiles.*] ignored. */
+export function codexUpdatePlanEnabled(configText) {
+  let table = []; // current header key path parts
+  for (const line of String(configText ?? "").split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    if (t.startsWith("[")) {
+      table = tomlKeyParts(t.slice(1, t.lastIndexOf("]"))) ?? ["?"];
+      continue;
+    }
+    const kv = splitTomlKeyValue(t);
+    if (!kv) continue;
+    const parts = tomlKeyParts(kv[0]);
+    if (!parts?.length) continue;
+    const value = stripTomlComment(kv[1]).trim();
+    const truthy = (v) => v === "true";
+    if (parts.length === 1 && parts[0] === "enabled" && table.length === 2 && table[0] === "tools" && table[1] === "update_plan") {
+      if (truthy(value)) return true;
+    } else if (parts[0] === "update_plan" && table.length === 1 && table[0] === "tools") {
+      if (parts.length === 1 && /(?:^|[,{]\s*)enabled\s*=\s*true(?![\w-])/.test(value)) return true;
+      if (parts.length === 2 && parts[1] === "enabled" && truthy(value)) return true;
+    } else if (parts.length === 3 && table.length === 0
+      && parts[0] === "tools" && parts[1] === "update_plan" && parts[2] === "enabled") {
+      if (truthy(value)) return true;
+    }
+  }
+  return false;
 }
 
 /** Applies pruneCodexTrustText to ~/.codex/config.toml (install, I11). */

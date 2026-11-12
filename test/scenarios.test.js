@@ -52,6 +52,14 @@ test("fixture: Codex update_plan replaces tasks without active_form", () => {
   ]);
 });
 
+test("fixture: Codex shell command (exec_command reported as Bash) records the created PR", () => {
+  const store = applyCodex(emptyStore("t1", "codex"), load("codex-exec-command.json"));
+  assert.equal(store.prs?.length, 1);
+  assert.equal(store.prs[0].url, "https://github.com/o/r/pull/12");
+  assert.equal(store.prs[0].number, 12);
+  assert.equal(typeof store.prs[0].at, "string");
+});
+
 test("fixture: OpenCode todowrite tool hook replaces tasks", () => {
   const payload = load("opencode-todowrite.json");
   const store = reduceOpencode(emptyStore("t1", "opencode"), {

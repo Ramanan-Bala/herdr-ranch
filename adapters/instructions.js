@@ -3,18 +3,34 @@
 // adapters/install.js; every block is wrapped in markers so uninstall can take
 // back exactly what install added.
 
+import { looksWindows, tasksCommand } from "../lib/tasks-command.js";
+
 export const BEGIN = "<!-- ranch-tasks:begin -->";
 export const END = "<!-- ranch-tasks:end -->";
 
 const TOOL = {
   claude: "your task tool (TaskCreate to add tasks, TaskUpdate to change status; TodoWrite if that is what you have)",
-  codex: "the update_plan tool",
   opencode: "the todowrite tool",
 };
 
+const PLAN_EXAMPLE = `"doing: <first task>" "todo: <next task>"`;
+const PLAN_NOTE = "(one quoted argument per task, prefixes todo/doing/done/skip; each run replaces the whole list, so always pass every task)";
+
+/** Shell-ready absolute `ranch-tasks plan` command for a home dir ("ranch-tasks plan" without one). */
+export function planCommandLine(home) {
+  if (!home) return "ranch-tasks plan";
+  const win = looksWindows(home);
+  const [cmd, args] = tasksCommand(win ? String(home).replace(/\\/g, "/") : home, ["plan"], win);
+  if (win) return `node "${args[0]}" ${args.slice(1).join(" ")}`;
+  return `${cmd.includes(" ") ? `"${cmd}"` : cmd} ${args.join(" ")}`;
+}
+
 /** The rules, worded for one agent ("claude" | "codex" | "opencode"). */
-export function rulesFor(agent) {
-  const tool = TOOL[agent] ?? "your task/todo tool";
+export function rulesFor(agent, home) {
+  const tool =
+    agent === "codex"
+      ? `the update_plan tool if you have it; otherwise run \`${planCommandLine(home)} ${PLAN_EXAMPLE}\` ${PLAN_NOTE}`
+      : (TOOL[agent] ?? "your task/todo tool");
   return `# Task reporting (Ranch) - mandatory for every message
 
 The person watches your progress in Herdr's Ranch panel, which shows your task
@@ -35,8 +51,8 @@ sends, with no exceptions (questions and one-line answers included):
 }
 
 /** The marked block for an AGENTS.md / CLAUDE.md style file. */
-export function blockFor(agent) {
-  return `${BEGIN}\n${rulesFor(agent)}${END}\n`;
+export function blockFor(agent, home) {
+  return `${BEGIN}\n${rulesFor(agent, home)}${END}\n`;
 }
 
 /** The line Claude's CLAUDE.md gets: an import of ~/.claude/RANCH.md. */
@@ -71,8 +87,13 @@ function escape(s) {
  * once there is one, only when the previous turn did not update it
  * (missed_turns > 0).
  */
-export function reminderFor(agent, event, store) {
-  const tool = agent === "codex" ? "update_plan" : agent === "opencode" ? "todowrite" : "TaskCreate/TaskUpdate";
+export function reminderFor(agent, event, store, home) {
+  const tool =
+    agent === "codex"
+      ? `update_plan (or, without it: ${planCommandLine(home)} "doing: ..." "todo: ...")`
+      : agent === "opencode"
+        ? "todowrite"
+        : "TaskCreate/TaskUpdate";
   if (event !== "SessionStart" && event !== "UserPromptSubmit") return null;
   const hasList = Array.isArray(store?.tasks) && store.tasks.length > 0;
   const missed = Number.isInteger(store?.missed_turns) && store.missed_turns > 0;
