@@ -1,0 +1,13 @@
+{
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": { "command": "gh pr create --fill" },
+  "tool_response": "Creating pull request...\nhttps://github.com/o/r/pull/12\n",
+  "session_id": "s-exec",
+  "turn_id": "turn-1",
+  "tool_use_id": "call-1",
+  "cwd": "/tmp/repo",
+  "model": "gpt-5",
+  "permission_mode": "default",
+  "transcript_path": null
+}

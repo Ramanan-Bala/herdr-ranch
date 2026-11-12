@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   PRS_FILE,
   PR_URL,
@@ -120,4 +121,11 @@ test("detectCreatedPr only counts gh pr create run as a command", () => {
   assert.equal(ran("grep -n 'gh pr create' lib/prs.js"), null);
   // The URL gh prints last wins over earlier URLs in the output.
   assert.equal(ran("gh pr create --fill", "see https://github.com/a/b/pull/1\nhttps://github.com/o/r/pull/9\n")?.number, 9);
+});
+
+test("detectCreatedPr parses the Codex exec_command payload fixture", () => {
+  // Codex runs shell commands through exec_command but reports them to hooks
+  // as tool_name "Bash" with the command as ONE string (rust-v0.167.1).
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/codex-exec-command.json", import.meta.url), "utf8"));
+  assert.deepEqual(detectCreatedPr(fixture), { url: "https://github.com/o/r/pull/12", number: 12 });
 });

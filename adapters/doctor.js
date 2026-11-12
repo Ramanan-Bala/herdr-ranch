@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseStore } from "../lib/tasks.js";
 import { homeDir } from "./store.js";
-import { opencodeTodoEnabled, statusSummary } from "./install.js";
+import { codexTrustState, codexUpdatePlanEnabled, opencodeTodoEnabled, statusSummary } from "./install.js";
 
 const TODO_PAYLOAD = {
   hook_event_name: "PostToolUse",
@@ -38,6 +38,18 @@ export function cliPath() {
   return join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "ranch-tasks");
 }
 
+/** Store text of the temp home after a synthetic write: the session file the
+ * terminal pointer names, or the terminal file itself while no session id is
+ * known (fixes §3.3). Shared by the hook, plugin and plan checks. */
+function readSyntheticStore(home) {
+  const pointer = readFileSync(join(home, ".herdr", "ranch", "tasks", "terminals", "doctor.json"), "utf8");
+  const raw = JSON.parse(pointer);
+  const path = typeof raw.session === "string"
+    ? join(home, ".herdr", "ranch", "tasks", "sessions", `${raw.session}.json`)
+    : pointer;
+  return { store: readFileSync(path, "utf8"), pointer };
+}
+
 /** Runs one hook adapter against an isolated store; returns the store text. */
 function syntheticHook(agent, payload, home) {
   const env = { ...process.env, RANCH_HOME: home, HC_TERMINAL_ID: "doctor" };
@@ -49,12 +61,7 @@ function syntheticHook(agent, payload, home) {
   });
   if (run.status !== 0) return { error: run.stderr?.trim() || `exit ${run.status}` };
   try {
-    const pointer = readFileSync(join(home, ".herdr", "ranch", "tasks", "terminals", "doctor.json"), "utf8");
-    const raw = JSON.parse(pointer);
-    const path = typeof raw.session === "string"
-      ? join(home, ".herdr", "ranch", "tasks", "sessions", `${raw.session}.json`)
-      : pointer;
-    return { store: readFileSync(path, "utf8"), pointer };
+    return readSyntheticStore(home);
   } catch (err) {
     return { error: `no store appeared (${err?.code ?? err?.message ?? err})` };
   }
@@ -74,12 +81,7 @@ async function syntheticOpencode(home) {
     if (saved.RANCH_HOME === undefined) delete process.env.RANCH_HOME; else process.env.RANCH_HOME = saved.RANCH_HOME;
     if (saved.HC_TERMINAL_ID === undefined) delete process.env.HC_TERMINAL_ID; else process.env.HC_TERMINAL_ID = saved.HC_TERMINAL_ID;
   }
-  const pointer = readFileSync(join(home, ".herdr", "ranch", "tasks", "terminals", "doctor.json"), "utf8");
-  const raw = JSON.parse(pointer);
-  const path = typeof raw.session === "string"
-    ? join(home, ".herdr", "ranch", "tasks", "sessions", `${raw.session}.json`)
-    : pointer;
-  return { store: readFileSync(path, "utf8"), pointer };
+  return readSyntheticStore(home);
 }
 
 function check(name, ok, detail = "") {
@@ -92,6 +94,52 @@ function storeCheck(name, result) {
   if (!parsed.ok) return check(name, false, `store did not parse (${parsed.reason})`);
   const ok = parsed.store.tasks.length === 1 && parsed.store.tasks[0].title === "doctor check";
   return check(name, ok, ok ? "store appeared with the task" : "store missing the task");
+}
+
+/**
+ * `ranch-tasks plan` end to end in the same temp home: the codex synthetic
+ * event left a live Codex session in the terminal, so the command must write
+ * the task through the normal store path.
+ */
+function planCheck(name, run, home) {
+  if (run.status !== 0) return check(name, false, run.stderr?.trim() || `exit ${run.status}`);
+  let result;
+  try {
+    result = readSyntheticStore(home);
+  } catch (err) {
+    return check(name, false, `no store appeared (${err?.code ?? err?.message ?? err})`);
+  }
+  const parsed = parseStore(result.store);
+  if (!parsed.ok) return check(name, false, `store did not parse (${parsed.reason})`);
+  const task = parsed.store.tasks.length === 1 ? parsed.store.tasks[0] : null;
+  const ok = task?.title === "doctor plan check" && task.status === "in_progress";
+  return check(name, ok, ok ? "plan wrote the task" : "store missing the planned task");
+}
+
+/** The codex hook-approval check from codexTrustState, plus the
+ * informational update_plan check; both only when codex is installed. */
+function codexChecks(checks, agents, home) {
+  if (!agents?.codex || agents.codex === "missing") return;
+  const hooksFile = join(home, ".codex", "hooks.json");
+  let doc = null;
+  let configText = "";
+  try {
+    doc = JSON.parse(readFileSync(hooksFile, "utf8"));
+  } catch {}
+  try {
+    configText = readFileSync(join(home, ".codex", "config.toml"), "utf8");
+  } catch {}
+  const trust = codexTrustState(doc, configText, hooksFile);
+  if (trust === "trusted") {
+    checks.push(check("codex hook approval", true, "approved in ~/.codex/config.toml (Ranch cannot re-check Codex's hash: if Codex says hooks were modified, re-approve with /hooks)"));
+  } else if (trust === "needs approval") {
+    checks.push(check("codex hook approval", false, "approve the Ranch hooks once with /hooks in Codex"));
+  } else {
+    checks.push({ ...check("codex hook approval", true, "not verified: no trust entries for the Ranch hooks found; confirm with /hooks in Codex"), unknown: true });
+  }
+  checks.push(check("codex update_plan tool", true, codexUpdatePlanEnabled(configText)
+    ? "enabled ([tools.update_plan])"
+    : "off: Codex reports tasks with `ranch-tasks plan` (enable [tools.update_plan] in ~/.codex/config.toml to use the native tool; see RECIPE.md)"));
 }
 
 /** Full doctor report: { ok, checks: [{ name, ok, detail }] }. */
@@ -115,7 +163,7 @@ export async function doctor() {
   for (const [agent, state] of Object.entries(agents ?? {})) {
     checks.push(check(`${agent} hooks`, state === "installed", state));
   }
-  checks.push(check("codex hook approval", true, "confirm once with /hooks in Codex (cannot be checked from here)"));
+  codexChecks(checks, agents, home);
   checks.push(check("opencode experimental.todo", opencodeTodoEnabled(), "opencode config"));
 
   // Synthetic events in an isolated store.
@@ -123,6 +171,14 @@ export async function doctor() {
   try {
     checks.push(storeCheck("claude synthetic event", syntheticHook("claude", TODO_PAYLOAD, temp)));
     checks.push(storeCheck("codex synthetic event", syntheticHook("codex", PLAN_PAYLOAD, temp)));
+    // `ranch-tasks plan` in the same temp home: the codex event above left a
+    // live Codex session in this terminal, so the command may write through.
+    const planRun = spawnSync(process.execPath, [cliPath(), "plan", "doing: doctor plan check"], {
+      env: { ...process.env, RANCH_HOME: temp, HC_TERMINAL_ID: "doctor" },
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    checks.push(planCheck("codex plan command", planRun, temp));
     let opencode = null;
     try {
       opencode = await syntheticOpencode(temp);
