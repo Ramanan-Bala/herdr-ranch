@@ -4,6 +4,12 @@
  * `(args: string[]) => Promise<{code, stdout, stderr}>` so callers can bind
  * it to Herdr's `exec("git", args, {cwd, on})` and tests can fake it.
  * Helpers never throw: any failure yields null fields.
+ *
+ * Parsers: parseShortstat, parseNumstat (text) / parseNumstatZ (-z output),
+ * numstatTotals, parseLog, parseAheadBehind, parseStatusBranch, parsePr.
+ * Async helpers: defaultBranch, defaultRef, repoSnapshot (with repoSummary
+ * and repoDetails built on it), runGh. Caching/queueing: createTtlCache,
+ * createLimiter.
  */
 
 /**
@@ -37,6 +43,7 @@ function resolveRename(path) {
 
 /**
  * Parse `git diff --numstat` output.
+ * For `git diff --numstat -z` output use parseNumstatZ instead.
  * @param {string} text
  * @returns {Array<{path: string, add: number|null, del: number|null}>}
  */
@@ -53,6 +60,57 @@ export function parseNumstat(text) {
     });
   }
   return rows;
+}
+
+/**
+ * Parse `git diff --numstat -z` output. Records are NUL-separated so paths
+ * are verbatim (tabs, newlines, quotes, unicode, " => " all kept). Rename and
+ * copy records have an empty third field, then the old and new path each as
+ * their own NUL-terminated field; the row's path is the new path. `-` for
+ * add/del (binary) becomes null.
+ * @param {string} text
+ * @returns {Array<{path: string, add: number|null, del: number|null}>}
+ */
+export function parseNumstatZ(text) {
+  const rows = [];
+  if (!text) return rows;
+  const fields = text.split("\0");
+  for (let i = 0; i < fields.length; ) {
+    const field = fields[i];
+    if (!field) { i += 1; continue; }
+    const t1 = field.indexOf("\t");
+    const t2 = t1 === -1 ? -1 : field.indexOf("\t", t1 + 1);
+    if (t2 === -1) { i += 1; continue; }
+    const add = field.slice(0, t1) === "-" ? null : Number(field.slice(0, t1));
+    const del = field.slice(t1 + 1, t2) === "-" ? null : Number(field.slice(t1 + 1, t2));
+    const pathPart = field.slice(t2 + 1);
+    if (pathPart === "") {
+      // rename/copy record: old path and new path each follow as own fields
+      rows.push({ path: fields[i + 2] ?? "", add, del });
+      i += 3;
+    } else {
+      rows.push({ path: pathPart, add, del });
+      i += 1;
+    }
+  }
+  return rows;
+}
+
+/**
+ * Totals for numstat rows (either parser's output): file count plus add/del
+ * sums, with binary rows (null) counted as 0 lines — matches
+ * `git diff --shortstat`, where binary files count as files with 0 lines.
+ * @param {Array<{add: number|null, del: number|null}>} rows
+ * @returns {{files: number, add: number, del: number}}
+ */
+export function numstatTotals(rows) {
+  let add = 0;
+  let del = 0;
+  for (const row of rows) {
+    add += row.add ?? 0;
+    del += row.del ?? 0;
+  }
+  return { files: rows.length, add, del };
 }
 
 /** `git log --format=` template: sha, short sha, subject, author, unix time. */
@@ -91,6 +149,45 @@ export function parseAheadBehind(text) {
 }
 
 /**
+ * Parse `git status --porcelain=v2 --branch` output. Only lines starting with
+ * "# branch." are read; changed-file entries are ignored.
+ * @param {string} text
+ * @returns {{oid: string|null, branch: string|null, detached: boolean,
+ *            upstream: string|null, ahead: number|null, behind: number|null}}
+ */
+export function parseStatusBranch(text) {
+  let oid = null;
+  let branch = null;
+  let detached = false;
+  let upstream = null;
+  let ahead = null;
+  let behind = null;
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("# branch.")) continue;
+    const value = line.slice("# branch.".length).replace(/^\S+ ?/, "");
+    if (line.startsWith("# branch.oid ")) {
+      oid = value === "(initial)" ? null : value;
+    } else if (line.startsWith("# branch.head ")) {
+      if (value === "(detached)") {
+        branch = null;
+        detached = true;
+      } else {
+        branch = value || null;
+      }
+    } else if (line.startsWith("# branch.upstream ")) {
+      upstream = value || null;
+    } else if (line.startsWith("# branch.ab ")) {
+      const m = /^\+(\d+) -(\d+)$/.exec(value);
+      if (m) {
+        ahead = Number(m[1]);
+        behind = Number(m[2]);
+      }
+    }
+  }
+  return { oid, branch, detached, upstream, ahead, behind };
+}
+
+/**
  * Map a git remote URL to a web host.
  * @param {string} remoteUrl
  * @returns {{kind: "github"|"gitlab", base: string}|null}
@@ -121,11 +218,18 @@ export function webHost(remoteUrl) {
   }
   path = path.replace(/\.git$/, "").replace(/\/+$/, "");
   if (!path) return null;
+  const hostname = host.toLowerCase().replace(/:\d+$/, "");
   let kind = null;
-  if (host.includes("github.com")) kind = "github";
-  else if (host.includes("gitlab")) kind = "gitlab";
-  else return null;
-  return { kind, base: `https://${host}/${path}` };
+  let baseHost = host;
+  if (hostname === "github.com" || hostname === "www.github.com" || hostname === "ssh.github.com") {
+    kind = "github";
+    baseHost = "github.com";
+  } else if (hostname === "gitlab.com" || hostname.split(".").some((label) => label.startsWith("gitlab"))) {
+    kind = "gitlab";
+  } else {
+    return null;
+  }
+  return { kind, base: `https://${baseHost}/${path}` };
 }
 
 /**
@@ -148,7 +252,8 @@ export function links(host) {
       return `${host.base}${sep}/commit/${sha}`;
     },
     compare(from, to) {
-      const spec = `${from}...${to}`;
+      const enc = (ref) => ref.split("/").map(encodeURIComponent).join("/");
+      const spec = `${enc(from)}...${enc(to)}`;
       return isGitlab
         ? `${host.base}/-/compare/${spec}`
         : `${host.base}/compare/${spec}?expand=1`;
@@ -196,7 +301,9 @@ export async function defaultRef(git, name) {
 }
 
 /**
- * The default branch of the repo: origin HEAD, else main, else master.
+ * The default branch of the repo: origin HEAD, else the first of main/master
+ * that exists as a remote-tracking ref (checked before the local branch for
+ * each name).
  * @param {(args: string[]) => Promise<{code: number, stdout: string, stderr: string}>} git
  * @returns {Promise<string|null>}
  */
@@ -207,99 +314,182 @@ export async function defaultBranch(git) {
     return sym.stdout.trim().replace(/^origin\//, "");
   }
   for (const branch of ["main", "master"]) {
-    const probe = await git([
+    const remote = await git([
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      `refs/remotes/origin/${branch}`,
+    ]);
+    if (remote.code === 0) return branch;
+    const local = await git([
       "rev-parse",
       "--verify",
       "--quiet",
       `refs/heads/${branch}`,
     ]);
-    if (probe.code === 0) return branch;
+    if (local.code === 0) return branch;
   }
   return null;
 }
 
 /**
- * Snapshot of the repo state at the current directory.
+ * Full repo snapshot in a few small parallel rounds (at most 2 git processes
+ * per round, never more than 4 concurrent). Reads repo metadata (default
+ * branch, compare ref, web host) once and caches it via `meta` (a
+ * createTtlCache) keyed by `metaKey|<common dir>`.
  * @param {(args: string[]) => Promise<{code: number, stdout: string, stderr: string}>} git
- * @returns {Promise<object|null>} null when not inside a git repo.
+ * @param {{commits?: number, details?: boolean,
+ *          meta?: object|null, metaKey?: string, now?: number}} [options]
+ * @returns {Promise<{status: "ok"|"not-repo"|"failed",
+ *            summary: object|null, details: {files: Array, commits: Array}|null}>}
  */
-export async function repoSummary(git) {
+export async function repoSnapshot(
+  git,
+  { commits = 5, details = true, meta = null, metaKey = "", now = 0 } = {},
+) {
   git = safe(git);
-  const top = await git(["rev-parse", "--show-toplevel"]);
-  if (top.code !== 0) return null;
 
-  const branchOut = await git(["branch", "--show-current"]);
-  const branch = branchOut.code === 0 ? branchOut.stdout.trim() : "";
-  const detached = !branch;
+  // Round 1: where is the repo, and what does HEAD look like.
+  const [revOut, statusOut] = await Promise.all([
+    git(["rev-parse", "--show-toplevel", "--path-format=absolute", "--git-common-dir"]),
+    git(["--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=no"]),
+  ]);
+  if (revOut.code === -1) return { status: "failed", summary: null, details: null };
+  if (revOut.code !== 0) return { status: "not-repo", summary: null, details: null };
+  const revLines = revOut.stdout.split("\n");
+  const top = (revLines[0] ?? "").trim();
+  const common = (revLines[1] ?? "").trim() || null;
+  const st = statusOut.code === 0 ? parseStatusBranch(statusOut.stdout) : null;
+  const branch = st && !st.detached ? st.branch : null;
+  const detached = st ? st.detached : true;
+  const head = st?.oid ? st.oid.slice(0, 7) : null;
+  const ahead = st?.ahead ?? null;
+  const behind = st?.behind ?? null;
 
-  const headOut = await git(["rev-parse", "--short", "HEAD"]);
-  const head = headOut.code === 0 ? headOut.stdout.trim() : null;
-
-  const def = await defaultBranch(git);
-  const ref = await defaultRef(git, def);
-
-  let base = null;
-  if (ref) {
-    const baseOut = await git(["merge-base", "HEAD", ref]);
-    base = baseOut.code === 0 ? baseOut.stdout.trim() : null;
+  // Round 2: repo metadata, skipped on a cache hit.
+  const key = `${metaKey}|${common ?? top}`;
+  let def = null;
+  let ref = null;
+  let host = null;
+  let cached = null;
+  if (meta) cached = meta.get(key, now);
+  if (!cached) {
+    const [refsOut, urlOut] = await Promise.all([
+      git([
+        "for-each-ref",
+        "--format=%(refname)%09%(symref)",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+        "refs/heads/main",
+        "refs/heads/master",
+      ]),
+      git(["remote", "get-url", "origin"]),
+    ]);
+    host = urlOut.code === 0 ? webHost(urlOut.stdout.trim()) : null;
+    if (refsOut.code === 0) {
+      const lines = refsOut.stdout
+        .split("\n")
+        .map((line) => {
+          const i = line.indexOf("\t");
+          return { refname: i === -1 ? line : line.slice(0, i), symref: i === -1 ? "" : line.slice(i + 1) };
+        })
+        .filter((line) => line.refname);
+      const names = new Set(lines.map((line) => line.refname));
+      const headLine = lines.find(
+        (line) => line.refname === "refs/remotes/origin/HEAD" && line.symref,
+      );
+      if (headLine) def = headLine.symref.replace(/^refs\/remotes\/origin\//, "");
+      if (!def) {
+        for (const candidate of ["main", "master"]) {
+          if (names.has(`refs/remotes/origin/${candidate}`) || names.has(`refs/heads/${candidate}`)) {
+            def = candidate;
+            break;
+          }
+        }
+      }
+      if (def) {
+        if (names.has(`refs/remotes/origin/${def}`)) ref = `origin/${def}`;
+        else if (names.has(`refs/heads/${def}`)) ref = def;
+        else if (headLine) ref = await defaultRef(git, def);
+      }
+      if (meta) meta.set(key, { default: def, ref, host }, now);
+    }
+  } else {
+    def = cached.default;
+    ref = cached.ref;
+    host = cached.host;
   }
 
-  // Commits HEAD has that the default branch doesn't (ahead), and vice versa.
+  // Round 3: where HEAD diverged from the default branch.
+  let base = null;
   let vsDefault = null;
   if (ref) {
-    const out = await git(["rev-list", "--left-right", "--count", `HEAD...${ref}`]);
-    const counts = out.code === 0 ? parseAheadBehind(out.stdout) : null;
+    const [baseOut, countOut] = await Promise.all([
+      git(["merge-base", "HEAD", ref]),
+      git(["rev-list", "--left-right", "--count", `HEAD...${ref}`]),
+    ]);
+    base = baseOut.code === 0 ? baseOut.stdout.trim() : null;
+    const counts = countOut.code === 0 ? parseAheadBehind(countOut.stdout) : null;
     if (counts) vsDefault = { ahead: counts.ahead, behind: counts.behind, ref };
   }
 
+  // Round 4: files changed vs base, plus recent commits.
+  let files = [];
   let stat = null;
-  if (base) {
-    const statOut = await git(["diff", "--shortstat", base]);
-    stat = statOut.code === 0 ? parseShortstat(statOut.stdout) : null;
+  let diffOut = null;
+  let logOut = null;
+  if (details) {
+    const logArgs = ["log", "-n", String(commits), `--format=${LOG_FORMAT}`];
+    if (base) logArgs.push(`${base}..HEAD`);
+    [diffOut, logOut] = await Promise.all([
+      base ? git(["diff", "--numstat", "-z", base]) : Promise.resolve(null),
+      git(logArgs),
+    ]);
+  } else if (base) {
+    diffOut = await git(["diff", "--numstat", "-z", base]);
   }
-
-  let ahead = null;
-  let behind = null;
-  const countOut = await git([
-    "rev-list",
-    "--left-right",
-    "--count",
-    "HEAD...@{u}",
-  ]);
-  if (countOut.code === 0) {
-    const counts = parseAheadBehind(countOut.stdout);
-    if (counts) {
-      ahead = counts.ahead;
-      behind = counts.behind;
-    }
+  if (base && diffOut.code === 0) {
+    files = parseNumstatZ(diffOut.stdout);
+    stat = numstatTotals(files);
   }
-
-  const urlOut = await git(["remote", "get-url", "origin"]);
-  const host = urlOut.code === 0 ? webHost(urlOut.stdout.trim()) : null;
-
-  // A worktree's common dir is the main checkout's .git, not this top's.
-  const commonOut = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  const common = commonOut.code === 0 ? commonOut.stdout.trim() : null;
+  const commitsOut = logOut && logOut.code === 0 ? parseLog(logOut.stdout) : [];
 
   return {
-    top: top.stdout.trim(),
-    branch: detached ? null : branch,
-    detached,
-    head,
-    default: def,
-    base,
-    vsDefault,
-    stat,
-    ahead,
-    behind,
-    host,
-    common,
-    linked: common !== null && common !== `${top.stdout.trim()}/.git`,
+    status: "ok",
+    summary: {
+      top,
+      branch,
+      detached,
+      head,
+      default: def,
+      base,
+      vsDefault,
+      stat,
+      ahead,
+      behind,
+      host,
+      common,
+      linked: common !== null && common !== `${top}/.git`,
+    },
+    details: details ? { files, commits: commitsOut } : null,
   };
 }
 
 /**
- * Files changed and recent commits against a base commit.
+ * Summary of the repo state at the current directory (repoSnapshot without
+ * the file/commit details).
+ * @param {(args: string[]) => Promise<{code: number, stdout: string, stderr: string}>} git
+ * @param {{commits?: number, meta?: object|null, metaKey?: string, now?: number}} [options]
+ * @returns {Promise<object|null>} null when not inside a git repo.
+ */
+export async function repoSummary(git, opts = {}) {
+  return (await repoSnapshot(git, { ...opts, details: false })).summary;
+}
+
+/**
+ * Files changed and recent commits against a base commit. The numstat and
+ * log calls run in parallel.
  * @param {(args: string[]) => Promise<{code: number, stdout: string, stderr: string}>} git
  * @param {string|null} base merge-base sha, or null for HEAD-only history
  * @param {{commits?: number}} [options]
@@ -307,21 +497,16 @@ export async function repoSummary(git) {
  */
 export async function repoDetails(git, base, { commits = 5 } = {}) {
   git = safe(git);
-  let files = [];
-  if (base) {
-    const numstat = await git(["diff", "--numstat", base]);
-    if (numstat.code === 0) files = parseNumstat(numstat.stdout);
-  }
-  let logArgs;
-  if (base) {
-    logArgs = ["log", "-n", String(commits), `--format=${LOG_FORMAT}`, `${base}..HEAD`];
-  } else {
-    logArgs = ["log", "-n", String(commits), `--format=${LOG_FORMAT}`];
-  }
-  const log = await git(logArgs);
+  const logArgs = base
+    ? ["log", "-n", String(commits), `--format=${LOG_FORMAT}`, `${base}..HEAD`]
+    : ["log", "-n", String(commits), `--format=${LOG_FORMAT}`];
+  const [diffOut, logOut] = await Promise.all([
+    base ? git(["diff", "--numstat", "-z", base]) : Promise.resolve(null),
+    git(logArgs),
+  ]);
   return {
-    files,
-    commits: log.code === 0 ? parseLog(log.stdout) : [],
+    files: base && diffOut.code === 0 ? parseNumstatZ(diffOut.stdout) : [],
+    commits: logOut.code === 0 ? parseLog(logOut.stdout) : [],
   };
 }
 
@@ -434,26 +619,94 @@ export function parsePr(json) {
 
 /**
  * A tiny TTL cache for values that are expensive to compute.
- * Timestamps come from callers, never from Date.now().
+ * Timestamps come from callers, never from Date.now(). `get` deletes an
+ * expired entry; `prune` deletes all expired ones; with `max`, `set` evicts
+ * the oldest-inserted entries (re-setting a key refreshes its order).
  * @param {number} ttlMs
+ * @param {{max?: number}} [options]
  * @returns {{get: (key: string, now: number) => any,
  *            set: (key: string, value: any, now: number) => void,
+ *            prune: (now: number) => number,
+ *            size: number,
  *            delete: (key: string) => void}}
  */
-export function createTtlCache(ttlMs) {
+export function createTtlCache(ttlMs, { max = Infinity } = {}) {
   const entries = new Map();
   return {
     get(key, now) {
       const entry = entries.get(key);
       if (!entry) return undefined;
-      if (now - entry.at > ttlMs) return undefined;
+      if (now - entry.at > ttlMs) {
+        entries.delete(key);
+        return undefined;
+      }
       return entry.value;
     },
     set(key, value, now) {
+      entries.delete(key); // refresh insertion order for max eviction
       entries.set(key, { value, at: now });
+      while (entries.size > max) {
+        entries.delete(entries.keys().next().value);
+      }
+    },
+    prune(now) {
+      let removed = 0;
+      for (const [key, entry] of entries) {
+        if (now - entry.at > ttlMs) {
+          entries.delete(key);
+          removed += 1;
+        }
+      }
+      return removed;
+    },
+    get size() {
+      return entries.size;
     },
     delete(key) {
       entries.delete(key);
+    },
+  };
+}
+
+/**
+ * Runs at most `max` functions at once; queued ones start FIFO unless
+ * `front: true` puts them at the head of the queue. A rejecting function
+ * rejects only its own promise and frees its slot.
+ * @param {number} max
+ * @returns {{run: (fn: () => Promise<any>, options?: {front?: boolean}) => Promise<any>,
+ *            active: number, pending: number}}
+ */
+export function createLimiter(max) {
+  const queue = [];
+  let active = 0;
+  const next = () => {
+    while (active < max && queue.length > 0) {
+      const { fn, resolve, reject } = queue.shift();
+      active += 1;
+      // Promise.resolve().then: a sync throw or plain value still settles. The
+      // slot is freed before the caller resumes, then the queue moves on.
+      const settle = (done, value) => {
+        active -= 1;
+        done(value);
+        next();
+      };
+      Promise.resolve().then(fn).then((v) => settle(resolve, v), (e) => settle(reject, e));
+    }
+  };
+  return {
+    run(fn, { front = false } = {}) {
+      return new Promise((resolve, reject) => {
+        const job = { fn, resolve, reject };
+        if (front) queue.unshift(job);
+        else queue.push(job);
+        next();
+      });
+    },
+    get active() {
+      return active;
+    },
+    get pending() {
+      return queue.length;
     },
   };
 }

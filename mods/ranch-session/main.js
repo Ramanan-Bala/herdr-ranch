@@ -25,14 +25,16 @@ import {
   truncateMiddle,
 } from "./lib/format.js";
 import {
-  repoSummary,
-  repoDetails,
+  repoSnapshot,
   links,
   parsePr,
   runGh,
   createTtlCache,
+  createLimiter,
   PR_JSON_FIELDS,
 } from "./lib/git.js";
+import { GitContexts, ageLabel } from "./gitctx.js";
+import { createWatchLoops } from "./lib/watch.js";
 import { TASKS_DIR, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
 import { PRS_FILE, parsePrRegistry, prsFor, registryPrBelongs, repoOfWebBase } from "./lib/prs.js";
 import {
@@ -82,6 +84,13 @@ const isWin = () => appWindow()?.platform === "windows";
 // re-instantiating the view mid-session does not repeat the sweep.
 const gcDone = new Set(); // machine key ("", machine name)
 
+// The Session panel's share of the 4-gh budget (requirements §Performance:
+// sidebar 3 + session 1); module-level so every copy of this view shares it.
+const ghLimit = createLimiter(1);
+
+// Repo metadata (default branch, compare ref, web host) rarely changes.
+const GIT_META_TTL_MS = 600000;
+
 /** Friendly name for a detected editor CLI, for tooltips. */
 const EDITOR_NAMES = { cursor: "Cursor", code: "VS Code", zed: "Zed", subl: "Sublime Text" };
 
@@ -103,10 +112,9 @@ export default class RanchSession extends View {
     this.tasksWatchGen = 0;
     this.terminals = new Map(); // "addr@machine" -> { state, startedAt, at, busy }
     this.subTasks = new Map(); // sub address -> { parsed, read, at, busy, due }
-    this.git = { key: null, summary: null, details: null, top: null, busy: false, dirty: true, at: 0, readyKey: null };
-    this.gitWatchGen = 0;
-    this.pr = { key: null, parsed: null, busy: false, dirty: true, at: 0, failed: false, error: null };
-    this.recordedPrCache = createTtlCache(60000); // url -> parsePr() of a recorded PR
+    this.ctx = new GitContexts(); // per machine|cwd|branch Git/PR cache
+    this.gitMeta = createTtlCache(GIT_META_TTL_MS, { max: 50 }); // repo metadata
+    this.recordedPrCache = createTtlCache(60000, { max: 100 }); // url -> parsePr() of a recorded PR
     this.recordedPrTtl = 60000; // recreated when refresh.prSec changes
     this.recordedPrBusy = new Set(); // URLs with a lookup in flight
     this.prRegistry = { key: null, parsed: null, at: 0, busy: false, dirty: true };
@@ -119,10 +127,18 @@ export default class RanchSession extends View {
     this.settingUp = false;
     this.setupResult = null; // string output, "missing", or null
     this.editors = new Map(); // machine key -> { path: string|null, busy }
-    this.push = { busy: false, err: null };
-    this.pushAt = 0; // ms epoch of the last successful push (for "Pushed")
     this.copyAt = 0; // ms epoch of the last "Copy branch" click
     this.size = null;
+    // Local repo watches: at most one loop per root, no matter how often the
+    // folder changes (there is no way to cancel a pending watchFolder).
+    this.gitWatch = createWatchLoops({
+      watch: (root) => watchFolder(root),
+      onChange: (root) => {
+        const e = this.ctx.gitEntry();
+        if (this.ctx.current.machine == null && e?.top === root) this.ctx.markGitDirty();
+      },
+      sleep: (ms) => cx.sleep(ms),
+    });
     cx.timer.every(1000, (cx) => this.pump(cx));
     // Keep sub-agent activity statuses (store-based) fresh on screen.
     cx.timer.every(3000, (cx) => {
@@ -198,8 +214,7 @@ export default class RanchSession extends View {
     this.remembered.set(tabId, agent.address);
     this.filesOpen = false;
     this.loadTasks(cx);
-    this.git.dirty = true;
-    this.pr.dirty = true;
+    this.ctx.markGitDirty(); // the branch may change with the agent
     cx.notify();
   }
 
@@ -508,118 +523,59 @@ export default class RanchSession extends View {
   // ---- git --------------------------------------------------------------
 
   async refreshGit(cx) {
-    if (this.git.busy) {
-      this.git.dirty = true;
-      return;
-    }
-    const s = this.session();
-    if (!s.cwd) {
-      this.git = { key: null, summary: null, details: null, top: null, busy: false, dirty: false, at: Date.now(), readyKey: `${s.machine ?? ""}|` };
-      cx.notify();
-      return;
-    }
-    const key = `${s.machine ?? ""}|${s.cwd}`;
-    this.git.key = key;
-    this.git.busy = true;
-    this.git.dirty = false;
-    const git = (args) => exec("git", args, { cwd: s.cwd, on: s.machine, timeout: 10000 });
+    const op = this.ctx.beginGit();
+    if (!op) return;
+    const git = (args) => exec("git", args, { cwd: op.cwd, on: op.machine, timeout: 10000 });
+    let result;
     try {
-      const summary = await repoSummary(git);
-      const details = summary ? await repoDetails(git, summary.base, { commits: 5 }) : null;
-      if (this.git.key !== key) return; // session changed mid-flight; pump redoes it
-      this.git.summary = summary;
-      this.git.details = details;
-      this.git.top = summary?.top ?? null;
+      result = await repoSnapshot(git, {
+        commits: 5,
+        meta: this.gitMeta,
+        metaKey: op.machine ?? "",
+        now: Date.now(),
+      });
     } catch {
-      if (this.git.key !== key) return;
-      this.git.summary = null;
-      this.git.details = null;
-      this.git.top = null;
+      result = { status: "failed", summary: null, details: null };
     }
-    this.git.busy = false;
-    this.git.at = Date.now();
-    this.git.readyKey = key; // PR refresh waits for git to finish (I7)
+    // Filed under the context that started the read, even if the user moved on.
+    if (this.ctx.finishGit(op, result, Date.now())) this.syncGitWatch();
     cx.notify();
-    this.watchGit(cx);
   }
 
-  /** Local only: repo changes set a dirty flag the 1 s timer acts on. */
-  watchGit(cx) {
-    const gen = ++this.gitWatchGen;
-    const top = this.git.top;
-    if (!top || this.session().machine != null) return;
-    cx.spawn(async (cx) => {
-      while (this.gitWatchGen === gen) {
-        try {
-          await watchFolder(top);
-        } catch {
-          await cx.sleep(5000);
-          continue;
-        }
-        if (this.gitWatchGen !== gen) return;
-        this.git.dirty = true;
-        this.pr.dirty = true; // the branch may have changed too (I5)
-      }
-    });
+  /** Keeps exactly the current local repo's top watched. */
+  syncGitWatch() {
+    const e = this.ctx.gitEntry();
+    this.gitWatch.setWanted(this.ctx.current.machine == null && e?.top ? [e.top] : []);
   }
 
   async refreshPr(cx) {
-    if (this.pr.busy) {
-      this.pr.dirty = true;
-      return;
-    }
-    const s = this.session();
-    const branch = this.git.summary?.branch ?? null;
-    // No PR to look up on the default branch or without a known web host.
-    const noPr = branch && (branch === this.git.summary?.default || !this.git.summary?.host);
-    if (!s.cwd || !branch || noPr) {
-      this.pr = { key: null, parsed: null, busy: false, dirty: false, at: Date.now(), failed: false, error: null, readyFor: `${s.machine ?? ""}|${s.cwd ?? ""}` };
-      cx.notify();
-      return;
-    }
-    const key = `${s.machine ?? ""}|${s.cwd}|${branch}`;
-    this.pr.key = key;
-    this.pr.busy = true;
-    this.pr.dirty = false;
+    const op = this.ctx.beginPr();
+    if (!op) return;
     // First stderr line, for the quiet error note (I6).
     const stderrLine = (r) => (r.stderr ?? "").split("\n").map((l) => l.trim()).find(Boolean) ?? null;
+    const gh = (cmd, args) => exec(cmd, args, { cwd: op.cwd, on: op.machine, timeout: 15000 });
+    let res;
     try {
-      const gh = (cmd, args) => exec(cmd, args, { cwd: s.cwd, on: s.machine, timeout: 15000 });
-      const r = await runGh(gh, ["pr", "view", branch, "--json", PR_JSON_FIELDS]);
-      if (this.pr.key !== key) return;
+      const r = await ghLimit.run(() => runGh(gh, ["pr", "view", op.branch, "--json", PR_JSON_FIELDS]), { front: true });
       if (r.missing) {
-        this.pr.parsed = null;
-        this.pr.failed = "missing";
-        this.pr.error = null;
+        // gh's finishPr coerces failed to Boolean, so the missing note rides
+        // on `error` instead of a "missing" failed value.
+        res = { parsed: null, failed: true, error: "GitHub CLI not found" };
       } else if (r.code === 0) {
         try {
-          this.pr.parsed = parsePr(JSON.parse(r.stdout));
-          this.pr.failed = false;
-          this.pr.error = null;
+          res = { parsed: parsePr(JSON.parse(r.stdout)), failed: false, error: null };
         } catch {
-          this.pr.parsed = null;
-          this.pr.failed = true;
-          this.pr.error = stderrLine(r) ?? "gh pr view failed";
+          res = { parsed: null, failed: true, error: stderrLine(r) ?? "gh pr view failed" };
         }
       } else if (/no pull request/i.test(r.stderr ?? "")) {
-        this.pr.parsed = null; // no PR for this branch
-        this.pr.failed = false;
-        this.pr.error = null;
+        res = { parsed: null, failed: false, error: null }; // no PR for this branch
       } else {
-        this.pr.parsed = null;
-        this.pr.failed = true;
-        this.pr.error = stderrLine(r) ?? "gh pr view failed";
+        res = { parsed: null, failed: true, error: stderrLine(r) ?? "gh pr view failed" };
       }
     } catch {
-      if (this.pr.key !== key) return;
-      this.pr.parsed = null;
-      this.pr.failed = true;
-      this.pr.error = null;
+      res = { parsed: null, failed: true, error: null };
     }
-    this.pr.busy = false;
-    this.pr.at = Date.now();
-    this.pr.readyFor = `${s.machine ?? ""}|${s.cwd}`;
-    cx.notify();
+    if (this.ctx.finishPr(op, res, Date.now())) cx.notify();
   }
 
   /** The 1 s heartbeat: session changes, task re-reads and refresh cadence. */
@@ -630,16 +586,8 @@ export default class RanchSession extends View {
     const key = `${s.machine ?? ""}|${s.cwd ?? ""}`;
     if (key !== this.sessionKey) {
       this.sessionKey = key;
-      this.git.dirty = true;
-      this.pr.dirty = true;
-      // Stale PR from the previous folder: drop it and wait for the refresh
-      // gated on git below (I7).
-      this.pr.parsed = null;
-      this.pr.failed = false;
-      this.pr.error = null;
       this.filesOpen = false;
       this.ciOpen = null;
-      this.push = { busy: false, err: null };
       this.copyAt = 0;
       const tkey = s.chosen ? `${s.chosen.address}@${s.machine ?? ""}` : null;
       if (tkey !== this.tasks.key) this.loadTasks(cx);
@@ -653,7 +601,7 @@ export default class RanchSession extends View {
       this.subTasks.clear();
       this.filesOpen = false;
       this.ciOpen = null;
-      this.push = { busy: false, err: null };
+      if (!this.ctx.push.busy) this.ctx.push = { ...this.ctx.push, err: null, at: 0 };
       this.copyAt = 0;
     }
     // loadTasks guards itself (and takes over from a stalled read).
@@ -675,30 +623,26 @@ export default class RanchSession extends View {
       this.tasksReadAt = now;
       this.loadTasks(cx);
     }
+    // The context may have changed since the last pump (render can switch it
+    // earlier): make the schedule below act on the session being drawn.
+    if (this.ctx.select(s.machine, s.cwd)) this.syncGitWatch();
     // Git: immediately on change, then 30 s locally (watchFolder covers the
     // gaps) and refresh.remoteGitSec on another machine.
-    const gitEvery = s.machine != null ? Math.max(1, set.refresh.remoteGitSec) * 1000 : 30000;
-    if (!this.git.busy && (this.git.dirty || now - this.git.at >= gitEvery)) this.refreshGit(cx);
-    // PR: every refresh.prSec, sooner when the branch changed, 20 s while CI
-    // checks are pending (I5). Wait for git to finish for this folder so the
-    // branch it queries is current (I7).
-    const gitKey = `${s.machine ?? ""}|${s.cwd ?? ""}`;
-    const prKey = `${gitKey}|${this.git.summary?.branch ?? ""}`;
-    if (prKey !== this.pr.key) this.pr.dirty = true;
-    const pending = (this.pr.parsed?.checks?.pending ?? 0) > 0;
-    const prEvery = pending ? 20000 : Math.max(5, set.refresh.prSec) * 1000;
-    if (!this.pr.busy && this.git.readyKey === gitKey && (this.pr.dirty || now - this.pr.at >= prEvery)) {
-      this.refreshPr(cx);
-    }
+    if (this.ctx.shouldRefreshGit(now, this.gitEveryMs(s, set))) this.refreshGit(cx);
+    // PR: every refresh.prSec, 20 s while CI checks are pending (I5). The
+    // read always queries the current context's branch, so a branch change
+    // re-reads it (I7).
+    if (this.ctx.shouldRefreshPr(now, this.prEveryMs(set))) this.refreshPr(cx);
     // Recorded PRs ("Opened by this agent"): fetch each URL's real state and
     // title at the branch PR's cadence, one lookup per URL at a time.
     const recordedTtl = Math.max(5, set.refresh.prSec) * 1000; // not the 20 s CI-pending cadence
     if (recordedTtl !== this.recordedPrTtl) {
       this.recordedPrTtl = recordedTtl;
-      this.recordedPrCache = createTtlCache(recordedTtl);
+      this.recordedPrCache = createTtlCache(recordedTtl, { max: 100 });
     }
+    this.recordedPrCache.prune(now);
     if (s.cwd) {
-      for (const p of this.recordedPrs(s, this.pr.parsed)) {
+      for (const p of this.recordedPrs(s, this.ctx.prEntry()?.parsed ?? null)) {
         if (!this.recordedPrBusy.has(p.url) && this.recordedPrCache.get(p.url, now) === undefined) {
           this.lookupRecordedPr(cx, s, p.url);
         }
@@ -711,6 +655,17 @@ export default class RanchSession extends View {
     if (this.prRegistry.key !== regKey || this.prRegistry.dirty || now - this.prRegistry.at >= 3000) {
       this.loadPrRegistry(cx);
     }
+  }
+
+  /** Git re-read cadence: 30 s locally (watchFolder covers the gaps), refresh.remoteGitSec elsewhere. */
+  gitEveryMs(s, set) {
+    return s.machine != null ? Math.max(1, set.refresh.remoteGitSec) * 1000 : 30000;
+  }
+
+  /** PR re-read cadence: 20 s while CI checks are pending (I5), else refresh.prSec. */
+  prEveryMs(set) {
+    const pending = (this.ctx.prEntry()?.parsed?.checks?.pending ?? 0) > 0;
+    return pending ? 20000 : Math.max(5, set.refresh.prSec) * 1000;
   }
 
   /** One registry read (chosen machine's home), gated by loadPrRegistry. */
@@ -744,7 +699,8 @@ export default class RanchSession extends View {
     this.recordedPrBusy.add(url);
     try {
       const gh = (cmd, args) => exec(cmd, args, { cwd: s.cwd, on: s.machine, timeout: 15000 });
-      const r = await runGh(gh, ["pr", "view", url, "--json", PR_JSON_FIELDS]);
+      // Normal priority: the branch PR's lookup queues ahead of this (front).
+      const r = await ghLimit.run(() => runGh(gh, ["pr", "view", url, "--json", PR_JSON_FIELDS]));
       let parsed = null;
       if (r.code === 0) {
         try {
@@ -767,6 +723,9 @@ export default class RanchSession extends View {
     const t = theme();
     const set = resolveSettings(shared(SETTINGS_KEY));
     const s = this.session();
+    // render can run right after a tab switch, before the 1 s pump: make sure
+    // everything below reads the context being drawn.
+    this.ctx.select(s.machine, s.cwd);
     const root = v_flex()
       .id("ranch-session-root")
       .size_full()
@@ -790,7 +749,7 @@ export default class RanchSession extends View {
       root.child(div().text_size(12).text_color(t.dim).px(12).py(10).child("No agent in this tab"));
       if (set.session.git) {
         root.child(this.gitCard(t, s, set));
-        for (const node of this.prExtras(t, s)) root.child(node);
+        for (const node of this.prExtras(t, s, set)) root.child(node);
       }
       return root;
     }
@@ -805,21 +764,20 @@ export default class RanchSession extends View {
     }
     if (set.session.git) {
       root.child(this.gitCard(t, s, set));
-      for (const node of this.prExtras(t, s)) root.child(node);
+      for (const node of this.prExtras(t, s, set)) root.child(node);
     }
     return root;
   }
 
   /** The PR card plus the quiet failure notes under it (I3, I6). */
-  prExtras(t, s) {
+  prExtras(t, s, set) {
     const nodes = [];
-    const pr = this.prCard(t, s);
+    const pr = this.prCard(t, s, set);
     if (pr) nodes.push(pr);
-    if (this.pr.failed === "missing") {
-      nodes.push(div().text_size(12).text_color(t.dim).px(12).py(10).child("GitHub CLI not found"));
-    } else if (this.pr.failed === true) {
+    const pe = this.ctx.prReady() ? this.ctx.prEntry() : null;
+    if (pe?.failed) {
       // Only the first stderr line; the full output stays out of the panel.
-      nodes.push(div().text_size(12).text_color(t.dim).px(12).py(10).child(this.pr.error ?? "gh pr view failed"));
+      nodes.push(div().text_size(12).text_color(t.dim).px(12).py(10).child(pe.error ?? "gh pr view failed"));
     }
     return nodes;
   }
@@ -912,7 +870,7 @@ export default class RanchSession extends View {
    * copy branch, push and PR. Only known/possible actions show.
    */
   actionBar(t, s) {
-    const sum = this.gitReady(s) ? this.git.summary : null;
+    const sum = this.ctx.gitReady() ? this.ctx.gitEntry().summary : null;
     const top = sum?.top ?? s.cwd;
     const branch = sum?.branch ?? null;
     const lk = sum?.host ? links(sum.host) : null;
@@ -967,21 +925,22 @@ export default class RanchSession extends View {
     }
 
     if (branch && sum.host && branch !== sum.default) {
-      const pushed = this.pushAt && Date.now() - this.pushAt < 1500;
+      const pv = this.ctx.pushView();
+      const pushed = pv.at && Date.now() - pv.at < 1500;
       bar.child(
         this.actionBtn(
           t,
           "action-push",
           "mods/ranch-session/upload.svg",
-          this.push.busy ? "Pushing\u2026" : pushed ? "Pushed" : "Push",
+          pv.busy ? "Pushing\u2026" : pushed ? "Pushed" : "Push",
           "Push this branch to origin",
           (_e, cx) => this.pushBranch(cx),
-          this.push.busy
+          pv.busy || pv.blocked
         )
       );
     }
 
-    const pr = this.pr.parsed;
+    const pr = this.ctx.prReady() ? this.ctx.prEntry().parsed : null;
     if (pr?.url && pr.number != null) {
       bar.child(
         this.actionBtn(
@@ -1008,8 +967,9 @@ export default class RanchSession extends View {
 
     const wrap = v_flex().flex_none();
     wrap.child(bar);
-    if (this.push.err) {
-      wrap.child(div().text_size(11).text_color(t.blocked).truncate().child(this.push.err));
+    const pv = this.ctx.pushView();
+    if (pv.err) {
+      wrap.child(div().text_size(11).text_color(t.blocked).truncate().child(pv.err));
     }
     return wrap;
   }
@@ -1065,28 +1025,21 @@ export default class RanchSession extends View {
     });
   }
 
-  /** The Push action: push HEAD to origin, then refresh git and the PR. */
+  /** The Push action: push the branch the button showed, then refresh git+PR. */
   async pushBranch(cx) {
-    if (this.push.busy) return;
     const s = this.session();
-    const top = this.git.summary?.top;
-    if (!top) return;
-    this.push = { busy: true, err: null };
+    this.ctx.select(s.machine, s.cwd);
+    const op = this.ctx.beginPush(); // captures machine, top and branch once
+    if (!op) return;
     cx.notify();
+    let res;
     try {
-      const r = await exec("git", ["push", "-u", "origin", "HEAD"], { cwd: top, on: s.machine, timeout: 60000 });
-      if (r.code === 0) {
-        this.push = { busy: false, err: null };
-        this.pushAt = Date.now();
-        cx.timer.after(1500, (cx) => cx.notify());
-        this.refreshGit(cx);
-        this.pr.dirty = true; // the pump's PR path picks this up
-      } else {
-        this.push = { busy: false, err: (r.stderr ?? "").split("\n").find((l) => l.trim()) ?? "Push failed" };
-      }
+      const r = await exec("git", ["push", "-u", "origin", op.branch], { cwd: op.top, on: op.machine, timeout: 60000 });
+      res = r.code === 0 ? { ok: true } : { ok: false, err: (r.stderr ?? "").split("\n").find((l) => l.trim()) ?? "Push failed" };
     } catch {
-      this.push = { busy: false, err: "Push failed" };
+      res = { ok: false, err: "Push failed" };
     }
+    if (this.ctx.finishPush(op, res, Date.now()) && res.ok) cx.timer.after(1500, (cx) => cx.notify());
     cx.notify();
   }
 
@@ -1178,17 +1131,20 @@ export default class RanchSession extends View {
   // ---- git card ----------------------------------------------------------
 
   /**
-   * True once git has been read for this tab's folder. A tab change keeps the
-   * previous folder's summary until the new read lands (slow on Windows), so
-   * callers show "Refreshing…" instead of another repo's branch.
+   * True once git has been read for this tab's folder. The per-context cache
+   * (gitctx) answers for the context the tab is showing: a tab change keeps
+   * the previous folder's cached data on screen ("Updating…"), an unseen one
+   * shows "Refreshing…" instead of another repo's branch.
    */
   gitReady(s) {
-    return Boolean(s.cwd) && this.git.readyKey === `${s.machine ?? ""}|${s.cwd}`;
+    this.ctx.select(s.machine, s.cwd);
+    return this.ctx.gitReady();
   }
 
-  /** True once the PR lookup has finished for this tab's folder (after git). */
+  /** True once the PR lookup has finished for this tab's folder+branch. */
   prReady(s) {
-    return this.gitReady(s) && this.pr.readyFor === `${s.machine ?? ""}|${s.cwd}`;
+    this.ctx.select(s.machine, s.cwd);
+    return this.ctx.prReady();
   }
 
   /** True once the chosen agent's own store has been read (not the previous tab's). */
@@ -1204,14 +1160,38 @@ export default class RanchSession extends View {
       .child("Refreshing\u2026");
   }
 
+  /** The quieter badge for cached data that is being refreshed in place. */
+  updating(t) {
+    return h_flex().gap(5).items_center().flex_none().text_size(11).text_color(t.dim)
+      .child(svg("mods/ranch-session/spinner.svg").size(11).flex_none().text_color(t.working).spin(900))
+      .child("Updating\u2026");
+  }
+
+  /** Dim "as of 12s" badge: the data on screen is that old. */
+  asOf(t, label) {
+    return div().flex_none().text_size(11).text_color(t.dim).child(label);
+  }
+
   gitCard(t, s, set) {
     const card = this.cardShell(t);
     const ready = this.gitReady(s);
+    // Header badge: "Refreshing…" with nothing cached, "Updating…" over data
+    // being refreshed in place, "as of …" once it is older than the cadence.
+    const age = this.ctx.gitAge(Date.now());
+    const badge = !s.cwd
+      ? null
+      : !ready
+        ? this.refreshing(t)
+        : this.ctx.gitUpdating()
+          ? this.updating(t)
+          : age != null && age > this.gitEveryMs(s, set)
+            ? this.asOf(t, ageLabel(age))
+            : null;
     card.child(
       h_flex().gap(6).items_center().min_w(0)
         .child(this.cardTitle(t, "Git"))
         .child(div().flex_1().min_w(0))
-        .when(Boolean(s.cwd) && !ready, (el) => el.child(this.refreshing(t)))
+        .when(Boolean(badge), (el) => el.child(badge))
     );
     if (!s.cwd) {
       card.child(div().text_size(12).text_color(t.dim).child("—"));
@@ -1219,9 +1199,10 @@ export default class RanchSession extends View {
     }
     // Another folder's data would mislead: wait for this tab's read.
     if (!ready) return card;
-    const sum = this.git.summary;
+    const e = this.ctx.gitEntry();
+    const sum = e?.summary ?? null;
     if (!sum) {
-      card.child(div().text_size(12).text_color(t.dim).child("No git repo"));
+      card.child(div().text_size(12).text_color(t.dim).child(e?.failed ? "Git unavailable" : "No git repo"));
       return card;
     }
     const lk = sum.host ? links(sum.host) : null;
@@ -1305,7 +1286,7 @@ export default class RanchSession extends View {
     card.child(changes);
 
     if (this.filesOpen) {
-      const files = this.git.details?.files ?? [];
+      const files = e.details?.files ?? [];
       const shown = files.slice(0, MAX_FILES);
       for (const [i, f] of shown.entries()) {
         const fr = fileRow(f);
@@ -1349,7 +1330,7 @@ export default class RanchSession extends View {
 
     // Recent commits (R-SD-8), collapsed by default.
     if (set.session.commits) {
-      const commits = this.git.details?.commits ?? [];
+      const commits = e.details?.commits ?? [];
       card.child(
         h_flex()
           .id("commits-toggle")
@@ -1399,8 +1380,9 @@ export default class RanchSession extends View {
 
   // ---- pull request card -------------------------------------------------
 
-  prCard(t, s) {
-    if (s.cwd && !this.prReady(s)) {
+  prCard(t, s, set) {
+    const ready = this.prReady(s);
+    if (s.cwd && !ready) {
       return this.cardShell(t).child(
         h_flex().gap(6).items_center().min_w(0)
           .child(this.cardTitle(t, "Pull request"))
@@ -1408,10 +1390,11 @@ export default class RanchSession extends View {
           .child(this.refreshing(t))
       );
     }
-    const pr = this.pr.parsed;
+    const pe = ready ? this.ctx.prEntry() : null;
+    const pr = pe?.parsed ?? null;
     const extra = this.recordedPrs(s, pr);
     if (!pr && !extra.length) return null;
-    const sum = this.git.summary;
+    const sum = this.ctx.gitEntry()?.summary ?? null;
     const lk = sum?.host ? links(sum.host) : null;
     const url = pr ? (pr.url || (lk && pr.number ? lk.pr(pr.number) : null)) : null;
     const card = this.cardShell(t);
@@ -1419,6 +1402,14 @@ export default class RanchSession extends View {
     const head = h_flex().gap(6).items_center().min_w(0);
     head.child(this.cardTitle(t, "Pull request"));
     head.child(div().flex_1().min_w(0));
+    // Same badge rule as the git card, on the PR's own cadence.
+    const now = Date.now();
+    const badge = ready && this.ctx.prUpdating()
+      ? this.updating(t)
+      : pe && this.ctx.prs.has(this.ctx.prKey()) && now - pe.at > this.prEveryMs(set) // a real lookup, not the no-PR placeholder
+        ? this.asOf(t, ageLabel(now - pe.at))
+        : null;
+    if (badge) head.child(badge);
     if (pr) {
       // The PR's own state as the label (the token is only its colour), in
       // GitHub's colours: open green, draft grey, merged purple, closed red.
@@ -1446,7 +1437,6 @@ export default class RanchSession extends View {
         );
       card.child(title);
 
-      const now = Date.now();
       const byline = [];
       if (pr.author) byline.push(`by ${pr.author}`);
       if (pr.base) byline.push(`into ${pr.base}`);
@@ -1578,13 +1568,14 @@ export default class RanchSession extends View {
       }
     }
     // The shared registry (…): PRs any terminal's agent opened on this repo
-    // top + branch (refreshGit stores the top in this.git.top), merged with
+    // top + branch (the per-context git entry caches the top), merged with
     // the store records above, deduped, branch PR excluded. Registry records
     // for another repository (PR url vs this checkout's web host) are skipped.
-    const top = this.git.top ?? this.git.summary?.top ?? null;
-    const branch = this.git.summary?.branch ?? null;
+    const e = this.ctx.gitReady() ? this.ctx.gitEntry() : null;
+    const top = e?.top ?? e?.summary?.top ?? null;
+    const branch = e?.summary?.branch ?? null;
     if (top && branch) {
-      const checkoutRepo = repoOfWebBase(this.git.summary?.host?.base);
+      const checkoutRepo = repoOfWebBase(e?.summary?.host?.base);
       for (const p of prsFor(this.prRegistry.parsed, top, branch)) {
         if (!p?.url || !registryPrBelongs(p.url, checkoutRepo) || seenUrls.has(p.url)) continue;
         seenUrls.add(p.url);
@@ -1596,7 +1587,7 @@ export default class RanchSession extends View {
 
   /** The branch PR's URL (gh's, else built from the host and number). */
   branchPrUrl(pr) {
-    const host = this.git.summary?.host;
+    const host = this.ctx.gitEntry()?.summary?.host;
     return pr?.url || (host && pr?.number ? links(host).pr(pr.number) : null);
   }
 

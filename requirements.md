@@ -346,7 +346,7 @@ The current in-progress task is **not** a name source, because it changes too of
 
 ## 10. Non-functional
 
-- **Performance:** with 30 tabs over 3 machines, the sidebar stays smooth. At most one git process per repo in flight, and at most 4 `gh` calls at once. Hidden copies keep their timers, so poll gently.
+- **Performance:** with 30 tabs over 3 machines, the sidebar stays smooth. At most one git read per repo per view in flight; one read runs its independent git calls in small parallel rounds (never more than 4 processes at once). At most 4 `gh` calls at once: the sidebar's limit is 3 and the Session panel's is 1, each shared by every copy of that mod's view. Hidden copies keep their timers, so poll gently.
 - **Themes:** only `theme()` tokens, never hex. Check in `graphite` (dark) and `paper` (light).
 - **Keyboard:** every action reachable by key or palette. The sidebar and panel are `focusable: true` for `pane.go`.
 - **Errors:** a failed git or `gh` call shows an inline dim "—" with a tooltip, never a toast storm. `herdr-app status` shows no mod errors.

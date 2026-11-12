@@ -13,7 +13,10 @@ import {
   normalizeCollapsed, topOfFresh, cardRows,
 } from "./model.js";
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent } from "./lib/format.js";
-import { repoSummary, parsePr, createTtlCache, runGh, PR_JSON_FIELDS } from "./lib/git.js";
+import {
+  repoSummary, parsePr, createTtlCache, createLimiter, runGh, PR_JSON_FIELDS,
+} from "./lib/git.js";
+import { createWatchLoops } from "./lib/watch.js";
 import { homeCache } from "./lib/home.js";
 import { SETTINGS_KEY, FILTER_KEY, resolveSettings } from "./lib/settings.js";
 import { PRS_FILE, parsePrRegistry, prsFor, registryPrBelongs, repoOfWebBase, samePr } from "./lib/prs.js";
@@ -22,6 +25,11 @@ import { TabNamer, ACTIVITY_KEY } from "./namer.js";
 
 const ICON = (name) => `mods/ranch-sidebar/${name}.svg`;
 const COLLAPSE_KEY = "collapsed";
+// The sidebar's share of the 4-gh budget (requirements §Performance: sidebar 3
+// + session 1); module-level so every copy of this view in the mod shares one
+// limit.
+const ghLimit = createLimiter(3);
+const GIT_META_TTL_MS = 600000;
 
 export default class RanchSidebar extends View {
   init(_props, cx) {
@@ -44,17 +52,28 @@ export default class RanchSidebar extends View {
     this.topOf = new Map();
     this.pendingRepos = new Map(); // key -> {machine, cwd}, drained off-render
     this.busy = new Set();
-    this.watching = new Set();
+    // One watch loop per repo root, however often it is dropped and re-added
+    // (a pending watchFolder cannot be cancelled).
+    this.repoWatch = createWatchLoops({
+      watch: (top) => watchFolder(top),
+      onChange: async (top) => {
+        // Debounce: agents write many files in a burst; refresh once it settles.
+        await cx.sleep(1000);
+        await this.refreshRepo(null, top, cx);
+      },
+      sleep: (ms) => cx.sleep(ms),
+    });
     this.wanted = new Set(); // repo keys the current render still needs
 
     // PRs: TTL cache keyed `${machine}|${top}|${branch}`; render rebuilds the
-    // queue, drain() pumps it four at a time.
-    this.prCache = createTtlCache(120_000);
+    // queue, drain() pumps it through the shared gh limiter.
+    this.prCache = createTtlCache(120_000, { max: 500 });
     this.prSec = null;
     this.prQueue = [];
-    this.prPumping = false;
     this.prBusy = new Set();
     this.healthAt = 0;
+    // Default branch + remote URL per repo, refreshed every 10 min.
+    this.gitMeta = createTtlCache(GIT_META_TTL_MS, { max: 100 });
     // Recorded PRs (shared registry, …): `~/.herdr/ranch/prs.json` read per
     // machine (cached, refreshed on the sweep tick); remote home dirs come
     // from lib/home.js (sh, then cmd.exe; failed lookups back off).
@@ -126,37 +145,21 @@ export default class RanchSidebar extends View {
     if (this.busy.has(busyKey)) return;
     this.busy.add(busyKey);
     try {
-      const summary = await repoSummary(this.gitCmd(machine, cwd));
+      const summary = await repoSummary(this.gitCmd(machine, cwd), {
+        meta: this.gitMeta, metaKey: machine ?? "", now: Date.now(),
+      });
       // One entry shape for both outcomes: null top = no repository found
       // (timeout, unreachable machine or plain not-a-repo); trusted only
       // inside the TOP_OF_RETRY_MS window (model.js topOfFresh).
       this.topOf.set(`${machine ?? ""}|${cwd}`, { top: summary?.top ?? null, at: Date.now() });
       if (summary) {
         this.repos.set(`${machine ?? ""}|${summary.top}`, { summary, at: Date.now() });
-        if (!machine) this.watchRepo(summary.top, cx);
+        if (!machine) this.repoWatch.add(summary.top);
       }
     } finally {
       this.busy.delete(busyKey);
     }
     cx.notify();
-  }
-
-  watchRepo(top, cx) {
-    if (this.watching.has(top)) return;
-    this.watching.add(top);
-    cx.spawn(async (cx) => {
-      try {
-        for (;;) {
-          await watchFolder(top);
-          if (!this.watching.has(top)) break;
-          // Debounce: agents write many files in a burst; refresh once it settles.
-          await new Promise((resolve) => cx.timer.after(1000, () => resolve()));
-          await this.refreshRepo(null, top, cx);
-        }
-      } catch {
-        this.watching.delete(top);
-      }
-    });
   }
 
   sweep(cx) {
@@ -166,6 +169,14 @@ export default class RanchSidebar extends View {
     for (const [key, entry] of [...this.repos]) {
       if (!this.wanted.has(key)) {
         this.repos.delete(key);
+        // Drop positive topOf mappings for this top on the same machine (the
+        // null "known not a repo" values stay).
+        const i = key.indexOf("|");
+        const prefix = key.slice(0, i + 1);
+        const top = key.slice(i + 1);
+        for (const [tk, t] of [...this.topOf]) {
+          if (tk.startsWith(prefix) && t?.top === top) this.topOf.delete(tk);
+        }
         continue;
       }
       if (!entry?.summary) continue;
@@ -174,16 +185,15 @@ export default class RanchSidebar extends View {
       const due = now - entry.at > (machine ? remoteMs : 30_000);
       if (due) this.refreshRepo(machine, key.slice(i + 1), cx);
     }
-    for (const top of [...this.watching]) {
-      if (!this.wanted.has(`|${top}`)) this.watching.delete(top);
+    for (const top of this.repoWatch.wanted()) {
+      if (!this.wanted.has(`|${top}`)) this.repoWatch.remove(top);
     }
+    this.prCache.prune(now);
   }
 
   // ---- pull requests ----
 
   async fetchPr(job, cx) {
-    if (this.prBusy.has(job.key)) return;
-    this.prBusy.add(job.key);
     try {
       const r = await runGh(
         (bin, args) => exec(bin, args, { cwd: job.cwd, on: job.machine, timeout: 15_000 }),
@@ -287,18 +297,15 @@ export default class RanchSidebar extends View {
         });
       }
     }
-    if (this.prQueue.length && !this.prPumping) {
-      this.prPumping = true;
-      cx.spawn(async (cx) => {
-        try {
-          while (this.prQueue.length) {
-            const batch = this.prQueue.splice(0, 4);
-            await Promise.all(batch.map((job) => this.fetchPr(job, cx)));
-          }
-        } finally {
-          this.prPumping = false;
-        }
-      });
+    if (this.prQueue.length) {
+      const jobs = this.prQueue;
+      this.prQueue = [];
+      for (const job of jobs) {
+        if (this.prBusy.has(job.key)) continue;
+        // Claim the key before queueing so render does not queue it again.
+        this.prBusy.add(job.key);
+        ghLimit.run(() => this.fetchPr(job, cx)).catch(() => {});
+      }
     }
   }
 
@@ -1018,7 +1025,7 @@ export default class RanchSidebar extends View {
     this.settings = s;
     if (this.prSec !== s.refresh.prSec) {
       this.prSec = s.refresh.prSec;
-      this.prCache = createTtlCache(s.refresh.prSec * 1000);
+      this.prCache = createTtlCache(s.refresh.prSec * 1000, { max: 500 });
     }
     const filter = shared(FILTER_KEY) ?? null;
     const tree = buildTree({
