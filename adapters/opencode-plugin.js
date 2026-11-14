@@ -73,12 +73,23 @@ function terminalStartedAt(terminal) {
 // is whichever terminal first started the service, long since stale. There
 // the terminal is resolved per session from Herdr's live terminals.
 
+/**
+ * True when these process args are the shared server: `serve` without
+ * `--stdio`. A `serve --stdio` child is a per-TUI process whose
+ * HC_TERMINAL_ID is that TUI's terminal; only `serve` without --stdio
+ * (e.g. `serve --service`) is shared.
+ */
+export function isSharedServerArgv(argv) {
+  const args = Array.isArray(argv) ? argv.slice(1) : [];
+  return args.includes("serve") && !args.includes("--stdio");
+}
+
 /** True when this plugin runs in the shared OpenCode server process. */
 function sharedServer() {
   const forced = process.env.RANCH_OPENCODE_SHARED;
   if (forced === "1") return true;
   if (forced === "0") return false;
-  return process.argv.slice(1).includes("serve");
+  return isSharedServerArgv(process.argv);
 }
 
 // session id -> { terminal, at }: a resolved binding, re-checked after TTL.
@@ -120,6 +131,14 @@ function tuiSessionTitle(terminal) {
   if (typeof title !== "string") return null;
   const match = /^OC\s*\|\s*(.+)$/.exec(title.trim());
   return match ? match[1].trim() : null;
+}
+
+/** True when this terminal's TUI title is the session's title (it shows it). */
+function titleShowsSession(terminal, sid, event) {
+  const title = sid ? sessionTitle(sid, event) : null;
+  if (!title) return false;
+  const shown = tuiSessionTitle(terminal);
+  return Boolean(shown) && shown.trim().toLowerCase() === title.trim().toLowerCase();
 }
 
 /**
@@ -430,6 +449,46 @@ function fingerprint(tasks) {
   return JSON.stringify((Array.isArray(tasks) ? tasks : []).map((t) => [t.id, t.status, t.title]));
 }
 
+// Mirrors lib/tasks.js capTasks; keep in sync (the plugin is installed
+// standalone and cannot import lib/). Never drops in_progress tasks.
+export function capTasks(tasks, max = 50) {
+  if (!Array.isArray(tasks)) return tasks;
+  if (tasks.length <= max) return tasks;
+  const keep = [...tasks];
+  for (const status of ["completed", "cancelled", "pending"]) {
+    for (let i = 0; i < keep.length && keep.length > max; ) {
+      if (keep[i].status === status) keep.splice(i, 1);
+      else i += 1;
+    }
+    if (keep.length <= max) break;
+  }
+  return keep;
+}
+
+const SESSION_INDEX_MAX = 20;
+
+/** One sanitized { id, title, at } session-index entry, or null when malformed. */
+function sessionIndexEntry(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v) || typeof v.id !== "string" || !v.id) return null;
+  return {
+    id: v.id,
+    title: typeof v.title === "string" ? v.title : null,
+    at: typeof v.at === "string" ? v.at : null,
+  };
+}
+
+// Mirrors lib/tasks.js mergeSessionIndex; keep in sync (the plugin is
+// installed standalone and cannot import lib/).
+function mergeSessionIndex(list, entry, max = SESSION_INDEX_MAX) {
+  const items = (Array.isArray(list) ? list : []).map(sessionIndexEntry).filter(Boolean);
+  const limit = Number.isInteger(max) && max >= 0 ? max : SESSION_INDEX_MAX;
+  const next = sessionIndexEntry(entry);
+  if (!next) return items.slice(0, limit);
+  const old = items.find((v) => v.id === next.id);
+  if (next.title == null && old?.title != null) next.title = old.title;
+  return [next, ...items.filter((v) => v.id !== next.id)].slice(0, limit);
+}
+
 export function reduceOpencode(store, event) {
   const next = reduceOpencodeCore(store, event);
   const state = opencodeActivity(next ?? store, event);
@@ -540,6 +599,19 @@ function reduceOpencodeCore(store, event) {
       }
       next.session = session;
     }
+    return next;
+  }
+
+  if (type === "tui.session.select") {
+    // The TUI switched sessions: what is on screen now owns the store. A
+    // session Ranch has never recorded starts completely fresh; the one
+    // already in the store changes nothing here (no write, no seq bump).
+    if (typeof props.sessionID !== "string" || !props.sessionID
+      || props.sessionID === store.session?.id) return store;
+    next.tasks = [];
+    next.subagents = [];
+    next.missed_turns = 0;
+    next.session = { id: props.sessionID, title: null, title_source: null, first_prompt: null, state: "running" };
     return next;
   }
 
@@ -716,10 +788,12 @@ function recordUnderTerminalLock(event, terminal, tPath) {
     const knownSubagent = Array.isArray(loaded.subagents) && loaded.subagents.some((s) => s.id === incomingMain);
     // An event whose main session id differs from the loaded store's belongs
     // to the incoming session (resume in a new terminal, /clear, a newly
-    // created session). Events that merely mention another session for
-    // activity/todo purposes keep today's reducer semantics: they switch
-    // stores only when the incoming session already has a store on disk, or
-    // when no main session is known yet, or when the event defines a new one.
+    // created session, a TUI session switch). Events that merely mention
+    // another session for activity/todo purposes keep today's reducer
+    // semantics: they switch stores only when the incoming session already
+    // has a store on disk, or when no main session is known yet, or when the
+    // event defines a new one. A prompt typed for it or a TUI title showing it
+    // also means this terminal now displays the incoming session.
     const incomingPath = incomingMain ? sessionPath(incomingMain) : null;
     const switchNeeded = Boolean(
       incomingPath &&
@@ -728,7 +802,10 @@ function recordUnderTerminalLock(event, terminal, tPath) {
       (existsSync(incomingPath) ||
         !loadedId ||
         event?.type === "session.created" ||
-        (event?.type === "session.updated" && loaded.session?.state === "ended")),
+        event?.type === "tui.session.select" ||
+        event?.type === "chat.message" ||
+        (event?.type === "session.updated" && loaded.session?.state === "ended") ||
+        titleShowsSession(terminal, incomingMain, event)),
     );
 
     if (switchNeeded) {
@@ -757,8 +834,10 @@ function recordUnderTerminalLock(event, terminal, tPath) {
     const adopted = adoptSession(loaded, event);
     const next = reduceOpencode(adopted, event);
     // Nothing changed: no write, and never rebind the pointer for an event
-    // the reducer ignored.
-    if (next === adopted && adopted === loaded) return true;
+    // the reducer ignored — except a TUI session switch, whose whole job is
+    // to re-point the terminal even when the selected store needs no edit.
+    if (next === adopted && adopted === loaded
+      && !(switchNeeded && event?.type === "tui.session.select")) return true;
 
     // Identity (§3.3): schema 2, monotonic seq, this agent run.
     const updated = { ...next };
@@ -775,6 +854,8 @@ function recordUnderTerminalLock(event, terminal, tPath) {
     updated.terminal_started_at = (ownPointer ? pointerStarted : loaded.terminal_started_at)
       ?? terminalStartedAt(terminal) ?? new Date().toISOString();
     updated.updated_at = new Date().toISOString();
+    // Cap the task list before the (single) store write, like store.js does.
+    if (Array.isArray(updated.tasks)) updated.tasks = capTasks(updated.tasks);
     if (sid) {
       // The incoming session's file, written under its own lock, so the
       // pointer below matches after a session change. Never write a session
@@ -794,6 +875,7 @@ function recordUnderTerminalLock(event, terminal, tPath) {
         terminal_started_at: updated.terminal_started_at,
         agent: updated.agent,
         session: sid,
+        sessions: mergeSessionIndex(raw?.sessions, { id: sid, title: updated.session?.title ?? null, at: updated.updated_at }),
         updated_at: updated.updated_at,
       });
     } else {
@@ -884,6 +966,9 @@ export function normalizeV2(event) {
       return { type, properties: { sessionID: sid } };
     case "session.status":
       return { type, properties: { sessionID: sid, status: raw.status } };
+    case "tui.session.select":
+      // The TUI navigated to a session: the terminal's store must follow it.
+      return sid ? { type, properties: { sessionID: sid } } : null;
     case "todo.updated": {
       // Bus todo updates (v2): the tool hook already records the tool-based
       // path; this catches session-scoped todo events.

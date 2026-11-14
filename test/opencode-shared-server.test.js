@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RanchTasks } from "../adapters/opencode-plugin.js";
+import { isSharedServerArgv, RanchTasks } from "../adapters/opencode-plugin.js";
 
 function withEnv(t, vars) {
   const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
@@ -125,6 +125,86 @@ test("shared server: an ambiguous session is skipped rather than written to the 
   assert.equal(JSON.parse(readFileSync(pointer(home, "t8a"), "utf8")).session, "ses_a8");
   assert.equal(JSON.parse(readFileSync(pointer(home, "t8b"), "utf8")).session, "ses_b8");
   assert.equal(existsSync(pointer(home, "stale")), false);
+});
+
+test("shared server: a tui.session.select for an ambiguous session is skipped", async (t) => {
+  const home = setup(t, [
+    { address: "t10a", agent: "opencode", title: "OC | A" },
+    { address: "t10b", agent: "opencode", title: "OC | B" },
+  ]);
+  writePointer(home, "t10a", "ses_a10");
+  writePointer(home, "t10b", "ses_b10");
+  // The selected session matches no pointer, no title and no unbound
+  // terminal: resolveSharedTerminal returns null and nothing is written.
+  const plugin = await RanchTasks({});
+  await plugin.event({ event: { type: "tui.session.select", properties: { sessionID: "ses_amb10" } } });
+  assert.equal(existsSync(sessionStore(home, "ses_amb10")), false);
+  assert.equal(JSON.parse(readFileSync(pointer(home, "t10a"), "utf8")).session, "ses_a10");
+  assert.equal(JSON.parse(readFileSync(pointer(home, "t10b"), "utf8")).session, "ses_b10");
+  assert.equal(existsSync(pointer(home, "stale")), false);
+});
+
+test("isSharedServerArgv: only `serve` without --stdio is the shared server", () => {
+  assert.equal(isSharedServerArgv(["node", "opencode", "serve", "--service"]), true);
+  assert.equal(isSharedServerArgv(["x", "serve", "--stdio", "--port", "0"]), false);
+  assert.equal(isSharedServerArgv(["x", "--standalone"]), false);
+  assert.equal(isSharedServerArgv(["x", "serve"]), true);
+});
+
+test("shared server: a later title update re-points the terminal showing that title", async (t) => {
+  const home = setup(t, [
+    { address: "t12a", agent: "opencode", title: "OC | Old work" },
+    { address: "t12b", agent: "opencode", title: "OC | Fresh topic" },
+  ]);
+  writePointer(home, "t12a", "ses_old12a");
+  writePointer(home, "t12b", "ses_old12b");
+  mkdirSync(join(tasksDir(home), "sessions"), { recursive: true });
+  writeFileSync(sessionStore(home, "ses_old12b"), JSON.stringify({
+    version: 2, terminal: "t12b", agent: { app: "opencode", session: "ses_old12b" }, seq: 1,
+    session: { id: "ses_old12b", title: "Previous", state: "running" },
+    tasks: [{ id: "1", title: "kept", status: "pending", active_form: null }],
+  }));
+  const plugin = await RanchTasks({});
+  await plugin.event({
+    event: { type: "session.updated", properties: { info: { id: "ses_new12", title: "Fresh topic" } } },
+  });
+  assert.equal(JSON.parse(readFileSync(pointer(home, "t12b"), "utf8")).session, "ses_new12");
+  const fresh = JSON.parse(readFileSync(sessionStore(home, "ses_new12"), "utf8"));
+  assert.equal(fresh.terminal, "t12b");
+  assert.deepEqual(fresh.tasks, []);
+  const old = JSON.parse(readFileSync(sessionStore(home, "ses_old12b"), "utf8"));
+  assert.deepEqual(old.tasks.map((x) => x.title), ["kept"]);
+  assert.equal(JSON.parse(readFileSync(pointer(home, "t12a"), "utf8")).session, "ses_old12a");
+  await todo("ses_new12", ["landed"]);
+  assert.deepEqual(
+    JSON.parse(readFileSync(sessionStore(home, "ses_new12"), "utf8")).tasks.map((x) => x.title),
+    ["landed"],
+  );
+});
+
+test("non-shared TUI: a prompt for a new session re-points the terminal and resets its tasks", async (t) => {
+  const home = setup(t, []);
+  withEnv(t, { RANCH_OPENCODE_SHARED: "0", HC_TERMINAL_ID: "t13s" });
+  writePointer(home, "t13s", "ses_a13");
+  mkdirSync(join(tasksDir(home), "sessions"), { recursive: true });
+  writeFileSync(sessionStore(home, "ses_a13"), JSON.stringify({
+    version: 2, terminal: "t13s", agent: { app: "opencode", session: "ses_a13" }, seq: 2,
+    session: { id: "ses_a13", title: "A", state: "running" },
+    tasks: [{ id: "1", title: "old task", status: "pending", active_form: null }],
+  }));
+  const plugin = await RanchTasks({});
+  await plugin.event({ event: { type: "chat.message", properties: { sessionID: "ses_b13", text: "hi" } } });
+  assert.equal(JSON.parse(readFileSync(pointer(home, "t13s"), "utf8")).session, "ses_b13");
+  const fresh = JSON.parse(readFileSync(sessionStore(home, "ses_b13"), "utf8"));
+  assert.equal(fresh.terminal, "t13s");
+  assert.deepEqual(fresh.tasks, []);
+  const old = JSON.parse(readFileSync(sessionStore(home, "ses_a13"), "utf8"));
+  assert.deepEqual(old.tasks.map((x) => x.title), ["old task"]);
+  await todo("ses_b13", ["new task"]);
+  assert.deepEqual(
+    JSON.parse(readFileSync(sessionStore(home, "ses_b13"), "utf8")).tasks.map((x) => x.title),
+    ["new task"],
+  );
 });
 
 test("standalone TUI: HC_TERMINAL_ID is still used as is", async (t) => {

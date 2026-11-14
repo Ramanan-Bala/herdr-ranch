@@ -10,7 +10,7 @@ import {
 } from "herdr";
 import {
   buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials, diffSquares,
-  normalizeCollapsed, topOfFresh, cardRows,
+  normalizeCollapsed, topOfFresh, cardRows, moveIndex,
 } from "./model.js";
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent, closeNeedsConfirm, closeConfirmProps } from "./lib/format.js";
 import {
@@ -40,6 +40,12 @@ export default class RanchSidebar extends View {
     this.hoveredSpace = null; // pointer-hovered space id (drives plus/sparkle)
     this.order = []; // visible card tab ids, display order
     this.cardById = new Map();
+    // Drag to reorder: { kind: "space"|"card", id, machine|spaceId, startY,
+    // active, over, place } — active after the pointer moved >4px, over/place
+    // name the hovered target row and which side of it. Order itself lives
+    // in Herdr (space.move / tab.move); nothing is saved locally.
+    this.drag = null;
+    this.dragJustEnded = 0; // swallow the click GPUI fires on drag mouse-up
     this.settings = resolveSettings(shared(SETTINGS_KEY));
 
     // Folding: { m: {machineKey: bool}, s: {spaceId: bool}, w: {worktreeSpaceId: bool},
@@ -312,6 +318,11 @@ export default class RanchSidebar extends View {
   // ---- keyboard ----
 
   onKey(e, cx) {
+    if (e.key === "escape" && this.drag) {
+      this.drag = null; // cancel without moving anything
+      cx.notify();
+      return;
+    }
     if (e.key === "down" || e.key === "up" || e.key === "j" || e.key === "k") {
       if (!this.order.length) return;
       const down = e.key === "down" || e.key === "j";
@@ -366,6 +377,82 @@ export default class RanchSidebar extends View {
     if (platform === "macos") exec("open", [url]);
     else if (platform === "windows") exec("cmd", ["/c", "start", "", url]);
     else exec("xdg-open", [url]);
+  }
+
+  // ---- drag to reorder ----
+
+  /** True within 300ms of an active drag ending: swallow the click GPUI
+   * fires on mouse-up, so a drop does not also select or fold the row. */
+  clickSuppressed() {
+    return Date.now() - this.dragJustEnded < 300;
+  }
+
+  // Mouse-down on a draggable row (top-level space row, non-settled card):
+  // remember the press. A press that never moves more than 4px is still the
+  // plain click it always was (the row's on_click runs as before).
+  dragStart(kind, id, e, extra) {
+    this.drag = { kind, id, startY: e.position.y, active: false, over: null, place: "before", ...extra };
+  }
+
+  // Mouse-move on a draggable row: the pointer hovers it. Becomes a drag
+  // past the threshold; only valid targets count (a space stays inside its
+  // machine's block, a card inside its space's non-settled cards). The
+  // dragged row itself never becomes its own target.
+  dragMove(kind, rowId, isValid, e, cx) {
+    const d = this.drag;
+    if (!d || d.kind !== kind) return;
+    if (!d.active) {
+      if (Math.abs(e.position.y - d.startY) <= 4) return;
+      d.active = true; // past the click threshold: this is a drag now
+      cx.notify();
+    }
+    if (rowId === d.id || !isValid) return;
+    const bounds = e.bounds;
+    const localY = e.local_position?.y ?? (bounds ? e.position.y - bounds.y : 0);
+    const place = localY < (bounds?.height ?? 0) / 2 ? "before" : "after";
+    if (d.over !== rowId || d.place !== place) {
+      d.over = rowId;
+      d.place = place;
+      cx.notify();
+    }
+  }
+
+  // Mouse-up on a draggable row: end the drag. When it was active and landed
+  // on a different row, ask Herdr to move it (positions are 1-based over the
+  // full Herdr list; errors are ignored, Herdr owns the order).
+  dragEnd(cx) {
+    const d = this.drag;
+    if (!d) return;
+    this.drag = null;
+    if (!d.active) return;
+    this.dragJustEnded = Date.now();
+    if (d.over != null && d.over !== d.id) {
+      let ids = [];
+      if (d.kind === "space") {
+        ids = spaces().filter((s) => s.machine === d.machine).map((s) => s.id);
+      } else {
+        const sp = spaces().find((s) => s.id === d.spaceId);
+        ids = sp?.tabs.map((tb) => tb.id) ?? [];
+      }
+      const index = moveIndex(ids, d.id, d.over, d.place);
+      if (index != null) {
+        try {
+          run(d.kind === "space" ? "space.move" : "tab.move", { id: d.id, index });
+        } catch {}
+      }
+    }
+    cx.notify();
+  }
+
+  /** The 2px accent drop line at the top (before) or bottom (after) of the
+   * hovered target row, or null when that row is not the hovered target. */
+  dropLine(id) {
+    const d = this.drag;
+    if (!d?.active || d.over !== id) return null;
+    const t = theme();
+    return div().absolute().left(0).right(0).h(2).rounded(1).bg(t.accent)
+      .when(d.place === "before", (e) => e.top(0))
+      .when(d.place === "after", (e) => e.bottom(0));
   }
 
   // ---- render helpers ----
@@ -484,6 +571,9 @@ export default class RanchSidebar extends View {
     const resolved = typeof custom === "string" ? (custom.startsWith("#") ? custom : t[custom]) : null;
     const tint = resolved ?? t[BADGE_COLORS[badgeColorIndex(sp.space)]] ?? t.muted;
     const tintBg = /^#[0-9a-f]{6}$/i.test(tint) ? `${tint}38` : t.hover;
+    // The machine the space belongs to: a drag stays inside it.
+    const machine = spaces().find((s) => s.id === sp.space)?.machine ?? null;
+    const line = this.dropLine(sp.space);
     const badge = div().flex_none().size(17).rounded(4).flex().items_center().justify_center()
       .bg(tintBg).text_size(8.5).font_bold().text_color(tint)
       .child(initials(sp.name) || "·");
@@ -494,8 +584,10 @@ export default class RanchSidebar extends View {
     const count = withWts
       ? withWts.reduce((n, x) => n + x.cards.length + x.settled.length, 0)
       : sp.cards.length + sp.settled.length;
-    return h_flex().id(`space-${sp.space}`).h(28).mt(10).flex_none().pl(10).pr(8).gap(8).items_center()
+    return h_flex().id(`space-${sp.space}`).relative().h(28).mt(10).flex_none().pl(10).pr(8).gap(8).items_center()
       .cursor_pointer().hover((s) => s.bg(t.hover)).tooltip(folded ? "Expand" : "Collapse")
+      .when(this.drag?.active && this.drag.id === sp.space, (e) => e.opacity(0.5))
+      .when(Boolean(line), (e) => e.child(line))
       .on_hover((isIn, cx) => {
         const next = isIn ? sp.space : null;
         if (this.hoveredSpace !== next) {
@@ -503,8 +595,16 @@ export default class RanchSidebar extends View {
           cx.notify();
         }
       })
-      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click((_e, cx) => this.toggleFold("s", sp.space, cx))
+      .on_mouse_down("left", (e, cx) => {
+        cx.stop_propagation(); // as before the drag support: the press stays on this row
+        this.dragStart("space", sp.space, e, { machine });
+      })
+      .on_mouse_move((e, cx) => this.dragMove("space", sp.space, machine === this.drag?.machine, e, cx))
+      .on_mouse_up("left", (_e, cx) => this.dragEnd(cx))
+      .on_click((_e, cx) => {
+        if (this.clickSuppressed()) return;
+        this.toggleFold("s", sp.space, cx);
+      })
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
         openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: sp.space } } });
@@ -769,6 +869,7 @@ export default class RanchSidebar extends View {
       branch,
       c.label,
     ].filter(Boolean).join("\n");
+    const line = this.dropLine(c.tabId);
 
     // Left bar = status: idle grey, working yellow, needs you red, done blue.
     // An agent pane whose status report was cleared still counts as idle.
@@ -791,8 +892,22 @@ export default class RanchSidebar extends View {
           cx.notify();
         }
       })
-      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click(() => this.selectCard(c))
+      // Only non-settled cards are drag sources/targets; settled cards keep
+      // their plain press behaviour.
+      .when(!settled, (e) => e
+        .when(Boolean(line), (el) => el.child(line))
+        .when(this.drag?.active && this.drag.id === c.tabId, (el) => el.opacity(0.5))
+        .on_mouse_down("left", (ev, ecx) => {
+          ecx.stop_propagation(); // as before the drag support: the press stays on this card
+          this.dragStart("card", c.tabId, ev, { spaceId: c.spaceId });
+        })
+        .on_mouse_move((ev, ecx) => this.dragMove("card", c.tabId, c.spaceId === this.drag?.spaceId, ev, ecx))
+        .on_mouse_up("left", (_ev, ecx) => this.dragEnd(ecx)))
+      .when(settled, (e) => e.on_mouse_down("left", (_ev, ecx) => ecx.stop_propagation()))
+      .on_click(() => {
+        if (this.clickSuppressed()) return;
+        this.selectCard(c);
+      })
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
         openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: c.tabId, space: c.spaceId } } });
@@ -1116,6 +1231,13 @@ export default class RanchSidebar extends View {
     return v_flex().id("root").size_full().min_h(0).bg(t.chrome)
       .track_focus(this.handle)
       .on_key_down((e, cx) => this.onKey(e, cx))
+      // Fallback end of a drag: released off any draggable row cancels it
+      // (mouse-up bubbles here after the rows; a row already nulled this.drag).
+      .on_mouse_up("left", (_e, cx) => {
+        if (!this.drag) return;
+        this.drag = null;
+        cx.notify();
+      })
       .on_size_change((size, cx) => {
         if (this.size === null || size.width !== this.size.width) {
           this.size = size;

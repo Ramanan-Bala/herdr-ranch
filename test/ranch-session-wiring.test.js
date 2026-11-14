@@ -156,7 +156,7 @@ function repoAnswers(top, branch, base = "b".repeat(40)) {
     ["git|merge-base HEAD origin/main", { code: 0, stdout: `${base}\n`, stderr: "" }],
     ["git|rev-list --left-right --count HEAD...origin/main", { code: 0, stdout: "2 0\n", stderr: "" }],
     [`git|diff --numstat -z ${base}`, { code: 0, stdout: "3\t1\tsrc/a.js\n", stderr: "" }],
-    [`git|log -n 5 --format=%H%x1f%h%x1f%s%x1f%an%x1f%at%x1e ${base}..HEAD`, { code: 0, stdout: "", stderr: "" }],
+    [`git|log -n 5 --format=%H%x1f%h%x1f%s%x1f%an%x1f%at%x1e`, { code: 0, stdout: "", stderr: "" }],
     [`gh|pr view ${branch} --json ${PR_JSON_FIELDS}`, { code: 0, stdout: JSON.stringify(PR_JSON), stderr: "" }],
   ];
 }

@@ -95,6 +95,19 @@ test("applyClaude TaskCreate picks the id from tool_response", () => {
     tool_input: { subject: "Alone" },
   });
   assert.equal(noId.tasks.at(-1).id, "1");
+
+  // After capping dropped the oldest tasks, length + 1 would repeat a kept
+  // id: the fallback is one past the highest numeric id instead.
+  const capped = { ...base, tasks: [
+    { id: "9", title: "a", status: "completed", active_form: null },
+    { id: "10", title: "b", status: "pending", active_form: null },
+  ] };
+  const next = applyClaude(capped, {
+    hook_event_name: "PostToolUse",
+    tool_name: "TaskCreate",
+    tool_input: { subject: "New" },
+  });
+  assert.equal(next.tasks.at(-1).id, "11");
 });
 
 test("applyClaude TaskUpdate changes, deletes and appends", () => {
@@ -771,6 +784,32 @@ test("updateStore writes atomically under RANCH_HOME", () => {
   }
 });
 
+test("updateStore caps a 60-task list to 50", () => {
+  const home = mkdtempSync(join(tmpdir(), "ranch-adapters-"));
+  process.env.RANCH_HOME = home;
+  process.env.HC_TERMINAL_ID = "t9";
+  try {
+    updateStore("codex", (store) => ({
+      ...store,
+      tasks: Array.from({ length: 60 }, (_, i) => ({
+        id: String(i), title: `t${i}`, status: i % 2 ? "completed" : "pending", active_form: null,
+      })),
+    }));
+    const path = terminalPath(home, "t9");
+    const disk = parseStore(readFileSync(path, "utf8"));
+    assert.equal(disk.ok, true);
+    assert.equal(disk.store.tasks.length, 50);
+    // The 10 oldest completed entries (odd ids 1..19) were dropped first.
+    assert.deepEqual(
+      disk.store.tasks.filter((t) => t.status === "completed" && Number(t.id) < 20).map((t) => t.id),
+      [],
+    );
+  } finally {
+    delete process.env.RANCH_HOME;
+    delete process.env.HC_TERMINAL_ID;
+  }
+});
+
 test("updateStore looks up terminal start time only when it is missing", (t) => {
   const home = tempHome();
   withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t-start" });
@@ -785,6 +824,44 @@ test("updateStore looks up terminal start time only when it is missing", (t) => 
   assert.equal(calls, 1, "the stored start time is reused on the second event");
   const disk = parseStore(readFileSync(terminalPath(home, "t-start"), "utf8"));
   assert.equal(disk.store.terminal_started_at, started);
+});
+
+test("a session switch indexes both sessions and a late old-session end changes nothing", (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t-index" });
+  const hook = (payload) => updateStore("claude", (store) => applyClaude(store, payload));
+  const pointerPath = terminalPath(home, "t-index");
+
+  hook({ hook_event_name: "SessionStart", session_id: "A", source: "startup" });
+  hook({
+    hook_event_name: "PostToolUse",
+    session_id: "A",
+    tool_name: "TaskCreate",
+    tool_input: { subject: "Task A" },
+    tool_response: "Task #1 created successfully",
+    transcript: `${JSON.stringify({ type: "ai-title", aiTitle: "Alpha" })}\n`,
+  });
+  assert.deepEqual(
+    JSON.parse(readFileSync(pointerPath, "utf8")).sessions.map(({ id, title }) => ({ id, title })),
+    [{ id: "A", title: "Alpha" }],
+  );
+
+  // /resume picks session B: the pointer indexes B first, A second with its title.
+  hook({ hook_event_name: "SessionStart", session_id: "B", source: "resume" });
+  const pointer = JSON.parse(readFileSync(pointerPath, "utf8"));
+  assert.equal(pointer.session, "B");
+  assert.deepEqual(pointer.sessions.map(({ id, title }) => ({ id, title })), [
+    { id: "B", title: null },
+    { id: "A", title: "Alpha" },
+  ]);
+
+  // A late SessionEnd from A must not re-point the terminal or end B.
+  hook({ hook_event_name: "SessionEnd", session_id: "A" });
+  const after = JSON.parse(readFileSync(pointerPath, "utf8"));
+  assert.equal(after.session, "B");
+  const b = parseStore(readFileSync(join(home, ".herdr", "ranch", "tasks", "sessions", "B.json"), "utf8"));
+  assert.equal(b.ok, true);
+  assert.equal(b.store.session.state, "running");
 });
 
 test("updateStore adopts legacy stores only for the same agent and session", (t) => {
@@ -1056,7 +1133,11 @@ test("hook events map to activity (status when Herdr shows none)", async () => {
   assert.equal(claudeActivity({ hook_event_name: "UserPromptSubmit" }), "working");
   assert.equal(claudeActivity({ hook_event_name: "PermissionRequest" }), "blocked");
   assert.equal(claudeActivity({ hook_event_name: "Notification", message: "Claude needs your permission to use Bash" }), "blocked");
-  assert.equal(claudeActivity({ hook_event_name: "Notification", message: "Claude is waiting for your input" }), "blocked");
+  // The idle reminder after a finished turn is not a question: Stop's "done" stands.
+  assert.equal(claudeActivity({ hook_event_name: "Notification", message: "Claude is waiting for your input" }), null);
+  assert.equal(claudeActivity({ hook_event_name: "Notification", notification_type: "idle_prompt", message: "Claude is waiting for your input" }), null);
+  assert.equal(claudeActivity({ hook_event_name: "Notification", notification_type: "permission_prompt", message: "Claude needs your permission to use Bash" }), "blocked");
+  assert.equal(claudeActivity({ hook_event_name: "Notification", notification_type: "elicitation_dialog", message: "An MCP server needs input" }), "blocked");
   assert.equal(claudeActivity({ hook_event_name: "Notification", message: "hello" }), null);
   assert.equal(claudeActivity({ hook_event_name: "Stop" }), "done");
   assert.equal(codexActivity({ hook_event_name: "PermissionRequest" }), "blocked");

@@ -9,7 +9,7 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { STORE_VERSION, agentApp, emptyStore, parseStore, storeFileName } from "../lib/tasks.js";
+import { STORE_VERSION, agentApp, capTasks, emptyStore, mergeSessionIndex, parseStore, storeFileName } from "../lib/tasks.js";
 import { PRS_FILE, addPr, parsePrRegistry } from "../lib/prs.js";
 
 // Mirrors lib/settings.js TASKS_DIR; lib/settings.js is not copied to the
@@ -380,6 +380,7 @@ function writeOnce(home, tPath, terminal, agent, fn, lookupStartedAt) {
 
     // Identity (§3.3): schema 2, this terminal, this agent run, monotonic
     // seq — incremented from the value read inside the held session lock.
+    if (Array.isArray(next.tasks)) next.tasks = capTasks(next.tasks);
     next.version = STORE_VERSION;
     next.terminal = terminal;
     const sid = incoming;
@@ -413,6 +414,7 @@ function writeOnce(home, tPath, terminal, agent, fn, lookupStartedAt) {
         terminal_started_at: next.terminal_started_at,
         agent: next.agent,
         session: sid,
+        sessions: mergeSessionIndex(raw?.sessions, { id: sid, title: next.session?.title ?? null, at: next.updated_at }),
         updated_at: next.updated_at,
       });
     } else {

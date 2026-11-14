@@ -276,6 +276,26 @@ export function normalizeCollapsed(parsed) {
 }
 
 /**
+ * The 1-based index for Herdr's `space.move` / `tab.move` after reordering
+ * `ids` (the full list in Herdr's order — for tabs that is every tab of the
+ * space, settled ones included, because move positions count the whole list)
+ * so `dragId` lands before or after `targetId`.
+ *
+ * @param {Array<string|number>} ids ids in Herdr's order
+ * @param {string|number} dragId the row being dragged
+ * @param {string|number} targetId the row it was dropped on
+ * @param {"before"|"after"} place which side of the target
+ * @returns {number|null} 1-based index, or null when either id is missing or
+ *   the two are the same (nothing to move).
+ */
+export function moveIndex(ids, dragId, targetId, place) {
+  if (ids.indexOf(dragId) === -1 || ids.indexOf(targetId) === -1 || dragId === targetId) return null;
+  const rest = ids.filter((id) => id !== dragId);
+  const pos = rest.indexOf(targetId) + (place === "after" ? 1 : 0);
+  return pos + 1;
+}
+
+/**
  * What the checkout row (line 3 of an ordinary card, grouped tab or
  * worktree row) shows (audit finding 19): diff statistics follow
  * `line3`, PR badges follow `pr` alone, and the row renders when either

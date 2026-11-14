@@ -27,6 +27,7 @@ const {
   activityStatus,
   nativeActivity,
   nativeActivityText,
+  activityLine,
   nativeFor,
   prStateToken,
   prStateLabel,
@@ -279,4 +280,15 @@ test("nativeFor matches terminal addresses exactly", () => {
   assert.equal(nativeFor(null, "t3"), null);
   assert.equal(nativeFor(undefined, "t3"), null);
   assert.equal(nativeFor(list, null), null);
+});
+
+test("activityLine uses the task list's percent when a list is shown (TODO 8)", () => {
+  // With a list: the list's percent replaces the terminal's own report.
+  assert.equal(activityLine({ progress: 90, msg: "Working" }, { done: 2, total: 4 }), "Working · 50%");
+  // No message: just the percent.
+  assert.equal(activityLine(null, { done: 4, total: 4 }), "100%");
+  assert.equal(activityLine({ progress: 90, msg: null }, { done: 0, total: 3 }), "0%");
+  // No list (total 0): Herdr's native text unchanged, or null.
+  assert.equal(activityLine({ progress: 90, msg: "Working" }, { done: 0, total: 0 }), "Working · 90%");
+  assert.equal(activityLine(null, { done: 0, total: 0 }), null);
 });

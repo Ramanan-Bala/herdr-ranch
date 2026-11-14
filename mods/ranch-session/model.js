@@ -76,6 +76,22 @@ export function nativeActivityText(a) {
 }
 
 /**
+ * The activity line under the Tasks header: Herdr's native message, but with
+ * the task list's own percent whenever the card shows a list (TODO 8) — the
+ * terminal's report does not match the checklist. With no message and a list,
+ * the line is just "NN%".
+ * @param {{progress: number|null, msg: string|null}|null} native nativeActivity() output
+ * @param {{done: number, total: number}} prog progress() output over the live tasks
+ * @returns {string|null}
+ */
+export function activityLine(native, prog) {
+  if (prog && prog.total > 0) {
+    return nativeActivityText({ msg: native?.msg ?? null, progress: Math.round((100 * prog.done) / prog.total) });
+  }
+  return nativeActivityText(native);
+}
+
+/**
  * The terminals() row for an exact address, or null (no prefix/substring
  * matching: "t3" must not match "mac/t3").
  * @param {Array<{address: string}>|null|undefined} list terminals() rows

@@ -289,7 +289,7 @@ test("repoSummary null outside a repo", async () => {
 test("repoDetails with base", async () => {
   const git = fakeGit({
     "diff --numstat -z base000": "3\t1\tsrc/a.js\u0000-\t-\timg.png\u0000",
-    "log -n 2 --format=%H%x1f%h%x1f%s%x1f%an%x1f%at%x1e base000..HEAD":
+    "log -n 2 --format=%H%x1f%h%x1f%s%x1f%an%x1f%at%x1e":
       "abc\x1fabc1\x1fFix\x1fAnn\x1f1700000000\x1e\n",
   });
   const details = await repoDetails(git, "base000", { commits: 2 });
@@ -627,7 +627,7 @@ const SNAP = {
   "merge-base HEAD origin/main": "b0\n",
   "rev-list --left-right --count HEAD...origin/main": "1\t2\n",
   "diff --numstat -z b0": "3\t1\ta.js\0-\t-\tb.png\0",
-  "log -n 5 --format=%H%x1f%h%x1f%s%x1f%an%x1f%at%x1e b0..HEAD":
+  "log -n 5 --format=%H%x1f%h%x1f%s%x1f%an%x1f%at%x1e":
     "abc\x1fabc1\x1fFix\x1fAnn\x1f1700000000\x1e\n",
 };
 
@@ -723,7 +723,7 @@ test("repoSnapshot unborn repo with no commits", async () => {
     "for-each-ref --format=%(refname)%09%(symref) refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master refs/heads/main refs/heads/master":
       "refs/heads/main\t\n",
     "merge-base HEAD main": "",
-    "log -n 5 --format=%H%x1f%h%x1f%s%x1f%an%x1f%at%x1e main..HEAD": "",
+    "log -n 5 --format=%H%x1f%h%x1f%s%x1f%an%x1f%at%x1e": "",
   });
   const r = await repoSnapshot(git);
   assert.equal(r.status, "ok");
