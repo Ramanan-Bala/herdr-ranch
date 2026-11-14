@@ -53,9 +53,9 @@ function blockedTarget() {
 }
 
 export default class RanchChrome extends View {
-  button(id, label, action) {
+  button(id, label, action, size = 26) {
     const t = theme();
-    return div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))
+    return div().id(id).size(size).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click(action).child(label);
   }
   render() {
@@ -86,13 +86,13 @@ export default class RanchChrome extends View {
       // One status chip; hidden when its count is 0. Blocked focuses the agent, the rest filter the tree.
       const chip = (status, color, pulse) => {
         const selected = status !== "blocked" && filter === status;
-        return h_flex().id(`status-${status}`).h(20).px(5).gap(5).items_center().rounded(6).flex_none()
+        return h_flex().id(`status-${status}`).h(18).px(5).gap(5).items_center().rounded(6).flex_none()
           .when(selected, el => el.bg(t.selected))
           .text_color(selected ? t.foreground : t.muted).hover(s => s.bg(t.hover)).cursor_pointer()
           .on_click(() => toggle(status))
           .child(dot(color, pulse))
           .child(`${counts[status]} ${status === "blocked" ? "needs you" : status}`);
-      // (chips are compact: the footer is a single 40px row)
+      // (chips are compact: the footer is a single 28px row)
       };
       // Wide footer: chips for whatever is busy (done included), else a quiet line.
       const busy = counts.blocked + counts.working > 0;
@@ -111,21 +111,21 @@ export default class RanchChrome extends View {
         counts.working ? badge("working", t.working) : null,
         counts.done ? badge("done", t.done) : null,
       ].filter(Boolean);
-      const quiet = h_flex().id("status-summary").h(24).px(8).gap(8).items_center()
+      const quiet = h_flex().id("status-summary").h(22).px(8).gap(8).items_center()
         .when(idleTip, el => el.tooltip(idleTip))
         .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child("Nothing needs you"))
         .when(counts.done > 0, el => el.child(chip("done", t.done, false)));
       const summary = collapsed
-        ? h_flex().id("status-summary").h(24).gap(6).items_center().justify_center()
+        ? h_flex().id("status-summary").h(22).gap(6).items_center().justify_center()
             .when(idleTip && !badges.length, el => el.tooltip(idleTip)).children(badges)
         : busy
-          ? h_flex().id("status-summary").h(24).px(8).gap(6).items_center()
+          ? h_flex().id("status-summary").h(22).px(8).gap(6).items_center()
               .when(idleTip, el => el.tooltip(idleTip)).children(chips)
           : quiet;
       // Tools: two icon buttons; the update-ready dot sits on the settings slot.
-      const tool = (id, icon, label, action) => this.button(id, svg(`mods/ranch-chrome/${icon}.svg`).size(14), action)
+      const tool = (id, icon, label, action) => this.button(id, svg(`mods/ranch-chrome/${icon}.svg`).size(14), action, 22)
         .tooltip(label);
-      const tools = h_flex().id("tools").h(28).flex_none().gap(6).items_center()
+      const tools = h_flex().id("tools").h_full().flex_none().gap(6).items_center()
         .when(collapsed, el => el.flex_1().justify_center())
         .child(tool("settings", "settings", "Settings", () => run("app.settings")).relative()
           .when(Boolean(updates().app.ready), el => el.child(
@@ -133,7 +133,7 @@ export default class RanchChrome extends View {
         .child(tool("machine", "plus", "Add machine", () => run("mod.open", { name: "machine-add" })));
       // One row like the reference: status text at left, two tool buttons at right.
       if (collapsed) {
-        // The rail shows per-space badges already; keep the 40px footer to the tools.
+        // The rail shows per-space badges already; keep the 28px footer to the tools.
         return h_flex().size_full().bg(t.chrome).border_t(1).border_color(t.border).items_center().justify_center().text_size(11)
           .child(tools);
       }
@@ -143,6 +143,7 @@ export default class RanchChrome extends View {
     }
     const macos = window()?.platform === "macos";
     return h_flex().size_full().bg(t.chrome).pl(collapsed ? 6 : 14).pr(10).gap(4).items_center().text_size(13.5)
+      .border_b(1).border_color(t.border)
       .when(macos && !window()?.fullscreen && !collapsed, el => el.pl(76))
       .when(!collapsed, el => el.child(h_flex().flex_1().gap(8).items_center()
         .child(image("mods/ranch-chrome/logo.svg").size(20))

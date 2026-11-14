@@ -16,6 +16,9 @@ export const FILTER_KEY = "ranch.filter";
 /** Where adapters write one JSON file per agent terminal, relative to the machine's home. */
 export const TASKS_DIR = ".herdr/ranch/tasks";
 
+/** Most launch buttons the top bar shows (settings caps the list here). */
+export const MAX_AGENTS = 4;
+
 /** Built-in defaults. */
 export const DEFAULTS = Object.freeze({
   // Program keys (programs.json / knownAgents()) shown as top-bar launch buttons, in order.
@@ -23,6 +26,8 @@ export const DEFAULTS = Object.freeze({
   agents: ["claude", "codex", "opencode", "terminal"],
   card: { time: true, line3: true, pr: true },
   session: { tasks: true, git: true, commits: true, subagents: true },
+  // Whether the agent usage bar shows in the status bar.
+  usage: { show: true },
   refresh: { remoteGitSec: 15, prSec: 120 },
   naming: { enabled: true, exitMode: "keep", followAgent: true, model: false, maxLen: 32 },
 });
@@ -45,7 +50,10 @@ function merge(base, over) {
 
 /** Settings with defaults filled in. `stored` is whatever shared(SETTINGS_KEY) returned. */
 export function resolveSettings(stored) {
-  return merge(DEFAULTS, stored);
+  const out = merge(DEFAULTS, stored);
+  // Launch buttons: no duplicates, at most MAX_AGENTS (older settings may hold more).
+  const agents = [...new Set(out.agents)].slice(0, MAX_AGENTS);
+  return agents.length === out.agents.length ? out : { ...out, agents };
 }
 
 /** Returns a new stored object with `path` ("naming.exitMode") set to `value`. */
