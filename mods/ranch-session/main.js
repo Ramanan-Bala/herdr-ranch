@@ -73,6 +73,7 @@ import {
   prRepoText,
 } from "./model.js";
 import { windowsHome } from "./win.js";
+import { EdgeGrip } from "./lib/edge-grip.js";
 
 const MAX_FILES = 20;
 
@@ -756,6 +757,15 @@ export default class RanchSession extends View {
   // ---- ui ---------------------------------------------------------------
 
   render(cx) {
+    // Left-edge drag strip on the panel column with a hover cue (lib/edge-grip.js).
+    this.grip ??= new EdgeGrip({
+      id: "panel", side: "left", min: 280, max: 640, div, theme, run,
+      width: () => this.grip.measured ?? 360,
+    });
+    return this.grip.wrap(this.renderBody(cx), theme().surface);
+  }
+
+  renderBody(cx) {
     const t = theme();
     const set = resolveSettings(shared(SETTINGS_KEY));
     const s = this.session();
@@ -923,8 +933,15 @@ export default class RanchSession extends View {
     return v_flex().flex_none().border_b(1).border_color(t.border).px(12).py(10).gap(5);
   }
 
+  /** A section label: small caps-style, quieter than the content under it. */
   cardTitle(t, text) {
-    return div().text_size(11.5).font_medium().text_color(t.muted).min_w(0).truncate().child(text);
+    return div().text_size(10.5).font_semibold().text_color(t.dim).min_w(0).truncate().child(String(text).toUpperCase());
+  }
+
+  /** A count beside a section label ("7/9"), in the content colour. */
+  countChip(t, text) {
+    return div().flex_none().h(16).px(5).rounded(4).flex().items_center().bg(t.hover)
+      .text_size(10.5).font_medium().text_color(t.muted).child(text);
   }
 
   /** A small tinted pill: "Open", "Approved", an agent's status word, … */
@@ -1594,15 +1611,8 @@ export default class RanchSession extends View {
     const label = isMain
       ? "Tasks"
       : `Tasks \u00b7 ${sub.name || sub.template || sub.program?.name || sub.address}`;
-    head.child(
-      div()
-        .text_size(11.5)
-        .font_medium()
-        .text_color(t.muted)
-        .min_w(0)
-        .truncate()
-        .child(prog.total ? `${label} ${prog.done}/${prog.total}` : label)
-    );
+    head.child(this.cardTitle(t, label));
+    if (prog.total) head.child(this.countChip(t, `${prog.done}/${prog.total}`));
     head.child(div().flex_1().min_w(0));
     if (refreshingNow) head.child(this.refreshing(t));
     if (status) head.child(this.pill(t, stateWord(status), status));

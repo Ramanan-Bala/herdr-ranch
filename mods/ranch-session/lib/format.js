@@ -144,6 +144,9 @@ export function folderLabel(path, home) {
 /** Hook activity older than this is treated as idle (a missed Stop event). */
 export const ACTIVITY_STALE_MS = 30 * 60 * 1000;
 
+/** A store sub-agent still "running" this long after it started is treated as gone. */
+export const SUBAGENT_STALE_MS = 2 * 60 * 60 * 1000;
+
 /**
  * Tabs across all spaces that need the person right now: effectiveStatus is
  * "blocked" or "done", and the tab isn't settled. Entries are
@@ -171,11 +174,43 @@ export function attentionQueue(spaceList, activity, now) {
 }
 
 /**
+ * Whether a tab still has a sub-agent working under its parent agent: a live
+ * terminal row parented to it that reports working/running/blocked, or a store
+ * sub-agent still running and started within SUBAGENT_STALE_MS. A finished-but-
+ * open child terminal reports done/idle, and a stale or unparseable started_at
+ * never pins a tab as working.
+ * @param {{terminals?: Array<{parent?: string, state?: string, status?: string|null}>|null, parent?: string|null, subagents?: Array<{status: string, started_at: string|null}>|null, now?: number}} args
+ * @returns {boolean}
+ */
+export function subagentsWorking({ terminals, parent, subagents, now } = {}) {
+  if (!parent) return false;
+  for (const k of terminals ?? []) {
+    if (k?.parent !== parent || k.state !== "live") continue;
+    if (["working", "running", "blocked"].includes(String(k.status ?? "").toLowerCase())) return true;
+  }
+  for (const s of subagents ?? []) {
+    if (s?.status !== "running" || !s.started_at) continue;
+    const started = Date.parse(s.started_at);
+    if (!Number.isNaN(started) && typeof now === "number" && now - started <= SUBAGENT_STALE_MS) return true;
+  }
+  return false;
+}
+
+/**
  * The status to show for a tab: Herdr's own status when it has one, else the
- * activity Ranch's hooks recorded ({ state, at }), else null.
+ * activity Ranch's hooks recorded ({ state, at }), else null. A sub-agent still
+ * working under the tab's agent (activity.subsWorking) shows "working" even
+ * when the parent has finished, unless the tab itself is blocked.
  * Returns { status, since } where since is ms elapsed (or null).
  */
 export function effectiveStatus(tab, activity, now) {
+  if (tab?.status === "blocked") return { status: "blocked", since: statusSince(tab, now) };
+  if (activity?.subsWorking === true) {
+    return {
+      status: "working",
+      since: tab?.status ? statusSince(tab, now) : (typeof activity.at === "number" ? now - activity.at : null),
+    };
+  }
   if (tab?.status) return { status: tab.status, since: statusSince(tab, now) };
   if (!activity?.state) return { status: null, since: null };
   const age = typeof activity.at === "number" ? now - activity.at : null;
@@ -197,6 +232,7 @@ export function closeNeedsConfirm({ tabId, tab, agents, panes, activity, now }) 
   const id = tab?.id ?? tabId;
   if (!id) return false;
   if ((agents ?? []).some((a) => a.tab === id && (a.status === "working" || a.status === "blocked"))) return true;
+  if (activity?.subsWorking === true) return true;
   if (tab?.status) return false;
   const { status } = effectiveStatus(tab ?? { status: null }, activity, now);
   if (status !== "working" && status !== "blocked") return false;

@@ -1,10 +1,11 @@
 import { View, div, image, svg } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
+import { Popover, v_flex, h_flex } from "gpui-base";
 import { theme, shared, setShared, run, exec, home, knownAgents, nextCommand, readTextFile, window as appWindow } from "herdr";
 import { runGh } from "./lib/git.js";
 import { relativeTime } from "./lib/format.js";
-import { SETTINGS_KEY, resolveSettings, withSetting } from "./lib/settings.js";
+import { SETTINGS_KEY, MAX_AGENTS, resolveSettings, withSetting } from "./lib/settings.js";
 import { tasksCommand } from "./lib/tasks-command.js";
+import { EdgeGrip } from "./lib/edge-grip.js";
 
 // Windows can't exec the POSIX sh launcher; it calls node on the .js entry.
 const isWin = () => appWindow()?.platform === "windows";
@@ -170,9 +171,13 @@ export default class RanchSettings extends View {
 
   // ---- render helpers ----
 
-  header(label) {
+  card(title, description, rows) {
     const t = theme();
-    return div().text_size(11).font_semibold().text_color(t.dim).child(label.toUpperCase());
+    return v_flex().flex_none().rounded(8).border_1().border_color(t.border).bg(t.background).p(12).gap(10)
+      .child(v_flex().gap(2)
+        .child(div().text_size(12.5).font_semibold().text_color(t.foreground).child(title))
+        .when(!!description, (e) => e.child(div().text_size(11).text_color(t.dim).child(description))))
+      .children(rows.flatMap((row, i) => (i === 0 ? [row] : [div().h(1).flex_none().bg(t.border), row])));
   }
 
   iconBtn(id, icon, action) {
@@ -189,15 +194,28 @@ export default class RanchSettings extends View {
     return div().id(id).flex_none().w(32).h(18).rounded(9).p(2).flex().items_center().border_1().border_color(t.border)
       .bg(on ? t.accent : t.input).cursor_pointer()
       .when(on, (e) => e.justify_end())
-      .on_click(() => toggle())
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        toggle();
+      })
       .child(div().size(12).rounded(9).bg(on ? t.accent_foreground : t.muted));
   }
 
-  switchRow(id, label, value, path) {
+  switchRow(id, label, value, path, hint = null, onChange = null) {
     const t = theme();
-    return h_flex().flex_none().items_center().justify_between().gap(8)
-      .child(div().flex_1().min_w(0).truncate().child(label))
-      .child(this.pill(id, value, () => this.set(path, !value)));
+    const toggle = () => {
+      const next = !value;
+      this.set(path, next);
+      if (onChange) onChange(next);
+    };
+    return h_flex().id(id).flex_none().items_center().justify_between().gap(8).cursor_pointer()
+      .rounded(6).px(6).py(4).hover((s) => s.bg(t.hover))
+      .on_click(toggle)
+      .child(v_flex().flex_1().min_w(0).gap(1)
+        .child(div().truncate().child(label))
+        .when(!!hint, (e) => e.child(div().text_size(11).text_color(t.dim).child(hint))))
+      .child(this.pill(`${id}-pill`, value, toggle));
   }
 
   stepper(id, value, unit, min, max, step, path) {
@@ -262,25 +280,48 @@ export default class RanchSettings extends View {
       ...known.filter((a) => a.run && !s.agents.includes(a.key)).map((a) => ({ key: a.key, name: a.name })),
       ...(s.agents.includes("terminal") ? [] : [{ key: "terminal", name: "Terminal" }]),
     ];
-    return v_flex().gap(8).children([
-      this.header("Top bar agents"),
+    const full = s.agents.length >= MAX_AGENTS;
+    return this.card("Agents", `Launch buttons in the top bar (up to ${MAX_AGENTS})`, [
       ...s.agents.map((key, i) => row(key, i)),
-      ...(choices.length
-        ? [h_flex().flex_wrap().items_center().gap(6).children([
-            div().text_size(11).text_color(t.dim).child("Add:"),
-            ...choices.map((c) => h_flex().id(`agent-add-${c.key}`).flex_none().items_center().gap(4).px(8).py(3).rounded(6)
-              .bg(t.input).border_1().border_color(t.border).cursor_pointer().hover((st) => st.bg(t.hover))
-              .on_click(() => this.set("agents", [...s.agents, c.key]))
-              .child(div().text_size(11).child(c.name))
-              .child(svg("mods/ranch-settings/plus.svg").size(10).text_color(t.muted))),
-          ])]
-        : []),
+      this.addAgentSelect(t, s, choices, full),
     ]);
   }
 
+  /** "Add agent" as one dropdown: a select-style trigger and a list popover. */
+  addAgentSelect(t, s, choices, full) {
+    const disabled = full || !choices.length;
+    const label = full ? `Limit reached (${MAX_AGENTS} of ${MAX_AGENTS})` : choices.length ? "Add an agent…" : "All agents added";
+    const trigger = h_flex().id("agent-add").flex_none().h(28).px(10).gap(8).items_center().rounded(6)
+      .bg(t.input).border_1().border_color(this.addOpen ? t.accent : t.border)
+      .when(!disabled, (e) => e.cursor_pointer().hover((st) => st.border_color(t.muted)))
+      .child(svg("mods/ranch-settings/plus.svg").size(11).text_color(disabled ? t.border : t.muted))
+      .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(disabled ? t.dim : t.muted).child(label))
+      .when(!disabled, (e) => e.child(svg("mods/ranch-settings/chevron-down.svg").size(11).text_color(t.muted)));
+    if (disabled) return trigger;
+    const known = this.known ?? [];
+    const list = v_flex().id("agent-add-list").w(240).p(4).gap(1).rounded(8)
+      .border_1().border_color(t.border).bg(t.popover).shadow_lg()
+      .children(choices.map((c) => h_flex().id(`agent-add-${c.key}`).h(28).px(8).gap(8).items_center().rounded(5)
+        .cursor_pointer().hover((st) => st.bg(t.hover))
+        .on_click((_e, cx) => {
+          this.addOpen = false;
+          this.set("agents", [...s.agents, c.key]);
+          cx.notify();
+        })
+        .child(this.agentIcon(c.key, known.find((a) => a.key === c.key)))
+        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(c.name))));
+    return Popover.new("agent-add-popover").anchor("top_left")
+      .open(!!this.addOpen)
+      .on_open_change((open, cx) => {
+        this.addOpen = open;
+        cx.notify();
+      })
+      .trigger(trigger)
+      .content(list);
+  }
+
   sectionCards(t, s) {
-    return v_flex().gap(8).children([
-      this.header("Sidebar cards"),
+    return this.card("Sidebar cards", "What each session card shows", [
       this.switchRow("card-time", "Time in status", s.card.time, "card.time"),
       this.switchRow("card-line3", "Diff stats line", s.card.line3, "card.line3"),
       this.switchRow("card-pr", "Pull request link", s.card.pr, "card.pr"),
@@ -288,8 +329,7 @@ export default class RanchSettings extends View {
   }
 
   sectionSession(t, s) {
-    return v_flex().gap(8).children([
-      this.header("Session details"),
+    return this.card("Session details", "Sections of the session panel", [
       this.switchRow("session-tasks", "Agent tasks", s.session.tasks, "session.tasks"),
       this.switchRow("session-git", "Git status", s.session.git, "session.git"),
       this.switchRow("session-commits", "Recent commits", s.session.commits, "session.commits"),
@@ -297,9 +337,16 @@ export default class RanchSettings extends View {
     ]);
   }
 
+  sectionStatus(t, s) {
+    return this.card("Status bar", "Bottom bar contents", [
+      this.switchRow("usage-show", "Show agent usage", s.usage.show, "usage.show",
+        "Plan limits and session usage at the bottom right",
+        (next) => run(next ? "layout.show" : "layout.hide", { id: "usage" })),
+    ]);
+  }
+
   sectionRefresh(t, s) {
-    return v_flex().gap(8).children([
-      this.header("Refresh"),
+    return this.card("Refresh", "How often git and PRs refresh", [
       h_flex().flex_none().items_center().justify_between().gap(8)
         .child(div().flex_1().min_w(0).truncate().child("Remote git"))
         .child(this.stepper("refresh-git", s.refresh.remoteGitSec, "s", 5, 300, 5, "refresh.remoteGitSec")),
@@ -310,17 +357,14 @@ export default class RanchSettings extends View {
   }
 
   sectionNaming(t, s) {
-    return v_flex().gap(8).children([
-      this.header("Smart tab names"),
+    return this.card("Naming", "Automatic tab names", [
       this.switchRow("naming-enabled", "Enabled", s.naming.enabled, "naming.enabled"),
       h_flex().flex_none().items_center().justify_between().gap(8)
         .child(div().flex_1().min_w(0).truncate().child("On exit"))
         .child(this.seg("naming-exit", s.naming.exitMode, [["keep", "Keep name"], ["revert", "Revert"], ["check", "Add ✓"]], "naming.exitMode")),
       this.switchRow("naming-follow", "Follow agent renames", s.naming.followAgent, "naming.followAgent"),
-      v_flex().gap(2).children([
-        this.switchRow("naming-model", "Summarise with a model", s.naming.model, "naming.model"),
-        div().text_size(11).text_color(t.dim).child("Sends the first prompt of each session to the model provider (via the claude CLI)."),
-      ]),
+      this.switchRow("naming-model", "Summarise with a model", s.naming.model, "naming.model",
+        "Sends the first prompt of each session to the model provider (via the claude CLI)."),
       h_flex().flex_none().items_center().justify_between().gap(8)
         .child(div().flex_1().min_w(0).truncate().child("Max length"))
         .child(this.stepper("naming-maxlen", s.naming.maxLen, "", 16, 60, 4, "naming.maxLen")),
@@ -338,23 +382,24 @@ export default class RanchSettings extends View {
       for (const key of TASK_KEYS) {
         const status = this.tasks.agents[key];
         const color = status === "installed" ? t.done : status === "outdated" || status === "needs approval" ? t.working : t.blocked;
-        rows.push(h_flex().flex_none().items_center().justify_between().gap(8)
+        const group = [h_flex().flex_none().items_center().justify_between().gap(8)
           .child(div().flex_1().min_w(0).truncate().child(key))
-          .child(div().text_color(color).child(status)));
+          .child(div().text_color(color).child(status))];
         // "last report N min ago" (fixes 3.8): when the agent last evented.
         const at = this.report?.[key] ? Date.parse(this.report[key]) : null;
         if (Number.isFinite(at)) {
           const ago = Date.now() - at;
           if (ago >= 0) {
-            rows.push(div().text_size(11).text_color(t.dim).child(`last report ${relativeTime(ago)}`));
+            group.push(div().text_size(11).text_color(t.dim).child(`last report ${relativeTime(ago)}`));
           }
         }
+        // Codex hooks waiting for trust: only Codex's own /hooks can approve them.
+        if (key === "codex" && status === "needs approval") {
+          group.push(div().text_size(11).text_color(t.dim).child("Codex: approve the Ranch hooks once with /hooks in Codex."));
+        }
+        rows.push(v_flex().gap(2).children(group));
       }
       const repair = TASK_KEYS.some((key) => this.tasks.agents[key] === "broken");
-      // Codex hooks waiting for trust: only Codex's own /hooks can approve them.
-      if (this.tasks.agents.codex === "needs approval") {
-        rows.push(div().text_size(11).text_color(t.dim).child("Codex: approve the Ranch hooks once with /hooks in Codex."));
-      }
       if (TASK_KEYS.some((key) => !["installed", "needs approval"].includes(this.tasks.agents[key]))) {
         rows.push(h_flex().flex_none().justify_end()
           .child(div().id("tasks-setup").flex_none().px(10).py(4).rounded(7).bg(t.accent).text_color(t.accent_foreground).font_semibold().cursor_pointer()
@@ -366,7 +411,7 @@ export default class RanchSettings extends View {
       rows.push(div().text_size(11).text_color(t.dim).child(this.setup.split("\n").slice(0, 6).join("\n")));
     }
     rows.push(div().text_size(11).text_color(t.dim).child("Codex asks you to trust new hooks once (/hooks in Codex)."));
-    return v_flex().gap(8).children([this.header("Task reporting"), ...rows]);
+    return this.card("Task reporting", "Which agents report their tasks", rows);
   }
 
   sectionHealth(t) {
@@ -376,8 +421,7 @@ export default class RanchSettings extends View {
       : w === "signed-out" ? ["signed out", t.blocked]
       : w === "old" ? ["too old", t.working]
       : ["checking…", t.dim]);
-    return v_flex().gap(8).children([
-      this.header("Health"),
+    return this.card("Health", "git, GitHub CLI and Herdr versions", [
       ...[["git", this.health.git, "health-git"], ["gh (GitHub CLI)", gh, "health-gh"], ["Herdr app", this.health.herdr, "health-herdr"]].map(([label, w, id]) => {
         const [word_, color] = word(w);
         return h_flex().flex_none().items_center().justify_between().gap(8)
@@ -398,16 +442,29 @@ export default class RanchSettings extends View {
   // ---- root ----
 
   render(cx) {
+    // Left-edge drag strip on the panel column with a hover cue (lib/edge-grip.js).
+    this.grip ??= new EdgeGrip({
+      id: "panel", side: "left", min: 280, max: 640, div, theme, run,
+      width: () => this.grip.measured ?? 360,
+    });
+    return this.grip.wrap(this.renderBody(cx), theme().surface);
+  }
+
+  renderBody(cx) {
     const t = theme(), s = this.s();
     return v_flex().id("ranch-settings").size_full().min_h(0).overflow_y_scrollbar().bg(t.surface)
-      .text_color(t.foreground).text_size(13).p(12).gap(20).track_focus(this.handle)
+      .text_color(t.foreground).text_size(13).p(14).gap(14).track_focus(this.handle)
       .on_key_down((e, cx) => {
         if (e.key === "escape") run("pane.go", { direction: "left" });
       })
       .children([
+        v_flex().flex_none().gap(2)
+          .child(div().text_size(14).font_semibold().text_color(t.foreground).child("Ranch settings"))
+          .child(div().text_size(11).text_color(t.dim).child("Sidebar, session panel and agent options")),
         this.sectionAgents(t, s),
         this.sectionCards(t, s),
         this.sectionSession(t, s),
+        this.sectionStatus(t, s),
         this.sectionRefresh(t, s),
         this.sectionNaming(t, s),
         this.sectionTasks(t),

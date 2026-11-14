@@ -25,13 +25,13 @@
       "min": 44,
       "max": 480,
       "background": "chrome",
-      "resizable": true,
+      "resizable": false,
       "children": [
         {
           "id": "brand",
           "type": "block",
           "size": {
-            "px": 46
+            "px": 42
           },
           "window_drag": true,
           "content": {
@@ -49,7 +49,7 @@
           "id": "sidebar-footer",
           "type": "block",
           "size": {
-            "px": 40
+            "px": 28
           },
           "content": {
             "mod": "ranch-chrome",

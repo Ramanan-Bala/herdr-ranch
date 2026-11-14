@@ -9,7 +9,7 @@
 // Apache-2.0); see THIRD_PARTY.md at the repo root for the licence and changes.
 import { View, div, image, svg } from "gpui-kit";
 import { HoverCard, h_flex, v_flex } from "gpui-base";
-import { exec, focused, spaces, theme, props, shared, setShared, appHome, window } from "herdr";
+import { exec, focused, spaces, theme, props, shared, setShared, appHome, window, run } from "herdr";
 import { PROVIDERS } from "./providers/index.js";
 import { barModel, cardModel, chooseDensity, panelOnEnter } from "./usage/view.js";
 import { effectivePrefs, isOnBar, isShown, toggleOnBar, toggleProvider, toggleShowBars, toggleShowRemaining, toggleShowResetTime, toggleWindow } from "./usage/prefs.js";
@@ -17,6 +17,7 @@ import { parseSession, sessionOnBar, sessionView } from "./usage/session.js";
 import { sessionUsageSupport } from "./usage/session-support.js";
 import { nextState } from "./usage/state.js";
 import { UNREPORTED } from "./usage/unreported.js";
+import { SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
 
 const MOD = "ranch-usage";
 const KEY_STATE = "ranch-usage.state";
@@ -75,6 +76,8 @@ export default class UsageLimits extends View {
     this.unreported = [];  // UNREPORTED entries whose bin is on PATH
     this.unreportedAt = 0; // ms, when the PATH was last checked (once an hour)
     this.seenRefresh = shared(KEY_REFRESH) ?? 0;
+    // The block stays hidden across restarts: render() alone cannot shrink it.
+    if (!resolveSettings(shared(SETTINGS_KEY)).usage.show) run("layout.hide", { id: "usage" });
     this.tick(cx, true);
     cx.timer.every(60 * 1000, (cx) => this.tick(cx, false));
   }
@@ -413,6 +416,9 @@ export default class UsageLimits extends View {
   }
 
   render(cx) {
+    // Nothing in the rest of render must run while hidden: the timers in init
+    // keep the data warm, and the terminal/machine diff runs again once shown.
+    if (!resolveSettings(shared(SETTINGS_KEY)).usage.show) return div().size_full();
     const focus = focused();
     const terminal = focus?.terminal ?? null;
     // The terminal's machine, like ranch-session: its space's machine field,

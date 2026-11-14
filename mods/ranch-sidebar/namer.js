@@ -3,7 +3,7 @@
 // logic in ./lib/naming.js. Names flow ONE WAY (agent -> tab): this file never
 // sends anything to an agent or terminal (no `hc send`, no `hc keys`).
 import {
-  spaces, agents, panes, shared, setShared, run, exec, readTextFile, home,
+  spaces, agents, panes, terminals, shared, setShared, run, exec, readTextFile, home,
 } from "herdr";
 import {
   decide, exitAction, rememberSession, recallSession, ownership, cleanTitle,
@@ -12,7 +12,7 @@ import { listVisible, parseStore, storeCandidates, withPointerIdentity } from ".
 import {
   SETTINGS_KEY, AUTONAMES_KEY, SESSIONS_KEY, TASKS_DIR, resolveSettings,
 } from "./lib/settings.js";
-import { folderLabel } from "./lib/format.js";
+import { folderLabel, subagentsWorking } from "./lib/format.js";
 import { homeCache } from "./lib/home.js";
 import { agentShort, collectInputs, buildModelPrompt } from "./namer-model.js";
 
@@ -80,6 +80,7 @@ export class TabNamer {
     if (shared("layout") !== "ranch") return;
     const agentsNow = agents();
     const panesNow = panes();
+    const terminalsNow = terminals();
     const seen = new Set();
     const activity = {};
     for (const space of spaces()) {
@@ -91,7 +92,13 @@ export class TabNamer {
           if (agent) {
             const store = await this.loadStore(agent.address, space.machine, agent.app);
             const act = store?.session?.activity;
-            if (act) activity[tab.id] = act;
+            // Herdr sub-agents belong to their parent's tab, so any agent in the
+            // tab may be the parent (the first one found could be a child).
+            const now = Date.now();
+            const parents = new Set([agent.address, ...agentsNow.filter((a) => a.tab === tab.id).map((a) => a.address)]);
+            const subs = subagentsWorking({ terminals: terminalsNow, parent: agent.address, subagents: store?.subagents, now })
+              || [...parents].some((p) => subagentsWorking({ terminals: terminalsNow, parent: p, now }));
+            if (act || subs) activity[tab.id] = subs ? { ...(act ?? {}), subsWorking: true } : act;
           }
           if (settings.naming.enabled) await this.handleTab(space, tab, agentsNow, panesNow, settings);
         } catch (err) {

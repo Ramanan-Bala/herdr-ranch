@@ -1,7 +1,8 @@
 // A lazy file browser for the focused pane's folder, with bounded read-only previews.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, run } from "herdr";
+import { EdgeGrip } from "./lib/edge-grip.js";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -164,6 +165,15 @@ export default class Files extends View {
   }
 
   render(cx) {
+    // Left-edge drag strip on the panel column with a hover cue (lib/edge-grip.js).
+    this.grip ??= new EdgeGrip({
+      id: "panel", side: "left", min: 280, max: 640, div, theme, run,
+      width: () => this.grip.measured ?? 360,
+    });
+    return this.grip.wrap(this.renderBody(cx), theme().surface);
+  }
+
+  renderBody(cx) {
     if (key() !== this.context?.key) this.refresh(cx);
     const t = theme();
     return v_flex().id("files").size_full().min_h(0).overflow_hidden().bg(t.surface).text_color(t.foreground).text_size(13)

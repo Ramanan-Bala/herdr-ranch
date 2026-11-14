@@ -12,6 +12,8 @@ import {
   relativeTime,
   folderLabel,
   attentionQueue,
+  subagentsWorking,
+  SUBAGENT_STALE_MS,
 } from "../lib/format.js";
 
 const MIN = 60_000;
@@ -166,6 +168,45 @@ test("effectiveStatus prefers Herdr, falls back to hook activity", async () => {
   assert.deepEqual(effectiveStatus({ status: null }, { state: "blocked", at: now - 5000 }, now), { status: "blocked", since: 5000 });
   assert.deepEqual(effectiveStatus({ status: null }, null, now), { status: null, since: null });
   assert.equal(effectiveStatus({ status: null }, { state: "working", at: now - ACTIVITY_STALE_MS - 1 }, now).status, "idle");
+  // A working sub-agent keeps the tab working even after its parent finished.
+  assert.deepEqual(
+    effectiveStatus({ status: "done", changed_at: now - 4000 }, { subsWorking: true }, now),
+    { status: "working", since: 4000 },
+  );
+  // A blocked tab stays blocked while its sub-agent works.
+  assert.deepEqual(
+    effectiveStatus({ status: "blocked", changed_at: now - 3000 }, { subsWorking: true }, now),
+    { status: "blocked", since: 3000 },
+  );
+  // No native status, no hook state: the sub-agent alone makes it working.
+  assert.deepEqual(effectiveStatus({ status: null }, { subsWorking: true }, now), { status: "working", since: null });
+});
+
+test("subagentsWorking", () => {
+  const now = 1_000_000_000_000;
+  const iso = (ms) => new Date(ms).toISOString();
+  // Live child terminals parented to the agent, with a working status.
+  assert.equal(subagentsWorking({ terminals: [{ parent: "a1", state: "live", status: "working" }], parent: "a1", now }), true);
+  // A finished-but-open child TUI reports done/idle and must not count.
+  assert.equal(subagentsWorking({ terminals: [{ parent: "a1", state: "live", status: "done" }], parent: "a1", now }), false);
+  assert.equal(subagentsWorking({ terminals: [{ parent: "a1", state: "live", status: "idle" }], parent: "a1", now }), false);
+  // A finished child does not count even while still reporting working.
+  assert.equal(subagentsWorking({ terminals: [{ parent: "a1", state: "finished", status: "working" }], parent: "a1", now }), false);
+  // A child of another parent does not count.
+  assert.equal(subagentsWorking({ terminals: [{ parent: "a2", state: "live", status: "working" }], parent: "a1", now }), false);
+  // Store sub-agents: running and started recently counts.
+  assert.equal(subagentsWorking({ parent: "a1", subagents: [{ status: "running", started_at: iso(now - 5 * MIN) }], now }), true);
+  // Running but older than SUBAGENT_STALE_MS (3h) does not.
+  assert.equal(SUBAGENT_STALE_MS, 2 * HOUR);
+  assert.equal(subagentsWorking({ parent: "a1", subagents: [{ status: "running", started_at: iso(now - 3 * HOUR) }], now }), false);
+  // Missing/unparseable started_at never pins a tab as working.
+  assert.equal(subagentsWorking({ parent: "a1", subagents: [{ status: "running", started_at: null }], now }), false);
+  assert.equal(subagentsWorking({ parent: "a1", subagents: [{ status: "running", started_at: "not a date" }], now }), false);
+  // A finished sub-agent does not count.
+  assert.equal(subagentsWorking({ parent: "a1", subagents: [{ status: "done", started_at: iso(now - 5 * MIN) }], now }), false);
+  // Null/undefined input.
+  assert.equal(subagentsWorking({ terminals: null, parent: null, subagents: null, now }), false);
+  assert.equal(subagentsWorking(), false);
 });
 
 test("closeNeedsConfirm", async () => {
@@ -203,6 +244,11 @@ test("closeNeedsConfirm", async () => {
   assert.equal(closeNeedsConfirm({ tabId: "t1", agents: [], now }), false);
   // j. No tab object, but the native agent for tabId is working.
   assert.equal(closeNeedsConfirm({ tabId: "t1", tab: undefined, agents: [A], now }), true);
+  // k. A working sub-agent asks for confirmation even when the parent is done.
+  assert.equal(
+    closeNeedsConfirm({ tabId: "t1", tab: { id: "t1", status: "done" }, agents: [], activity: { subsWorking: true }, now }),
+    true,
+  );
 });
 
 test("closeConfirmProps", async () => {

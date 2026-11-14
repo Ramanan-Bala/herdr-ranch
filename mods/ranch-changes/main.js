@@ -1,7 +1,8 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, home } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, home, run } from "herdr";
 import { headerLabel, requestGate } from "./model.js";
+import { EdgeGrip } from "./lib/edge-grip.js";
 
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
@@ -194,6 +195,15 @@ export default class Changes extends View {
   }
 
   render(cx) {
+    // Left-edge drag strip on the panel column with a hover cue (lib/edge-grip.js).
+    this.grip ??= new EdgeGrip({
+      id: "panel", side: "left", min: 280, max: 640, div, theme, run,
+      width: () => this.grip.measured ?? 360,
+    });
+    return this.grip.wrap(this.renderBody(cx), theme().surface);
+  }
+
+  renderBody(cx) {
     if (key() !== this.context) this.refresh(cx);
     const t = theme(), add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
     const enabled = Boolean(this.message.trim() && this.root && !this.busy && !this.loading);
