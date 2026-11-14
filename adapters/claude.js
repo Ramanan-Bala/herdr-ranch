@@ -138,7 +138,10 @@ function applyTool(store, payload) {
       : null;
     // tool_response may also be a string or an object; search its JSON text.
     const match = /Task #(\S+) created successfully/.exec(JSON.stringify(payload.tool_response ?? ""));
-    const id = structuredId ?? (match ? match[1] : String(store.tasks.length + 1));
+    // Fallback id: one past the highest numeric id, not length + 1 — the
+    // list is capped (lib/tasks.js capTasks), so length can repeat an id.
+    const maxId = store.tasks.reduce((m, t) => (/^\d+$/.test(t.id) ? Math.max(m, Number(t.id)) : m), store.tasks.length);
+    const id = structuredId ?? (match ? match[1] : String(maxId + 1));
     store.tasks = [...store.tasks, {
       id,
       title: subject,
@@ -193,8 +196,17 @@ export function claudeActivity(payload) {
     case "PermissionRequest":
       return "blocked";
     case "Notification": {
-      const text = `${payload.notification_type ?? ""} ${payload.message ?? ""}`.toLowerCase();
-      return /permission|approv|needs your|waiting for your/.test(text) ? "blocked" : null;
+      // Only a real question for the person is "blocked" (needs you): a
+      // permission prompt or an input dialog. The idle reminder Claude sends
+      // a minute after a finished turn ("Claude is waiting for your input",
+      // notification_type idle_prompt) says nothing new: the turn's Stop
+      // already recorded "done", and it must not flip the tab to "needs you".
+      const type = String(payload.notification_type ?? "").toLowerCase();
+      if (type === "idle_prompt") return null;
+      if (type === "permission_prompt" || type === "elicitation_dialog") return "blocked";
+      const text = String(payload.message ?? "").toLowerCase();
+      if (/waiting for your input/.test(text)) return null;
+      return /permission|approv|needs your/.test(text) ? "blocked" : null;
     }
     case "Stop":
       return "done";
@@ -207,6 +219,15 @@ export function claudeActivity(payload) {
 }
 
 export function applyClaude(store, payload) {
+  // After /resume, a late SessionEnd/Stop from the session we just left must
+  // change nothing: the reuse path would otherwise re-point the terminal back
+  // to it and mark it ended, hiding the list.
+  const event = payload?.hook_event_name;
+  const sid = payload?.session_id;
+  if ((event === "SessionEnd" || event === "Stop")
+    && typeof sid === "string" && sid
+    && typeof store?.session?.id === "string" && store.session.id
+    && sid !== store.session.id) return store;
   const next = applyClaudeCore(store, payload);
   const state = claudeActivity(payload);
   if (!state) return next;

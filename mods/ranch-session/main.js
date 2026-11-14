@@ -41,6 +41,7 @@ import { PRS_FILE, parsePrRegistry, prsFor, registryPrBelongs, repoOfWebBase } f
 import {
   listLifecycle,
   listVisible,
+  normalizeTitle,
   parseStore,
   orderTasks,
   progress,
@@ -65,13 +66,13 @@ import {
   herdrSubStatus,
   activityStatus,
   nativeActivity,
-  nativeActivityText,
+  activityLine,
   nativeFor,
   prStateToken,
   prStateLabel,
   prRepoText,
 } from "./model.js";
-import { isWinHome, whereFirstPath, editorLaunch, windowsHome } from "./win.js";
+import { windowsHome } from "./win.js";
 
 const MAX_FILES = 20;
 
@@ -94,14 +95,6 @@ const ghLimit = createLimiter(1);
 
 // Repo metadata (default branch, compare ref, web host) rarely changes.
 const GIT_META_TTL_MS = 600000;
-
-/** Friendly name for a detected editor CLI, for tooltips. */
-const EDITOR_NAMES = { cursor: "Cursor", code: "VS Code", zed: "Zed", subl: "Sublime Text" };
-
-function editorName(path) {
-  const base = (path.split(/[\\/]/).pop() ?? "").replace(/\.(exe|cmd)$/i, "");
-  return EDITOR_NAMES[base] ?? base;
-}
 
 /** How long a task-store read may run before a new one replaces it. */
 const TASKS_READ_STALL_MS = 5000;
@@ -130,14 +123,13 @@ export default class RanchSession extends View {
     this.prRegistry = { key: null, parsed: null, at: 0, busy: false, dirty: true };
     this.agentKey = null; // `${address}@${machine}` of the last seen chosen agent (I2)
     this.sessionKey = null;
+    this.titleKey = null; // last live title seen for the chosen agent
     this.commitsOpen = localStorage.getItem("commitsOpen") === "1";
     this.filesOpen = false;
     this.ciOpen = null; // null: follow the default (open when checks failed)
     this.tasksOpen = new Map(); // agent address -> collapsed?
     this.settingUp = false;
     this.setupResult = null; // string output, "missing", or null
-    this.editors = new Map(); // machine key -> { path: string|null, busy }
-    this.copyAt = 0; // ms epoch of the last "Copy branch" click
     this.size = null;
     // Local repo watches: at most one loop per root, no matter how often the
     // folder changes (there is no way to cancel a pending watchFolder).
@@ -258,13 +250,13 @@ export default class RanchSession extends View {
    * terminals/<address>.json (possibly a pointer) → sessions/<session>.json,
    * falling back to the legacy flat <address>.json. Returns { parsed, text }.
    */
-  async readStoreText(machine, homeDir, address) {
+  async readStoreText(machine, homeDir, address, liveTitle = null) {
     const [terminal, legacy] = storeCandidates(address);
     if (!homeDir || !terminal) return { parsed: { ok: false, reason: "missing" }, text: null };
     try {
       const text = await readTextFile(`${homeDir}/${TASKS_DIR}/${terminal}`, { on: machine });
       if (text != null) {
-        const [session] = storeCandidates(address, text);
+        const [session] = storeCandidates(address, text, liveTitle);
         if (session) {
           try {
             const sessionText = await readTextFile(`${homeDir}/${TASKS_DIR}/${session}`, { on: machine });
@@ -303,8 +295,9 @@ export default class RanchSession extends View {
         return;
       }
       const key = `${agent.address}@${s.machine ?? ""}`;
+      const liveTitle = agent.title ?? panes().find((p) => p.terminal === agent.address)?.title ?? null;
       const homeDir = await this.homeFor(s.machine);
-      const { parsed } = await this.readStoreText(s.machine, homeDir, agent.address);
+      const { parsed } = await this.readStoreText(s.machine, homeDir, agent.address, liveTitle);
       if (gen !== this.tasksGen) return; // superseded after a stall
       // Stale read (I2): the focused agent changed while the file was read.
       const now = this.session();
@@ -461,7 +454,7 @@ export default class RanchSession extends View {
       entry.due = false;
       entry.at = now;
       cx.spawn(async (cx) => {
-        const { parsed } = await this.readStoreText(s.machine, homeDir, k.address);
+        const { parsed } = await this.readStoreText(s.machine, homeDir, k.address, k.title ?? null);
         const e = this.subTasks.get(k.address);
         if (e) {
           e.parsed = parsed;
@@ -479,12 +472,12 @@ export default class RanchSession extends View {
   taskLists(s) {
     const lists = [];
     const main = this.mainTasks(s).parsed;
-    if (main?.ok && listVisible(main, this.liveFor(s.chosen, s.machine))) {
+    if (main?.ok && main.store.session?.state !== "ended" && listVisible(main, this.liveFor(s.chosen, s.machine))) {
       lists.push(main.store.tasks);
     }
     for (const k of this.subTerminals(s)) {
       const entry = this.subTasks.get(k.address);
-      if (entry?.parsed?.ok && listVisible(entry.parsed, this.liveFor(k, s.machine))) {
+      if (entry?.parsed?.ok && entry.parsed.store.session?.state !== "ended" && listVisible(entry.parsed, this.liveFor(k, s.machine))) {
         lists.push(entry.parsed.store.tasks);
       }
     }
@@ -626,7 +619,6 @@ export default class RanchSession extends View {
       this.sessionKey = key;
       this.filesOpen = false;
       this.ciOpen = null;
-      this.copyAt = 0;
       const tkey = s.chosen ? `${s.chosen.address}@${s.machine ?? ""}` : null;
       if (tkey !== this.tasks.key) this.loadTasks(cx);
       else this.loadSubTasks(s, cx);
@@ -640,12 +632,18 @@ export default class RanchSession extends View {
       this.filesOpen = false;
       this.ciOpen = null;
       if (!this.ctx.push.busy) this.ctx.push = { ...this.ctx.push, err: null, at: 0 };
-      this.copyAt = 0;
+    }
+    // A TUI session switch changes the terminal title with no event: re-read
+    // the pointer so the list follows the session now on screen.
+    const tk = s.chosen
+      ? `${s.chosen.address}@${s.machine ?? ""}|${normalizeTitle(s.chosen.title ?? panes().find((p) => p.terminal === s.chosen.address)?.title ?? null) ?? ""}`
+      : null;
+    if (tk !== this.titleKey) {
+      this.titleKey = tk;
+      this.loadTasks(cx);
     }
     // loadTasks guards itself (and takes over from a stalled read).
     if (akey !== this.tasks.key) this.loadTasks(cx);
-    // The action bar's Editor button needs one detection per machine.
-    this.maybeDetectEditor(s.machine, cx);
     // Only needed while the store is missing (to offer Set up), once a minute.
     if (s.chosen && this.tasks.parsed && !this.tasks.parsed.ok && this.tasks.parsed.reason === "missing") {
       this.maybeCheckAdapters(s.machine, cx);
@@ -781,7 +779,6 @@ export default class RanchSession extends View {
       return root;
     }
     if (s.inTab.length > 1) root.child(this.picker(t, s));
-    root.child(this.actionBar(t, s));
     if (!s.chosen) {
       // No agent: no tasks or sub-agents, but the tab's git state still applies.
       root.child(div().text_size(12).text_color(t.dim).px(12).py(10).child("No agent in this tab"));
@@ -899,168 +896,6 @@ export default class RanchSession extends View {
           );
       })
     );
-  }
-
-  // ---- action bar --------------------------------------------------------
-
-  /**
-   * One row of common next steps under the header (R-SD-2): shell, editor,
-   * copy branch, push and PR. Only known/possible actions show.
-   */
-  actionBar(t, s) {
-    const sum = this.ctx.gitReady() ? this.ctx.gitEntry().summary : null;
-    const top = sum?.top ?? s.cwd;
-    const branch = sum?.branch ?? null;
-    const lk = sum?.host ? links(sum.host) : null;
-    const dbl = defaultBranchLine(sum);
-    const compare =
-      branch && lk && dbl?.kind === "diverged" && (dbl.ahead || dbl.behind)
-        ? lk.compare(dbl.default, branch)
-        : null;
-    const bar = h_flex().px(12).py(8).gap(6).flex_wrap().border_b(1).border_color(t.border);
-
-    bar.child(
-      this.actionBtn(t, "action-shell", "mods/ranch-session/terminal.svg", "Shell", "Open a shell below, in this repo", () =>
-        run("terminal.open", { folder: top, place: "down" })
-      )
-    );
-
-    const editor = this.editors.get(s.machine ?? "");
-    if (editor?.path) {
-      bar.child(
-        this.actionBtn(
-          t,
-          "action-editor",
-          "mods/ranch-session/code.svg",
-          "Editor",
-          `Open in ${editorName(editor.path)}`,
-          () => {
-            // .cmd launchers (code.cmd, cursor.cmd) need cmd.exe on Windows (F10).
-            const [cmd, args] = editorLaunch(editor.path, top);
-            exec(cmd, args, { on: s.machine }).catch(() => {});
-          }
-        )
-      );
-    }
-
-    if (branch) {
-      const copied = Date.now() - this.copyAt < 1500;
-      bar.child(
-        this.actionBtn(
-          t,
-          "action-copy",
-          "mods/ranch-session/copy.svg",
-          copied ? "Copied" : "Copy branch",
-          "Copy the branch name",
-          (_e, cx) => {
-            cx.write_to_clipboard(branch);
-            this.copyAt = Date.now();
-            cx.notify();
-            cx.timer.after(1500, (cx) => cx.notify());
-          }
-        )
-      );
-    }
-
-    if (branch && sum.host && branch !== sum.default) {
-      const pv = this.ctx.pushView();
-      const pushed = pv.at && Date.now() - pv.at < 1500;
-      bar.child(
-        this.actionBtn(
-          t,
-          "action-push",
-          "mods/ranch-session/upload.svg",
-          pv.busy ? "Pushing\u2026" : pushed ? "Pushed" : "Push",
-          "Push this branch to origin",
-          (_e, cx) => this.pushBranch(cx),
-          pv.busy || pv.blocked
-        )
-      );
-    }
-
-    const pr = this.ctx.prReady() ? this.ctx.prEntry().parsed : null;
-    if (pr?.url && pr.number != null) {
-      bar.child(
-        this.actionBtn(
-          t,
-          "action-pr",
-          "mods/ranch-session/git-pull-request.svg",
-          `PR #${pr.number}`,
-          "Open the pull request",
-          () => this.openUrl(pr.url)
-        )
-      );
-    } else if (compare) {
-      bar.child(
-        this.actionBtn(
-          t,
-          "action-pr",
-          "mods/ranch-session/git-pull-request.svg",
-          "Create PR",
-          "Open the pull-request page",
-          () => this.openUrl(compare)
-        )
-      );
-    }
-
-    const wrap = v_flex().flex_none();
-    wrap.child(bar);
-    const pv = this.ctx.pushView();
-    if (pv.err) {
-      wrap.child(div().text_size(11).text_color(t.blocked).truncate().child(pv.err));
-    }
-    return wrap;
-  }
-
-  /** A compact button in the action bar: icon + label, hover lights it up. */
-  actionBtn(t, id, icon, label, tip, act, inert) {
-    return h_flex()
-      .id(id)
-      .h(26)
-      .px(8)
-      .gap(5)
-      .rounded(6)
-      .border(1)
-      .border_color(t.border)
-      .bg(t.raised)
-      .items_center()
-      .cursor_pointer()
-      .text_size(11.5)
-      .text_color(t.muted)
-      .tooltip(tip)
-      .hover((h) => h.bg(t.hover).text_color(t.foreground))
-      .when(!inert, (el) => el.on_click(act))
-      .child(svg(icon).size(12).flex_none())
-      .child(label);
-  }
-
-  /** Detects the machine's editor CLI once (cursor/code/zed/subl); pump calls it. */
-  maybeDetectEditor(machine, cx) {
-    const key = machine ?? "";
-    if (this.editors.has(key)) return;
-    this.editors.set(key, { path: null, busy: true });
-    cx.spawn(async (cx) => {
-      let path = null;
-      try {
-        // Windows (F10): Git sh answers with an MSYS path exec can't start, so
-        // ask where.exe; it exits 1 when some names are missing — don't check.
-        // Decide by the target machine's home: a remote may differ from here.
-        const target = machine ? await this.homeFor(machine) : home();
-        if (isWinHome(target)) {
-          const r = await exec("where.exe", ["cursor.cmd", "code.cmd", "zed.exe", "subl.exe"], { on: machine });
-          path = whereFirstPath(r.stdout);
-        } else {
-          const r = await exec(
-            "sh",
-            ["-c", "command -v cursor || command -v code || command -v zed || command -v subl"],
-            { on: machine }
-          );
-          path = r.code === 0 ? r.stdout.trim().split("\n")[0] || null : null;
-        }
-      } catch {}
-      this.editors.set(key, { path, busy: false });
-      cx.notify();
-    });
   }
 
   /** The Push action: push the branch the button showed, then refresh git+PR. */
@@ -1752,7 +1587,10 @@ export default class RanchSession extends View {
     const lifeStatus = isMain ? status ?? "idle" : status;
     // A stale done list is hidden ("No recent activity"), so no count either.
     const stale = parsed?.ok && listLifecycle(parsed.store, lifeStatus, Date.now()).hide;
-    const prog = read && parsed?.ok && !stale ? progress(this.liveTasks(parsed.store.tasks)) : { done: 0, total: 0 };
+    // Only a list the card will actually show counts (no ended session, no
+    // other terminal's list): the header count and the percent line use it.
+    const shown = read && parsed?.ok && !stale && listVisible(parsed, this.liveFor(isMain ? s.chosen : sub, s.machine));
+    const prog = shown ? progress(this.liveTasks(parsed.store.tasks)) : { done: 0, total: 0 };
     const label = isMain
       ? "Tasks"
       : `Tasks \u00b7 ${sub.name || sub.template || sub.program?.name || sub.address}`;
@@ -1794,13 +1632,24 @@ export default class RanchSession extends View {
 
     // Herdr's native activity (OSC 7501 message / %), matched by exact
     // terminal address: shown with or without a checklist, never stored.
-    const native = nativeActivityText(nativeActivity(nativeFor(terminals(), addr)));
-    if (native) card.child(div().text_size(11.5).text_color(t.muted).min_w(0).truncate().child(native));
+    // With a visible list the percent is the task list's own (TODO 8): the
+    // terminal's report does not match the checklist.
+    const native = nativeActivity(nativeFor(terminals(), addr));
+    const line = activityLine(native, prog);
+    if (line) card.child(div().text_size(11.5).text_color(t.muted).min_w(0).truncate().child(line));
 
     if (!read) {
       // First read for this agent still in flight: say so, never leave the
       // card at just the native % line.
       if (isMain) card.child(div().text_size(12).text_color(t.muted).child("Loading tasks\u2026"));
+      return card;
+    }
+
+    // A finished agent's session (TODO 1): its run is over, so say that
+    // instead of showing the leftover list.
+    if (parsed?.ok && parsed.store.session?.state === "ended") {
+      if (!isMain) return null;
+      card.child(div().text_size(12).text_color(t.muted).child("Agent exited \u00b7 no active session."));
       return card;
     }
 
@@ -1831,27 +1680,29 @@ export default class RanchSession extends View {
 
     // Lifecycle (fixes 3.5): fade out stale done lists, flag idle-with-work.
     const lc = listLifecycle(parsed.store, lifeStatus, Date.now());
+    const paused = lc.flag;
     if (lc.hide) {
       if (!isMain) return null;
       card.child(div().text_size(12).text_color(t.muted).child("No recent activity."));
       return card;
     }
 
-    // Progress bar: working-coloured while something runs, done when not.
+    // Progress bar: proportional flex so it always fills the card exactly;
+    // working-coloured while something runs, done (grey) when paused.
     const tasks = parsed.store.tasks;
-    const width = Math.max(0, (this.size?.width ?? 0) - 40);
-    const fill = tasks.some((x) => x.status === "in_progress") ? t.working : t.done;
+    const fill = !paused && tasks.some((x) => x.status === "in_progress") ? t.working : t.done;
     card.child(
-      div()
+      h_flex()
         .w_full()
         .h(3)
         .flex_none()
         .rounded(2)
         .bg(t.border)
         .when(prog.done > 0, (el) =>
-          el.child(
-            div().h(3).rounded(2).bg(fill).w(Math.max(2, Math.round((width * prog.done) / prog.total)))
-          )
+          el.child(div().h(3).rounded(2).bg(fill).flex_basis(0).min_w(0).flex_grow(prog.done))
+        )
+        .when(prog.total - prog.done > 0, (el) =>
+          el.child(div().h(3).flex_basis(0).min_w(0).flex_grow(prog.total - prog.done))
         )
     );
     // Freshness (fixes 3.6): "updated N ago", greyed out when stale.
@@ -1865,17 +1716,24 @@ export default class RanchSession extends View {
       );
     }
     if (lc.flag) {
-      card.child(div().text_size(10.5).text_color(t.muted).child("Agent stopped while working on this"));
+      card.child(div().text_size(10.5).text_color(t.muted).child("Paused \u00b7 picks up when the agent continues"));
     }
     // Cancelled tasks render struck through, after the live ones.
     const cancelled = tasks.filter((x) => x.status === "cancelled");
-    for (const task of [...orderTasks(this.liveTasks(tasks)), ...cancelled]) card.child(this.taskRow(t, task, addr));
+    for (const task of [...orderTasks(this.liveTasks(tasks)), ...cancelled]) card.child(this.taskRow(t, task, addr, paused));
     return card;
   }
 
-  taskRow(t, task, addr) {
+  taskRow(t, task, addr, paused) {
     const row = h_flex().id(`task-${addr}-${task.id}`).h(20).px(4).gap(8).items_center().min_w(0);
     if (task.status === "in_progress") {
+      if (paused) {
+        // The agent stopped mid-task: quiet pause icon instead of a spinner.
+        return row
+          .child(svg("mods/ranch-session/pause.svg").size(11).flex_none().text_color(t.muted))
+          .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(task.title))
+          .child(div().flex_none().text_size(10.5).text_color(t.dim).child("Paused"));
+      }
       return row
         .child(svg("mods/ranch-session/spinner.svg").size(11).flex_none().text_color(t.working).spin(900))
         .child(

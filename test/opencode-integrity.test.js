@@ -6,7 +6,7 @@
 // test/adapters.test.js does (v1 RanchTasks host + env sandboxing).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseStore } from "../lib/tasks.js";
@@ -241,6 +241,107 @@ test("session.created for a new main session starts a complete empty store", asy
   assert.equal(readFileSync(sessionFile(home, "s1"), "utf8"), before);
 });
 
+// ------------------------------------------------------- TUI session select
+
+/** A saved store for an arbitrary session id (same shape as savedStore). */
+function savedStoreFor(terminal, sid, taskTitle) {
+  return {
+    ...savedStore(terminal),
+    agent: { app: "opencode", session: sid, pid: 1 },
+    session: { id: sid, title: `work ${sid}`, title_source: "agent", first_prompt: "p", state: "running" },
+    tasks: [{ id: "1", title: taskTitle, status: "pending", active_form: null }],
+  };
+}
+
+test("tui.session.select re-points the terminal to a session with a store, keeping that store's tasks", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t1", HOME: home });
+  mkdirSync(join(tasksDir(home), "sessions"), { recursive: true });
+  const aBefore = JSON.stringify(savedStoreFor("t1", "sA", "a"), null, 2) + "\n";
+  writeFileSync(sessionFile(home, "sA"), aBefore);
+  writeFileSync(sessionFile(home, "sB"), JSON.stringify(savedStoreFor("t1", "sB", "b"), null, 2) + "\n");
+  writePointer(home, "t1", "sA");
+
+  await record({ type: "tui.session.select", properties: { sessionID: "sB" } });
+
+  assert.equal(JSON.parse(readFileSync(pointerFile(home, "t1"), "utf8")).session, "sB");
+  const b = parseStore(readFileSync(sessionFile(home, "sB"), "utf8"));
+  assert.equal(b.ok, true);
+  assert.equal(b.store.session.id, "sB");
+  assert.deepEqual(b.store.tasks.map((task) => task.title), ["b"]);
+  // A's own store is untouched, so selecting it again restores its tasks.
+  assert.equal(readFileSync(sessionFile(home, "sA"), "utf8"), aBefore);
+});
+
+test("tui.session.select to a session without a store starts fresh and leaves the old store untouched", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t1", HOME: home });
+  mkdirSync(join(tasksDir(home), "sessions"), { recursive: true });
+  const aBefore = JSON.stringify(savedStoreFor("t1", "sA", "a"), null, 2) + "\n";
+  writeFileSync(sessionFile(home, "sA"), aBefore);
+  writePointer(home, "t1", "sA");
+
+  await record({ type: "tui.session.select", properties: { sessionID: "sC" } });
+
+  assert.equal(JSON.parse(readFileSync(pointerFile(home, "t1"), "utf8")).session, "sC");
+  const c = parseStore(readFileSync(sessionFile(home, "sC"), "utf8"));
+  assert.equal(c.ok, true);
+  assert.equal(c.store.session.id, "sC");
+  assert.deepEqual(c.store.tasks, []);
+  assert.deepEqual(c.store.subagents, []);
+  assert.equal(c.store.missed_turns, 0);
+  assert.equal(readFileSync(sessionFile(home, "sA"), "utf8"), aBefore);
+});
+
+test("tui.session.select back to a previously stored session shows its tasks again", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t1", HOME: home });
+  mkdirSync(join(tasksDir(home), "sessions"), { recursive: true });
+  const aBefore = JSON.stringify(savedStoreFor("t1", "sA", "a"), null, 2) + "\n";
+  writeFileSync(sessionFile(home, "sA"), aBefore);
+  writeFileSync(sessionFile(home, "sC"), JSON.stringify(savedStoreFor("t1", "sC", "c"), null, 2) + "\n");
+  writePointer(home, "t1", "sC");
+
+  await record({ type: "tui.session.select", properties: { sessionID: "sA" } });
+
+  assert.equal(JSON.parse(readFileSync(pointerFile(home, "t1"), "utf8")).session, "sA");
+  const a = parseStore(readFileSync(sessionFile(home, "sA"), "utf8"));
+  assert.deepEqual(a.store.tasks.map((task) => task.title), ["a"]);
+});
+
+test("selecting the session already shown is a no-op (no write, no seq bump)", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t1", HOME: home });
+  mkdirSync(join(tasksDir(home), "sessions"), { recursive: true });
+  const aBefore = JSON.stringify(savedStoreFor("t1", "sA", "a"), null, 2) + "\n";
+  writeFileSync(sessionFile(home, "sA"), aBefore);
+  writePointer(home, "t1", "sA");
+
+  await record({ type: "tui.session.select", properties: { sessionID: "sA" } });
+
+  assert.equal(readFileSync(sessionFile(home, "sA"), "utf8"), aBefore);
+  assert.equal(JSON.parse(readFileSync(pointerFile(home, "t1"), "utf8")).session, "sA");
+});
+
+test("a todo.updated for a session without a store never mixes into the selected session's store", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t1", HOME: home });
+  mkdirSync(join(tasksDir(home), "sessions"), { recursive: true });
+  writeFileSync(sessionFile(home, "sA"), JSON.stringify(savedStoreFor("t1", "sA", "a"), null, 2) + "\n");
+  writeFileSync(sessionFile(home, "sB"), JSON.stringify(savedStoreFor("t1", "sB", "b"), null, 2) + "\n");
+  writePointer(home, "t1", "sA");
+  await record({ type: "tui.session.select", properties: { sessionID: "sB" } });
+
+  await record({ type: "todo.updated", properties: { sessionID: "sX", todos: [{ id: "1", content: "stray", status: "pending" }] } });
+
+  // The never-mix guard: B's store keeps only B's tasks, nothing is written
+  // for sX, and the pointer stays on the selected session.
+  const b = parseStore(readFileSync(sessionFile(home, "sB"), "utf8"));
+  assert.deepEqual(b.store.tasks.map((task) => task.title), ["b"]);
+  assert.equal(JSON.parse(readFileSync(pointerFile(home, "t1"), "utf8")).session, "sB");
+  assert.equal(existsSync(join(tasksDir(home), "sessions", "sX.json")), false);
+});
+
 // ------------------------------------------------------- locking
 
 test("a held session lock blocks the write and is reported, without throwing", async (t) => {
@@ -257,6 +358,21 @@ test("a held session lock blocks the write and is reported, without throwing", a
 
   assert.equal(readFileSync(sessionFile(home, "s1"), "utf8"), saved);
   assert.match(readFileSync(logFile(home), "utf8"), /store lock busy/);
+});
+
+test("two sessions served through one terminal both stay in the pointer index", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, HC_TERMINAL_ID: "t1", HOME: home });
+
+  await record({ type: "session.created", properties: { info: { id: "sA", title: "Alpha" } } });
+  await record({ type: "session.created", properties: { info: { id: "sB", title: "Beta" } } });
+
+  const pointer = JSON.parse(readFileSync(pointerFile(home, "t1"), "utf8"));
+  assert.equal(pointer.session, "sB");
+  assert.deepEqual(pointer.sessions.map(({ id, title }) => ({ id, title })), [
+    { id: "sB", title: "Beta" },
+    { id: "sA", title: "Alpha" },
+  ]);
 });
 
 // ------------------------------------------------------- AGENTS.md marker

@@ -227,10 +227,111 @@ export function progress(tasks) {
   return { done: live.filter((t) => t.status === "completed").length, total: live.length };
 }
 
+/** Cap for a store's task list: keeps the files bounded on long sessions. */
+export const MAX_TASKS = 50;
+
+/**
+ * Caps a task list at `max` entries (default MAX_TASKS). Non-arrays are
+ * returned unchanged; a list at or under the cap is returned as the SAME
+ * array. Over the cap, the oldest (lowest index) finished entries
+ * ("completed" then "cancelled") are dropped one at a time, then the oldest
+ * "pending" ones; "in_progress" is never dropped. The kept entries keep
+ * their relative order. Pure: the input array is never mutated.
+ */
+export function capTasks(tasks, max = MAX_TASKS) {
+  if (!Array.isArray(tasks)) return tasks;
+  if (tasks.length <= max) return tasks;
+  const keep = [...tasks];
+  for (const status of ["completed", "cancelled", "pending"]) {
+    for (let i = 0; i < keep.length && keep.length > max; ) {
+      if (keep[i].status === status) keep.splice(i, 1);
+      else i += 1;
+    }
+    if (keep.length <= max) break;
+  }
+  return keep;
+}
+
 /** Store file name for a terminal address ("t6" -> "t6.json"); strips anything unsafe. */
 export function storeFileName(address) {
   const safe = String(address ?? "").replace(/[^A-Za-z0-9_.-]/g, "_");
   return safe ? `${safe}.json` : null;
+}
+
+/** Cap for a terminal pointer's session index (most recent first). */
+export const SESSION_INDEX_MAX = 20;
+
+const GENERIC_TITLES = new Set(["new session", "opencode", "oc", "claude code"]);
+
+/**
+ * Comparison key for a session title, or null when the title says nothing
+ * useful: an empty or generic agent title ("New session", the app's name).
+ * Terminal titles are noisy — OpenCode prefixes them with "OC | ", agents add
+ * a spinner glyph, and case/spacing drift — so they are normalized first.
+ */
+export function normalizeTitle(title) {
+  if (typeof title !== "string") return null;
+  const key = title
+    .trim()
+    .replace(/^oc\s*\|\s*/i, "")
+    .replace(/^[^\p{L}\p{N}]+/u, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  return key && !GENERIC_TITLES.has(key) ? key : null;
+}
+
+/** One sanitized { id, title, at } session-index entry, or null when malformed. */
+function sessionIndexEntry(v) {
+  if (!isPlainObject(v) || typeof v.id !== "string" || !v.id) return null;
+  return {
+    id: v.id,
+    title: typeof v.title === "string" ? v.title : null,
+    at: typeof v.at === "string" ? v.at : null,
+  };
+}
+
+/**
+ * Puts `entry` first in a terminal pointer's session index, dropping the older
+ * entry for the same id and capping the list at `max`. A null entry title
+ * keeps the title the list already had for that id. Returns a new, sanitized
+ * array (malformed items are dropped); the input is never mutated.
+ */
+export function mergeSessionIndex(list, entry, max = SESSION_INDEX_MAX) {
+  const items = (Array.isArray(list) ? list : []).map(sessionIndexEntry).filter(Boolean);
+  const limit = Number.isInteger(max) && max >= 0 ? max : SESSION_INDEX_MAX;
+  const next = sessionIndexEntry(entry);
+  if (!next) return items.slice(0, limit);
+  const old = items.find((v) => v.id === next.id);
+  if (next.title == null && old?.title != null) next.title = old.title;
+  return [next, ...items.filter((v) => v.id !== next.id)].slice(0, limit);
+}
+
+/** The sanitized session index stored in a terminal pointer, or [] on error. */
+export function pointerSessions(text) {
+  try {
+    const raw = JSON.parse(text);
+    return (Array.isArray(raw?.sessions) ? raw.sessions : []).map(sessionIndexEntry).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The session whose store the panel should read for `liveTitle`. Normally the
+ * pointed session; after a TUI session switch the pointer still names the old
+ * one, so the terminal's title picks the first indexed session with the same
+ * normalized title. Falls back to the pointed session when nothing matches.
+ */
+export function resolveSession(pointerText, liveTitle) {
+  const pointed = pointerSession(pointerText);
+  const key = normalizeTitle(liveTitle);
+  if (key == null) return pointed;
+  const index = pointerSessions(pointerText);
+  const current = index.find((v) => v.id === pointed);
+  if (current && normalizeTitle(current.title) === key) return pointed;
+  const match = index.find((v) => normalizeTitle(v.title) === key);
+  return match ? match.id : pointed;
 }
 
 /**
@@ -249,14 +350,15 @@ export function pointerSession(text) {
 
 /**
  * Relative store paths to read next: without terminal text, the schema-2
- * terminal file and its legacy fallback; with a pointer, its session file.
- * An empty result means the terminal text already is the store.
+ * terminal file and its legacy fallback; with a pointer, its session file
+ * (chosen by `liveTitle` after a TUI session switch). An empty result means
+ * the terminal text already is the store.
  */
-export function storeCandidates(address, terminalText = null) {
+export function storeCandidates(address, terminalText = null, liveTitle = null) {
   const name = storeFileName(address);
   if (!name) return [];
   if (terminalText != null) {
-    const sid = pointerSession(terminalText);
+    const sid = resolveSession(terminalText, liveTitle);
     const session = sid ? storeFileName(sid) : null;
     return session ? [`sessions/${session}`] : [];
   }
@@ -293,11 +395,14 @@ export function withPointerIdentity(parsed, terminalText) {
 /**
  * Whether a parsed store belongs to the agent run now live in the terminal
  * (fixes §3.3/F4): the terminal must be live, its start time must match the
- * store's terminal_started_at, and the agent app must match. `live` comes
- * from `hc get --json` (plus the panel's app); null skips that check.
+ * store's terminal_started_at, and the agent app must match. A session the
+ * agent exited ("ended", set on SessionEnd / session.deleted) is never
+ * visible: no active session means no list. `live` comes from
+ * `hc get --json` (plus the panel's app); null skips that check.
  */
 export function listVisible(parsed, live) {
   if (!parsed || !parsed.ok || !parsed.store) return false;
+  if (parsed.store.session?.state === "ended") return false;
   const store = parsed.store;
   if (live) {
     if (live.state && live.state !== "live") return false; // terminal gone/finished
