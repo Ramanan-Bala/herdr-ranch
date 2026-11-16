@@ -28,6 +28,21 @@ const PLAN_PAYLOAD = {
   tool_input: { plan: [{ step: "doctor check", status: "in_progress" }] },
 };
 
+const PI_SESSION_PAYLOAD = {
+  hook_event_name: "SessionStart",
+  session_id: "ses-ranch-doctor",
+  source: "startup",
+  cwd: "/tmp",
+};
+
+const PI_TODO_PAYLOAD = {
+  hook_event_name: "PostToolUse",
+  tool_name: "todo_write",
+  session_id: "ses-ranch-doctor",
+  cwd: "/tmp",
+  tool_input: { todos: [{ content: "doctor check", status: "in_progress" }] },
+};
+
 /**
  * The node entry this doctor was installed with (repo run falls back to
  * ../bin). The installed bin/ranch-tasks is a sh launcher, so run the .js.
@@ -165,6 +180,7 @@ export async function doctor() {
   }
   codexChecks(checks, agents, home);
   checks.push(check("opencode experimental.todo", opencodeTodoEnabled(), "opencode config"));
+  const piInstalled = !!agents?.pi && agents.pi !== "missing";
   // Claude Code's task tools: settings env, or the shell exporting it.
   const claudeTodo = claudeTodoEnvEnabled(join(home, ".claude", "settings.json")) || process.env.CLAUDE_CODE_ENABLE_TODO_TOOLS === "1";
   checks.push(check("claude CLAUDE_CODE_ENABLE_TODO_TOOLS", claudeTodo, "~/.claude/settings.json env"));
@@ -189,6 +205,12 @@ export async function doctor() {
       opencode = { error: err?.message ?? String(err) };
     }
     checks.push(storeCheck("opencode synthetic event", opencode, temp));
+    if (piInstalled) {
+      // SessionStart first, then the todo_write call; both through the same
+      // installed `ranch-tasks pi` entry.
+      syntheticHook("pi", PI_SESSION_PAYLOAD, temp);
+      checks.push(storeCheck("pi synthetic event", syntheticHook("pi", PI_TODO_PAYLOAD, temp)));
+    }
   } finally {
     try {
       rmSync(temp, { recursive: true, force: true });

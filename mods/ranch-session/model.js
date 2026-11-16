@@ -4,12 +4,12 @@
 import { statusRank, STATUS_LABEL, effectiveStatus } from "./lib/format.js";
 
 /** Agent apps whose task store Ranch reads (requirements.md §7.4). */
-export const TASK_AGENTS = new Set(["claude-code", "claude", "codex", "opencode"]);
+export const TASK_AGENTS = new Set(["claude-code", "claude", "codex", "opencode", "pi"]);
 
 /** Agent app name (OSC 7501 `app`) -> ranch-tasks adapter key. */
 export function adapterKey(app) {
   if (app === "claude-code" || app === "claude") return "claude";
-  if (app === "codex" || app === "opencode") return app;
+  if (app === "codex" || app === "opencode" || app === "pi") return app;
   return null;
 }
 

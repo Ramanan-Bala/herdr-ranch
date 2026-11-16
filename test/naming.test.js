@@ -36,6 +36,11 @@ test("cleanTitle strips glyphs, agent names, paths and user@host", () => {
   assert.equal(cleanTitle("Fix login..."), "Fix login");
   assert.equal(cleanTitle("Codex — Refactor db"), "Refactor db");
   assert.equal(cleanTitle("Fix login — Claude Code"), "Fix login");
+  assert.equal(cleanTitle("Pi — Fix pipeline"), "Fix pipeline");
+  assert.equal(cleanTitle("Fix pipeline — Pi"), "Fix pipeline");
+  // "Pi" is only an agent name as a whole word at the start or end.
+  assert.equal(cleanTitle("Pin deps"), "Pin deps");
+  assert.equal(cleanTitle("Fix pipeline"), "Fix pipeline");
   assert.equal(cleanTitle("(wip) Fix login"), "(wip) Fix login");
 });
 
@@ -46,6 +51,7 @@ test("cleanTitle rejects empty and generic titles", () => {
   assert.equal(cleanTitle("zsh"), null);
   assert.equal(cleanTitle("New session"), null);
   assert.equal(cleanTitle("OpenCode"), null);
+  assert.equal(cleanTitle("pi"), null);
   assert.equal(cleanTitle("claude"), null);
   assert.equal(cleanTitle("Ranch", { repo: "ranch" }), null);
   assert.equal(cleanTitle("12345"), null);

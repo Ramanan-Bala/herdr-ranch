@@ -4,10 +4,10 @@
 // process.platform (docs/fixes/ranch-tasks-windows-install-plan.md §3.4).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { backupLabel, hookCommand, homeDir, install, statusSummary, uninstall } from "../adapters/install.js";
+import { backupLabel, hookCommand, homeDir, install, repoRoot, statusSummary, uninstall } from "../adapters/install.js";
 
 const RANCH_MARK = "/.herdr/ranch/bin/ranch-tasks";
 
@@ -30,6 +30,21 @@ function withEnv(t, vars) {
     }
   });
 }
+
+/** console.log lines printed while an (async) install/uninstall runs. */
+async function captureOutput(run) {
+  const lines = [];
+  const log = console.log;
+  console.log = (...args) => lines.push(args.join(" "));
+  try {
+    await run();
+  } finally {
+    console.log = log;
+  }
+  return lines;
+}
+
+const piTheme = (name) => readFileSync(join(repoRoot(), "adapters", "pi", "themes", `${name}.json`));
 
 /** Ranch hook groups in a config doc, recognized on either path separator. */
 function ranchGroups(doc) {
@@ -174,4 +189,173 @@ test("install leaves a CLAUDE_CODE_ENABLE_TODO_TOOLS value the person set, and u
   await uninstall({ yes: true, agents: ["claude"] });
   const doc = JSON.parse(readFileSync(file, "utf8"));
   assert.deepEqual(doc.env, { CLAUDE_CODE_ENABLE_TODO_TOOLS: "1" });
+});
+
+// ------------------------------------------------------------------- Pi
+
+test("pi install copies the extension and writes the AGENTS.md block; reinstall is unchanged", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  await install({ yes: true, agents: ["pi"] });
+  const extension = join(home, ".pi", "agent", "extensions", "ranch-tasks.js");
+  const agents = join(home, ".pi", "agent", "AGENTS.md");
+  assert.match(readFileSync(extension, "utf8"), /ranch-tasks plugin/);
+  assert.match(readFileSync(agents, "utf8"), /todo_write/);
+  assert.equal(statusSummary().agents.pi, "installed");
+
+  const before = readFileSync(agents, "utf8");
+  await install({ yes: true, agents: ["pi"] });
+  assert.equal(readFileSync(agents, "utf8"), before);
+  assert.equal(statusSummary().agents.pi, "installed");
+});
+
+test("pi uninstall restores a foreign ranch-tasks.js and removes the AGENTS.md block", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  const extension = join(home, ".pi", "agent", "extensions", "ranch-tasks.js");
+  const agents = join(home, ".pi", "agent", "AGENTS.md");
+  mkdirSync(join(home, ".pi", "agent", "extensions"), { recursive: true });
+  writeFileSync(extension, "// someone else's extension\n");
+  writeFileSync(agents, "# my rules\n");
+
+  await install({ yes: true, agents: ["pi"] });
+  assert.match(readFileSync(extension, "utf8"), /ranch-tasks plugin/);
+  assert.match(readFileSync(agents, "utf8"), /todo_write/);
+
+  await uninstall({ yes: true, agents: ["pi"] });
+  assert.equal(readFileSync(extension, "utf8"), "// someone else's extension\n");
+  assert.equal(readFileSync(agents, "utf8"), "# my rules\n");
+  assert.equal(statusSummary().agents.pi, "missing");
+});
+
+test("--agents pi installs only pi", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  await install({ yes: true, agents: ["pi"], noInstructions: true });
+  assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "ranch-tasks.js")));
+  assert.ok(existsSync(join(home, ".pi", "agent", "themes", "opencode.json")));
+  assert.ok(existsSync(join(home, ".pi", "agent", "themes", "opencode-light.json")));
+  assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "statusline.ts")));
+  assert.equal(existsSync(join(home, ".claude", "settings.json")), false);
+  assert.equal(existsSync(join(home, ".codex", "hooks.json")), false);
+  assert.equal(existsSync(join(home, ".config", "opencode", "plugins", "ranch-tasks.js")), false);
+});
+
+test("pi install copies themes and status line and selects the theme in a new settings.json", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  await install({ yes: true, agents: ["pi"], noInstructions: true });
+  const agent = join(home, ".pi", "agent");
+  assert.deepEqual(readFileSync(join(agent, "themes", "opencode.json")), piTheme("opencode"));
+  assert.deepEqual(readFileSync(join(agent, "themes", "opencode-light.json")), piTheme("opencode-light"));
+  assert.deepEqual(
+    readFileSync(join(agent, "extensions", "statusline.ts")),
+    readFileSync(join(repoRoot(), "adapters", "pi", "statusline.ts")),
+  );
+  assert.equal(
+    readFileSync(join(agent, "settings.json"), "utf8"),
+    JSON.stringify({ theme: "opencode-light/opencode" }, null, 2) + "\n",
+  );
+
+  // drift in a new asset file reports outdated
+  writeFileSync(join(agent, "extensions", "statusline.ts"), "// changed\n");
+  assert.equal(statusSummary().agents.pi, "outdated");
+});
+
+test("pi install leaves an existing chosen theme byte-identical", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  const file = join(home, ".pi", "agent", "settings.json");
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  const original = JSON.stringify({ theme: "dark", x: 1 }) + "\n";
+  writeFileSync(file, original);
+  const lines = await captureOutput(() => install({ yes: true, agents: ["pi"], noInstructions: true }));
+  assert.equal(readFileSync(file, "utf8"), original);
+  assert.ok(lines.some((l) => l.includes(file) && l.includes("theme left as dark")), lines.join("\n"));
+});
+
+test("pi install adds the theme to settings that have none and keeps other keys", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  const file = join(home, ".pi", "agent", "settings.json");
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  writeFileSync(file, JSON.stringify({ x: 1 }) + "\n");
+  await install({ yes: true, agents: ["pi"], noInstructions: true });
+  const doc = JSON.parse(readFileSync(file, "utf8"));
+  assert.deepEqual(doc, { x: 1, theme: "opencode-light/opencode" });
+});
+
+test("pi reinstall reports the themes and settings unchanged", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  await install({ yes: true, agents: ["pi"], noInstructions: true });
+  const settings = join(home, ".pi", "agent", "settings.json");
+  const before = readFileSync(settings, "utf8");
+  const lines = await captureOutput(() => install({ yes: true, agents: ["pi"], noInstructions: true }));
+  assert.equal(readFileSync(settings, "utf8"), before);
+  for (const file of ["themes/opencode.json", "themes/opencode-light.json", "extensions/statusline.ts"]) {
+    const path = join(home, ".pi", "agent", file);
+    assert.ok(lines.some((l) => l.includes(path) && l.includes("unchanged")), `${file}: ${lines.join("\n")}`);
+  }
+});
+
+test("pi install backs up an identical pre-existing status line and uninstall restores it", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  const statusline = join(home, ".pi", "agent", "extensions", "statusline.ts");
+  const original = readFileSync(join(repoRoot(), "adapters", "pi", "statusline.ts"));
+  mkdirSync(join(home, ".pi", "agent", "extensions"), { recursive: true });
+  writeFileSync(statusline, original);
+  await install({ yes: true, agents: ["pi"], noInstructions: true });
+  const names = readdirSync(join(home, ".herdr", "ranch", "backups"));
+  assert.equal(names.filter((n) => n.startsWith("pi-statusline.")).length, 1);
+  await uninstall({ yes: true, agents: ["pi"] });
+  assert.ok(existsSync(statusline));
+  assert.deepEqual(readFileSync(statusline), original);
+});
+
+test("pi uninstall restores a pre-existing different theme file", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  const theme = join(home, ".pi", "agent", "themes", "opencode.json");
+  mkdirSync(join(home, ".pi", "agent", "themes"), { recursive: true });
+  writeFileSync(theme, "// my theme\n");
+  await install({ yes: true, agents: ["pi"], noInstructions: true });
+  assert.deepEqual(readFileSync(theme), piTheme("opencode"));
+  await uninstall({ yes: true, agents: ["pi"] });
+  assert.equal(readFileSync(theme, "utf8"), "// my theme\n");
+});
+
+test("pi uninstall removes Ranch-installed assets and the theme key it added", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  const agent = join(home, ".pi", "agent");
+  await install({ yes: true, agents: ["pi"], noInstructions: true });
+  await uninstall({ yes: true, agents: ["pi"] });
+  for (const file of ["themes/opencode.json", "themes/opencode-light.json", "extensions/statusline.ts"]) {
+    assert.equal(existsSync(join(agent, file)), false, file);
+  }
+  // settings.json was created by install and only held the theme
+  assert.equal(existsSync(join(agent, "settings.json")), false);
+});
+
+test("pi uninstall removes only the theme key when settings already had content", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  const file = join(home, ".pi", "agent", "settings.json");
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  writeFileSync(file, JSON.stringify({ x: 1 }) + "\n");
+  await install({ yes: true, agents: ["pi"], noInstructions: true });
+  await uninstall({ yes: true, agents: ["pi"] });
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { x: 1 });
+});
+
+test("pi uninstall leaves a theme the person changed after install", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home });
+  const file = join(home, ".pi", "agent", "settings.json");
+  await install({ yes: true, agents: ["pi"], noInstructions: true });
+  writeFileSync(file, JSON.stringify({ theme: "light" }, null, 2) + "\n");
+  await uninstall({ yes: true, agents: ["pi"] });
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).theme, "light");
 });
