@@ -37,6 +37,7 @@ export default class RanchSettings extends View {
     this.report = null; // agent -> last_event_at, from ~/.herdr/ranch/health.json
     this.healthBusy = false; // a health load in flight: skip ticks until done
     this.versionsAt = 0;     // ms, when git/herdr versions were last checked
+    this.upd = { state: "checking", installed: null, latest: null, message: "" };
     cx.spawn(async (cx) => {
       try {
         this.known = await knownAgents();
@@ -49,6 +50,7 @@ export default class RanchSettings extends View {
     this.loadTasks(cx);
     cx.timer.every(60_000, (cx) => this.loadTasks(cx));
     this.loadHealth(cx);
+    this.checkUpdate(cx, false);
     // Task-reporting health (the report file) refreshes every 30 s; the version
     // checks spawn processes, so those wait for refreshHealth's 5-min gate.
     cx.timer.every(30_000, (cx) => this.refreshHealth(cx));
@@ -57,6 +59,7 @@ export default class RanchSettings extends View {
       for (;;) if ((await nextCommand()) === "focus") {
         this.handle.focus();
         this.refreshHealth(cx); // shown again: catch up on the report file
+        this.checkUpdate(cx, false);
       }
     });
   }
@@ -105,6 +108,70 @@ export default class RanchSettings extends View {
         if (r.code === 0) this.loadTasks(cx);
       } catch {
         this.setup = "Could not run ranch-tasks.";
+      }
+      cx.notify();
+    });
+  }
+
+  checkUpdate(cx, force) {
+    const checkedAt = shared("ranch.update.checkedAt");
+    if (!force && Number.isFinite(checkedAt) && Date.now() - checkedAt < 30 * 60_000) {
+      const last = shared("ranch.update.last");
+      if (last) this.upd = last;
+      return;
+    }
+    this.upd = { ...this.upd, state: "checking", message: "" };
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const r = await exec(...tasksCmd(["update", "check", "--json"]), { timeout: 20000 });
+        let data = null;
+        try { data = JSON.parse(r.stdout || ""); } catch {}
+        if (!data || typeof data !== "object") {
+          this.upd = { ...this.upd, state: "unsupported", message: "" };
+        } else {
+          const state = data.dev ? "dev" : data.error ? "error" : data.available ? "available" : "current";
+          this.upd = {
+            state,
+            installed: data.installed ?? null,
+            latest: data.latest ?? null,
+            message: data.error || "",
+          };
+        }
+      } catch {
+        this.upd = { ...this.upd, state: "unsupported", message: "" };
+      }
+      setShared("ranch.update.last", this.upd);
+      setShared("ranch.update.checkedAt", Date.now());
+      cx.notify();
+    });
+  }
+
+  runUpdate(cx) {
+    this.upd = { ...this.upd, state: "updating", message: "" };
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const r = await exec(...tasksCmd(["update", "--yes", "--json"]), { timeout: 300000 });
+        let data = null;
+        try { data = JSON.parse(r.stdout || ""); } catch {}
+        if (data?.ok) {
+          let message = `Updated to ${String(data.to ?? "").slice(0, 7)}`;
+          if (data.backedUp?.length) message += `, backed up ${data.backedUp.length} edited file(s) to ${data.backupDir}`;
+          if (data.tasks === "failed") message += " Task reporting reinstall failed.";
+          this.upd = { state: "updated", installed: data.to ?? null, latest: data.to ?? null, message };
+          setShared("ranch.update.last", { ...this.upd, state: "current" });
+          setShared("ranch.update.checkedAt", Date.now());
+          cx.notify();
+          run("layout.switch", { name: "main" });
+          run("layout.switch", { name: "ranch" });
+        } else if (data) {
+          this.upd = { ...this.upd, state: data.dev ? "dev" : "error", message: data.error || "Update failed." };
+        } else {
+          this.upd = { ...this.upd, state: "unsupported", message: "" };
+        }
+      } catch {
+        this.upd = { ...this.upd, state: "error", message: "Could not run ranch-tasks." };
       }
       cx.notify();
     });
@@ -431,6 +498,49 @@ export default class RanchSettings extends View {
     ]);
   }
 
+  sectionUpdates(t) {
+    const u = this.upd;
+    const short = (sha) => (sha ? String(sha).slice(0, 7) : null);
+    const [word, color] = {
+      current: ["up to date", t.done],
+      updated: ["up to date", t.done],
+      available: ["update available", t.working],
+      checking: ["checking…", t.dim],
+      updating: ["updating…", t.dim],
+      error: ["error", t.blocked],
+      dev: ["dev install", t.working],
+      unsupported: ["not available", t.blocked],
+    }[u.state] ?? ["checking…", t.dim];
+    const busy = u.state === "checking" || u.state === "updating";
+    const message = u.message
+      || (u.state === "dev" ? "Symlinked dev install — run git pull in the repo."
+        : u.state === "unsupported" ? "This Ranch install predates updates. Ask your agent to reinstall Ranch once to enable them."
+          : "");
+    // Same chain as the "Set up" button in sectionTasks.
+    const button = (id, label, action, disabled) =>
+      div().id(id).flex_none().px(10).py(4).rounded(7).bg(t.accent).text_color(t.accent_foreground).font_semibold()
+        .when(!disabled, (e) => e.cursor_pointer().on_click(action))
+        .when(disabled, (e) => e.opacity(0.6))
+        .child(label);
+    const rows = [
+      h_flex().flex_none().items_center().justify_between().gap(8)
+        .child(div().flex_1().min_w(0).truncate().child("Installed"))
+        .child(div().text_color(t.muted).child(short(u.installed) ?? "unknown")),
+      h_flex().flex_none().items_center().justify_between().gap(8)
+        .child(div().flex_1().min_w(0).truncate().child("Latest"))
+        .child(div().text_color(t.muted).child(short(u.latest) ?? "—")),
+      h_flex().flex_none().items_center().justify_between().gap(8)
+        .child(div().flex_1().min_w(0).truncate().child("Status"))
+        .child(div().text_color(color).child(word)),
+    ];
+    if (message) rows.push(div().text_size(11).text_color(t.dim).child(message));
+    const showUpdate = u.state === "available" || u.state === "updating";
+    rows.push(h_flex().flex_none().justify_end().gap(8)
+      .child(button("updates-check", "Check now", (_e, cx) => this.checkUpdate(cx, true), busy))
+      .when(showUpdate, (e) => e.child(button("updates-update", "Update", (_e, cx) => this.runUpdate(cx), u.state === "updating"))));
+    return this.card("Updates", "Ranch layout and mods from GitHub main", rows);
+  }
+
   sectionFooter(t) {
     return h_flex().flex_none().justify_end()
       .child(div().id("open-herdr-settings").flex_none().px(10).py(4).rounded(7).border_1().border_color(t.border).text_color(t.muted).cursor_pointer()
@@ -469,6 +579,7 @@ export default class RanchSettings extends View {
         this.sectionNaming(t, s),
         this.sectionTasks(t),
         this.sectionHealth(t),
+        this.sectionUpdates(t),
         this.sectionFooter(t),
       ]);
   }

@@ -4,6 +4,7 @@
 //   install [--yes] [--agents a,b,c]  set the hooks up
 //   uninstall [--yes]                 take them back out
 //   status [--json]                   what's installed where
+//   update [check] [--yes] [--json]   self-update from the repo's main branch
 //   gc                                delete store files for dead terminals
 //   plan "<status>: <title>" ...      report the whole task list in one go
 import { readFileSync, statSync } from "node:fs";
@@ -16,6 +17,7 @@ import { applyCodex } from "./codex.js";
 import { applyPi } from "./pi.js";
 import { detectCreatedPr, effectiveDir, prCommandOf, prCreateHead, prRepoOf, remoteReposOf } from "../lib/prs.js";
 import { gcStores, install, statusSummary, uninstall } from "./install.js";
+import { applyUpdate, checkUpdate } from "./update.js";
 import { reminderFor } from "./instructions.js";
 import { doctor } from "./doctor.js";
 
@@ -200,8 +202,45 @@ function humanStatus(summary) {
   return lines.join("\n");
 }
 
+function shortCommit(sha) {
+  return sha ? String(sha).slice(0, 7) : "unknown";
+}
+
+function humanUpdateCheck(result) {
+  if (result.error) return `Ranch update check failed: ${result.error}`;
+  if (result.available) return `Update available: ${shortCommit(result.installed)} -> ${shortCommit(result.latest)}`;
+  return `Ranch is up to date (${shortCommit(result.installed ?? result.latest)})`;
+}
+
+function humanUpdate(result) {
+  if (!result.ok) return `Ranch update failed: ${result.error}`;
+  if (result.dryRun) {
+    const { plan } = result;
+    const lines = [
+      `Update available: ${shortCommit(result.from)} -> ${shortCommit(result.to)} (dry run)`,
+      `  ${plan.copy.length} to copy, ${plan.unchanged.length} unchanged, ${plan.backup.length} to back up, ${plan.remove.length} to remove`,
+    ];
+    if (plan.backup.length) {
+      lines.push("Backups:");
+      for (const rel of plan.backup) lines.push(`  ${rel}`);
+    }
+    lines.push("Run with --yes to apply.");
+    return lines.join("\n");
+  }
+  const lines = [
+    `Ranch updated: ${shortCommit(result.from)} -> ${shortCommit(result.to)}`,
+    `  copied ${result.copied}, removed ${result.removed}`,
+  ];
+  if (result.backupDir) {
+    lines.push(`  backups: ${result.backupDir}`);
+    for (const rel of result.backedUp) lines.push(`    ${rel}`);
+  }
+  lines.push(`  tasks: ${result.tasks}`);
+  return lines.join("\n");
+}
+
 const USAGE =
-  'usage: ranch-tasks <claude|codex|pi|plan "<status>: <title>" ...|doctor [--json]|install [--yes] [--no-instructions] [--agents claude,codex,opencode,pi]|uninstall [--yes]|status [--json]|gc>';
+  'usage: ranch-tasks <claude|codex|pi|plan "<status>: <title>" ...|doctor [--json]|install [--yes] [--no-instructions] [--agents claude,codex,opencode,pi]|uninstall [--yes]|status [--json]|update [check] [--yes] [--json]|gc>';
 
 export async function main(argv) {
   const [command = "", ...rest] = argv ?? [];
@@ -232,6 +271,18 @@ export async function main(argv) {
   if (command === "status") {
     const summary = statusSummary();
     console.log(parseArgs(rest).json ? JSON.stringify(summary, null, 2) : humanStatus(summary));
+    return;
+  }
+  if (command === "update") {
+    const flags = parseArgs(rest);
+    if (rest[0] === "check") {
+      const result = checkUpdate();
+      console.log(flags.json ? JSON.stringify(result, null, 2) : humanUpdateCheck(result));
+      return;
+    }
+    const result = applyUpdate({ yes: flags.yes });
+    console.log(flags.json ? JSON.stringify(result, null, 2) : humanUpdate(result));
+    if (!result.ok) process.exitCode = 1;
     return;
   }
   if (command === "gc") {
