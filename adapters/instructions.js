@@ -11,6 +11,7 @@ export const END = "<!-- ranch-tasks:end -->";
 const TOOL = {
   claude: "your task tool (TaskCreate to add tasks, TaskUpdate to change status; TodoWrite if that is what you have)",
   opencode: "the todowrite tool",
+  pi: "the todo_write tool (pass the whole list every time; it replaces the previous list)",
 };
 
 const PLAN_EXAMPLE = `"doing: <first task>" "todo: <next task>"`;
@@ -25,7 +26,7 @@ export function planCommandLine(home) {
   return `${cmd.includes(" ") ? `"${cmd}"` : cmd} ${args.join(" ")}`;
 }
 
-/** The rules, worded for one agent ("claude" | "codex" | "opencode"). */
+/** The rules, worded for one agent ("claude" | "codex" | "opencode" | "pi"). */
 export function rulesFor(agent, home) {
   const tool =
     agent === "codex"
@@ -93,7 +94,9 @@ export function reminderFor(agent, event, store, home) {
       ? `update_plan (or, without it: ${planCommandLine(home)} "doing: ..." "todo: ...")`
       : agent === "opencode"
         ? "todowrite"
-        : "TaskCreate/TaskUpdate";
+        : agent === "pi"
+          ? "todo_write"
+          : "TaskCreate/TaskUpdate";
   if (event !== "SessionStart" && event !== "UserPromptSubmit") return null;
   const hasList = Array.isArray(store?.tasks) && store.tasks.length > 0;
   const missed = Number.isInteger(store?.missed_turns) && store.missed_turns > 0;

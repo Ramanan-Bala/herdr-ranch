@@ -261,7 +261,7 @@ export function storeFileName(address) {
 /** Cap for a terminal pointer's session index (most recent first). */
 export const SESSION_INDEX_MAX = 20;
 
-const GENERIC_TITLES = new Set(["new session", "opencode", "oc", "claude code"]);
+const GENERIC_TITLES = new Set(["new session", "opencode", "oc", "claude code", "pi"]);
 
 /**
  * Comparison key for a session title, or null when the title says nothing

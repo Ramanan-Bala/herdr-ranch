@@ -1,5 +1,5 @@
 // ranch-tasks CLI (requirements.md §7.4). Subcommands:
-//   claude | codex                    hook entry points — read stdin JSON,
+//   claude | codex | pi               hook entry points — read stdin JSON,
 //                                     update the store, print NOTHING, exit 0
 //   install [--yes] [--agents a,b,c]  set the hooks up
 //   uninstall [--yes]                 take them back out
@@ -14,6 +14,7 @@ import { parsePlanArgs, planSummary } from "./plan.js";
 import { agentApp } from "../lib/tasks.js";
 import { applyClaude } from "./claude.js";
 import { applyCodex } from "./codex.js";
+import { applyPi } from "./pi.js";
 import { detectCreatedPr, effectiveDir, prCommandOf, prCreateHead, prRepoOf, remoteReposOf } from "../lib/prs.js";
 import { gcStores, install, statusSummary, uninstall } from "./install.js";
 import { applyUpdate, checkUpdate } from "./update.js";
@@ -239,7 +240,7 @@ function humanUpdate(result) {
 }
 
 const USAGE =
-  'usage: ranch-tasks <claude|codex|plan "<status>: <title>" ...|doctor [--json]|install [--yes] [--no-instructions] [--agents claude,codex,opencode]|uninstall [--yes]|status [--json]|update [check] [--yes] [--json]|gc>';
+  'usage: ranch-tasks <claude|codex|pi|plan "<status>: <title>" ...|doctor [--json]|install [--yes] [--no-instructions] [--agents claude,codex,opencode,pi]|uninstall [--yes]|status [--json]|update [check] [--yes] [--json]|gc>';
 
 export async function main(argv) {
   const [command = "", ...rest] = argv ?? [];
@@ -249,6 +250,10 @@ export async function main(argv) {
   }
   if (command === "codex") {
     runHook("codex", applyCodex);
+    return;
+  }
+  if (command === "pi") {
+    runHook("pi", applyPi);
     return;
   }
   if (command === "plan") {

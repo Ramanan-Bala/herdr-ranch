@@ -13,7 +13,7 @@ import { createInterface } from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
 import { STALE, pointerSession } from "../lib/tasks.js";
 
-const AGENTS = ["claude", "codex", "opencode"];
+const AGENTS = ["claude", "codex", "opencode", "pi"];
 import { rulesFor, blockFor, CLAUDE_IMPORT, withBlock, stripBlock } from "./instructions.js";
 
 const RANCH_MARK = "/.herdr/ranch/bin/ranch-tasks";
@@ -39,6 +39,18 @@ function runningFromRepo() {
   return resolve(here) !== resolve(join(homeDir(), ".herdr", "ranch", "adapters"));
 }
 
+/** Every file under dir, as paths relative to it (recursive, stable order). */
+function filesUnder(dir, prefix = "") {
+  const out = [];
+  for (const name of readdirSync(join(dir, prefix))) {
+    if (name.startsWith(".")) continue; // .DS_Store and other hidden files
+    const rel = prefix ? join(prefix, name) : name;
+    if (statSync(join(dir, rel)).isDirectory()) out.push(...filesUnder(dir, rel));
+    else out.push(rel);
+  }
+  return out;
+}
+
 /**
  * The exact src/dest list copyRuntime copies (also the drift check's list);
  * mode is applied to the copied file when set.
@@ -57,6 +69,14 @@ function runtimeFiles() {
     { src: join(root, "lib", "tasks.js"), dest: join(ranch, "lib", "tasks.js") },
     { src: join(root, "lib", "prs.js"), dest: join(ranch, "lib", "prs.js") },
     { src: join(root, "lib", "tasks-command.js"), dest: join(ranch, "lib", "tasks-command.js") },
+    // Pi themes and the status-line extension, so install from the installed
+    // copy (~/.herdr/ranch) still finds them.
+    ...(existsSync(join(root, "adapters", "pi"))
+      ? filesUnder(join(root, "adapters", "pi")).map((rel) => ({
+        src: join(root, "adapters", "pi", rel),
+        dest: join(ranch, "adapters", "pi", rel),
+      }))
+      : []),
   ];
 }
 
@@ -71,15 +91,22 @@ function installedRuntimeDiffers() {
     }
   }
   // A differing installed plugin also means outdated; a missing one does not
-  // (the opencode agent reports "missing" for that anyway).
-  try {
-    const installed = readFileSync(join(homeDir(), ".config", "opencode", "plugins", "ranch-tasks.js"));
-    // Only Ranch's own plugin counts; a person's file at that path is not drift.
-    if (!installed.toString("utf8").includes(PLUGIN_MARKER)) return false;
-    return !readFileSync(join(here, "opencode-plugin.js")).equals(installed);
-  } catch {
-    return false;
+  // (the opencode/pi agents report "missing" for that anyway).
+  const plugins = [
+    [join(here, "opencode-plugin.js"), join(homeDir(), ".config", "opencode", "plugins", "ranch-tasks.js")],
+    [join(here, "pi-extension.js"), join(homeDir(), ".pi", "agent", "extensions", "ranch-tasks.js")],
+  ];
+  for (const [src, dest] of plugins) {
+    try {
+      const installed = readFileSync(dest);
+      // Only Ranch's own plugin counts; a person's file at that path is not drift.
+      if (!installed.toString("utf8").includes(PLUGIN_MARKER)) continue;
+      if (!readFileSync(src).equals(installed)) return true;
+    } catch {
+      // missing or unreadable: not drift
+    }
   }
+  return false;
 }
 
 // Hooks written by a broken Windows install hold backslash paths; normalize
@@ -191,11 +218,12 @@ function readInstallManifest() {
       createdFiles: Array.isArray(doc.createdFiles) ? doc.createdFiles : [],
       createdDirs: Array.isArray(doc.createdDirs) ? doc.createdDirs : [],
       opencodeTodo: doc.opencodeTodo && typeof doc.opencodeTodo === "object" ? doc.opencodeTodo : null,
+      piTheme: doc.piTheme && typeof doc.piTheme === "object" ? doc.piTheme : null,
       claudeTodoEnv: doc.claudeTodoEnv === true,
       owned: doc.owned && typeof doc.owned === "object" && !Array.isArray(doc.owned) ? doc.owned : {},
     };
   } catch {
-    return { createdFiles: [], createdDirs: [], opencodeTodo: null, claudeTodoEnv: false, owned: {} };
+    return { createdFiles: [], createdDirs: [], opencodeTodo: null, piTheme: null, claudeTodoEnv: false, owned: {} };
   }
 }
 
@@ -701,6 +729,162 @@ function installOpencode(results, backups) {
   installOpencodeConfig(results, backups);
 }
 
+/** The Pi files Ranch installs: [src, dest, backup label]. */
+function piFiles() {
+  const agent = join(homeDir(), ".pi", "agent");
+  return [
+    { src: join(here, "pi-extension.js"), dest: join(agent, "extensions", "ranch-tasks.js"), label: "pi-extension" },
+    { src: join(here, "pi", "themes", "opencode.json"), dest: join(agent, "themes", "opencode.json"), label: "pi-theme-opencode" },
+    { src: join(here, "pi", "themes", "opencode-light.json"), dest: join(agent, "themes", "opencode-light.json"), label: "pi-theme-opencode-light" },
+    { src: join(here, "pi", "statusline.ts"), dest: join(agent, "extensions", "statusline.ts"), label: "pi-statusline" },
+  ];
+}
+
+/** The three shipped assets whose drift `status` reports (the extension is
+ * already covered by the plugin check). */
+function piAssetFiles() {
+  return piFiles().filter((f) => f.label !== "pi-extension");
+}
+
+function installPiFile({ src, dest, label }, results, backups) {
+  const existed = existsSync(dest);
+  const manifest = readInstallManifest();
+  const ours = existed && ownedMatches(manifest, dest, readFileSync(dest));
+  if (existed && ours) {
+    if (sameFile(src, dest)) {
+      recordOwned(dest, sha256Of(readFileSync(dest)));
+      results.push({ path: dest, action: "unchanged" });
+      return;
+    }
+    // Ranch's own file upgraded in place: keep the recorded original backup.
+    const ownedBackup = manifest.owned[dest]?.backup ?? null;
+    mkdirSync(dirname(dest), { recursive: true });
+    copyFileSync(src, dest);
+    recordOwned(dest, sha256Of(readFileSync(src)), ownedBackup);
+    results.push({ path: dest, action: "replaced" });
+    return;
+  }
+  if (existed) {
+    // Not Ranch's: always back it up, even when the bytes match ours, so
+    // uninstall restores the person's original instead of deleting it.
+    const backup = backupFile(dest, label, backups);
+    if (sameFile(src, dest)) {
+      recordOwned(dest, sha256Of(readFileSync(dest)), backup);
+      results.push({ path: dest, action: "unchanged" });
+      return;
+    }
+    mkdirSync(dirname(dest), { recursive: true });
+    copyFileSync(src, dest);
+    recordOwned(dest, sha256Of(readFileSync(src)), backup);
+    results.push({ path: dest, action: "replaced" });
+    return;
+  }
+  mkdirSync(dirname(dest), { recursive: true });
+  copyFileSync(src, dest);
+  recordOwned(dest, sha256Of(readFileSync(src)), null);
+  results.push({ path: dest, action: "copied" });
+}
+
+const PI_THEME = "opencode-light/opencode";
+
+/** Picks Ranch's Pi theme pair only when the person has not chosen one. */
+function installPiTheme(results, backups) {
+  const file = join(homeDir(), ".pi", "agent", "settings.json");
+  const existed = existsSync(file);
+  const { doc } = readConfig(file);
+  if (doc == null) {
+    results.push({ path: file, action: "skipped (not valid JSON)" });
+    return;
+  }
+  if (doc.theme !== undefined && doc.theme !== "system") {
+    results.push({ path: file, action: `theme left as ${doc.theme}` });
+    return;
+  }
+  const previous = doc.theme === undefined ? null : doc.theme;
+  if (existed) backupFile(file, "pi-settings", backups);
+  doc.theme = PI_THEME;
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+  const manifest = readInstallManifest();
+  manifest.piTheme = { file, previous, value: PI_THEME, created: !existed };
+  writeManifest(manifest);
+  results.push({ path: file, action: existed ? "selected theme" : "created (theme selected)" });
+}
+
+/** Undoes installPiTheme while the recorded value is still in place. */
+function uninstallPiTheme(results) {
+  const manifest = readInstallManifest();
+  const record = manifest.piTheme;
+  if (!record) return;
+  manifest.piTheme = null;
+  writeManifest(manifest);
+  const file = record.file ?? join(homeDir(), ".pi", "agent", "settings.json");
+  if (!existsSync(file)) {
+    results.push({ path: file, action: "not present" });
+    return;
+  }
+  const { doc } = readConfig(file);
+  if (doc == null || doc.theme !== record.value) {
+    results.push({ path: file, action: "theme changed since install, left as is" });
+    return;
+  }
+  if (record.previous == null) delete doc.theme;
+  else doc.theme = record.previous;
+  if (record.created && Object.keys(doc).length === 0) {
+    unlinkSync(file);
+    results.push({ path: file, action: "deleted (Ranch created it)" });
+    return;
+  }
+  writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+  results.push({ path: file, action: record.previous == null ? "removed theme setting" : "restored theme setting" });
+}
+
+function installPi(results, backups) {
+  for (const file of piFiles()) installPiFile(file, results, backups);
+  installPiTheme(results, backups);
+}
+
+/** Restores/deletes Pi files Ranch installed; the legacy extension rule
+ * (PLUGIN_MARKER without an owned record) stays for ranch-tasks.js. */
+function uninstallPiFile({ dest, label }, results, backups) {
+  if (!existsSync(dest)) {
+    results.push({ path: dest, action: "not present" });
+    return;
+  }
+  const bytes = readFileSync(dest);
+  const manifest = readInstallManifest();
+  // Ours = the exact bytes we recorded (or, for legacy extension installs
+  // without an owned record, the shipped extension unmodified).
+  const shipped = label === "pi-extension" ? shippedPi() : null;
+  const ours = ownedMatches(manifest, dest, bytes) ||
+    (shipped !== null && !manifest.owned[dest] && bytes.equals(shipped));
+  const backup = manifest.owned[dest]?.backup;
+  if (ours) {
+    if (backup && existsSync(backup)) {
+      copyFileSync(backup, dest);
+      results.push({ path: dest, action: "restored original" });
+    } else {
+      unlinkSync(dest);
+      results.push({ path: dest, action: "deleted" });
+    }
+    removeOwned(dest);
+  } else if (label === "pi-extension" ? bytes.toString("utf8").includes(PLUGIN_MARKER) : !!manifest.owned[dest]) {
+    // Ranch's file changed since install (edited, or an older Ranch version):
+    // keep a copy, then take ours out.
+    const saved = backupFile(dest, label, backups);
+    unlinkSync(dest);
+    removeOwned(dest);
+    results.push({ path: dest, action: `deleted (backed up to ${saved})` });
+  } else {
+    results.push({ path: dest, action: "unchanged (not Ranch's)" });
+  }
+}
+
+function uninstallPi(results, backups) {
+  for (const file of piFiles()) uninstallPiFile(file, results, backups);
+  uninstallPiTheme(results);
+}
+
 function selectAgents(opts) {
   const requested = Array.isArray(opts.agents) && opts.agents.length ? opts.agents : [...AGENTS];
   return AGENTS.filter((a) => requested.includes(a));
@@ -723,6 +907,13 @@ function plan(agents, opts = {}) {
     items.push({ path: join(home, ".config", "opencode", "plugins", "ranch-tasks.js"), action: "copy plugin" });
     items.push({ path: opencodeConfigFile(), action: "enable experimental todo tool" });
   }
+  if (agents.includes("pi")) {
+    items.push({ path: join(home, ".pi", "agent", "extensions", "ranch-tasks.js"), action: "copy extension" });
+    items.push({ path: join(home, ".pi", "agent", "themes", "opencode.json"), action: "copy theme" });
+    items.push({ path: join(home, ".pi", "agent", "themes", "opencode-light.json"), action: "copy theme" });
+    items.push({ path: join(home, ".pi", "agent", "extensions", "statusline.ts"), action: "copy status line extension" });
+    items.push({ path: join(home, ".pi", "agent", "settings.json"), action: "select theme if none chosen" });
+  }
   if (!opts.noInstructions) {
     for (const f of instructionFiles(agents)) items.push({ path: f.path, action: f.planAction });
   }
@@ -743,6 +934,7 @@ function instructionFiles(agents) {
   }
   if (agents.includes("codex")) files.push({ path: join(home, ".codex", "AGENTS.md"), block: blockFor("codex", home), planAction: "add marked task-reporting block" });
   if (agents.includes("opencode")) files.push({ path: join(home, ".config", "opencode", "AGENTS.md"), block: blockFor("opencode"), planAction: "add marked task-reporting block" });
+  if (agents.includes("pi")) files.push({ path: join(home, ".pi", "agent", "AGENTS.md"), block: blockFor("pi", home), planAction: "add marked task-reporting block" });
   return files;
 }
 
@@ -876,6 +1068,7 @@ export async function install(opts = {}) {
     }
   }
   if (agents.includes("opencode")) installOpencode(results, backups);
+  if (agents.includes("pi")) installPi(results, backups);
   if (agents.includes("codex")) pruneCodexTrust(results, backups);
   if (!opts.noInstructions) installInstructions(agents, results, backups);
   printResults(results, backups);
@@ -905,6 +1098,13 @@ export async function uninstall(opts = {}) {
   if (agents.includes("opencode")) {
     items.push({ path: join(home, ".config", "opencode", "plugins", "ranch-tasks.js"), action: "delete plugin" });
     items.push({ path: readInstallManifest().opencodeTodo?.file ?? opencodeConfigFile(), action: "disable experimental todo tool" });
+  }
+  if (agents.includes("pi")) {
+    items.push({ path: join(home, ".pi", "agent", "extensions", "ranch-tasks.js"), action: "delete extension" });
+    items.push({ path: join(home, ".pi", "agent", "themes", "opencode.json"), action: "delete theme" });
+    items.push({ path: join(home, ".pi", "agent", "themes", "opencode-light.json"), action: "delete theme" });
+    items.push({ path: join(home, ".pi", "agent", "extensions", "statusline.ts"), action: "delete status line extension" });
+    items.push({ path: join(home, ".pi", "agent", "settings.json"), action: "restore theme setting" });
   }
   if (!items.length) return;
   if (!opts.yes) {
@@ -1022,6 +1222,8 @@ export async function uninstall(opts = {}) {
     uninstallOpencodeConfig(results);
   }
 
+  if (agents.includes("pi")) uninstallPi(results, backups);
+
   printResults(results, backups);
 }
 
@@ -1029,6 +1231,15 @@ export async function uninstall(opts = {}) {
 function shippedPlugin() {
   try {
     return readFileSync(join(here, "opencode-plugin.js"));
+  } catch {
+    return null;
+  }
+}
+
+/** The Pi extension bytes this build ships (null when unreadable). */
+function shippedPi() {
+  try {
+    return readFileSync(join(here, "pi-extension.js"));
   } catch {
     return null;
   }
@@ -1060,6 +1271,28 @@ export function statusSummary(platform = process.platform) {
     }
     return outdated ? "outdated" : "installed";
   })();
+  const piExtension = join(home, ".pi", "agent", "extensions", "ranch-tasks.js");
+  const piOutdated = () => {
+    if (outdated) return true;
+    const manifest = readInstallManifest();
+    // Only files Ranch recorded count: a person's own file at a dest is not drift.
+    return piAssetFiles().some(({ src, dest }) => {
+      if (!manifest.owned[dest]) return false;
+      try {
+        return !readFileSync(src).equals(readFileSync(dest));
+      } catch {
+        return true;
+      }
+    });
+  };
+  const pi = (() => {
+    try {
+      if (!readFileSync(piExtension, "utf8").includes(PLUGIN_MARKER)) return "missing";
+    } catch {
+      return "missing";
+    }
+    return piOutdated() ? "outdated" : "installed";
+  })();
   const codexBase = hookStatus(join(home, ".codex", "hooks.json"));
   let codexConfigText = "";
   try {
@@ -1077,6 +1310,7 @@ export function statusSummary(platform = process.platform) {
       claude: hookStatus(join(home, ".claude", "settings.json")),
       codex,
       opencode,
+      pi,
     },
     opencodeTodo: opencodeTodoEnabled(),
     claudeTodoEnv: claudeTodoEnvEnabled(join(home, ".claude", "settings.json")),

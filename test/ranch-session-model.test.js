@@ -20,6 +20,8 @@ const {
   unfinishedCount,
   defaultBranchLine,
   taskEmptyState,
+  TASK_AGENTS,
+  adapterKey,
   remoteText,
   fileRow,
   subDuration,
@@ -145,15 +147,20 @@ test("defaultBranchLine", () => {
   assert.equal(defaultBranchLine({ branch: null, default: "main", vsDefault: { ahead: 1, behind: 0 } }).kind, "diverged");
 });
 
+test("TASK_AGENTS and adapterKey include Pi", () => {
+  assert.equal(TASK_AGENTS.has("pi"), true);
+  assert.equal(adapterKey("pi"), "pi");
+});
+
 test("taskEmptyState", () => {
   const ok = (tasks) => ({ ok: true, store: { tasks } });
   assert.equal(taskEmptyState(ok([{ title: "x" }]), "claude-code"), null);
   assert.deepEqual(taskEmptyState(ok([]), "claude-code"), { text: "No plan yet." });
-  assert.deepEqual(taskEmptyState(ok([]), "pi"), { text: "No detailed steps reported for this session." });
+  assert.deepEqual(taskEmptyState(ok([]), "pi"), { text: "No plan yet." });
   assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, "claude"), { text: "No plan yet." });
   assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, "codex"), { text: "No plan yet." });
   assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, "opencode"), { text: "No plan yet." });
-  for (const app of ["claude-code", "claude", "codex", "opencode"]) {
+  for (const app of ["claude-code", "claude", "codex", "opencode", "pi"]) {
     assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, app, "missing"), {
       text: "Task reporting isn't set up", setup: true,
     });

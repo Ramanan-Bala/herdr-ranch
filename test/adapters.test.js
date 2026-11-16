@@ -1069,8 +1069,8 @@ test("install/uninstall round trip restores configs byte-for-byte", async () => 
     assert.ok(enabled.includes('// "disabled_providers": ["opencode"],'));
     assert.equal(statusSummary().opencodeTodo, true);
 
-    // status: all installed while running from the repo
-    assert.deepEqual(statusSummary().agents, { claude: "installed", codex: "installed", opencode: "installed" });
+    // status: all installed while running from the repo (pi was not selected)
+    assert.deepEqual(statusSummary().agents, { claude: "installed", codex: "installed", opencode: "installed", pi: "missing" });
 
     // tamper with the installed cli.js -> outdated
     const installedCli = join(home, ".herdr", "ranch", "adapters", "cli.js");
@@ -1084,7 +1084,7 @@ test("install/uninstall round trip restores configs byte-for-byte", async () => 
     assert.equal(readFileSync(settings, "utf8"), before);
     assert.equal(readFileSync(opencodeConfig, "utf8"), configBefore);
     // ...and the fresh runtime copy repairs the tampered one
-    assert.deepEqual(statusSummary().agents, { claude: "installed", codex: "installed", opencode: "installed" });
+    assert.deepEqual(statusSummary().agents, { claude: "installed", codex: "installed", opencode: "installed", pi: "missing" });
 
     // uninstall restores everything
     await uninstall({ yes: true, agents: ["claude", "codex", "opencode"] });
@@ -1094,7 +1094,7 @@ test("install/uninstall round trip restores configs byte-for-byte", async () => 
     assert.equal(existsSync(join(home, ".codex")), false);
     assert.equal(existsSync(join(home, ".config", "opencode", "plugins", "ranch-tasks.js")), false);
     assert.equal(statusSummary().opencodeTodo, false);
-    assert.deepEqual(statusSummary().agents, { claude: "missing", codex: "missing", opencode: "missing" });
+    assert.deepEqual(statusSummary().agents, { claude: "missing", codex: "missing", opencode: "missing", pi: "missing" });
   } finally {
     delete process.env.RANCH_HOME;
   }
@@ -1208,12 +1208,14 @@ test("mandatory task reporting: hook reminder, instruction files, OpenCode syste
   assert.match(fs.readFileSync(path.join(home, ".claude", "RANCH.md"), "utf8"), /EVERY message/);
   assert.match(fs.readFileSync(path.join(home, ".codex", "AGENTS.md"), "utf8"), /update_plan/);
   assert.match(fs.readFileSync(path.join(home, ".config", "opencode", "AGENTS.md"), "utf8"), /todowrite/);
+  assert.match(fs.readFileSync(path.join(home, ".pi", "agent", "AGENTS.md"), "utf8"), /todo_write/);
   assert.equal(run(["install", "--yes"]).status, 0);
   assert.equal((fs.readFileSync(path.join(home, ".claude", "CLAUDE.md"), "utf8").match(/@RANCH\.md/g) ?? []).length, 1);
   assert.equal(run(["uninstall", "--yes"]).status, 0);
   assert.equal(fs.readFileSync(path.join(home, ".claude", "CLAUDE.md"), "utf8"), original);
   assert.equal(fs.existsSync(path.join(home, ".claude", "RANCH.md")), false);
   assert.equal(fs.existsSync(path.join(home, ".config", "opencode", "AGENTS.md")), false);
+  assert.equal(fs.existsSync(path.join(home, ".pi", "agent", "AGENTS.md")), false);
 
   // OpenCode plugin adds the rule to the system prompt once — with HOME
   // redirected so the real AGENTS.md block (if any) is out of the picture.

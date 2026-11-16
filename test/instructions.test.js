@@ -136,6 +136,19 @@ test("reminderFor opencode is byte-identical", () => {
   );
 });
 
+// Pi rules and reminders point at its todo_write tool.
+
+test("rulesFor pi mentions todo_write and whole-list replacement", () => {
+  const rules = rulesFor("pi");
+  assert.match(rules, /the todo_write tool/);
+  assert.match(rules, /pass the whole list every time; it replaces the previous list/);
+});
+
+test("reminderFor pi mentions todo_write", () => {
+  assert.match(reminderFor("pi", "SessionStart", { tasks: [] }), /todo_write/);
+  assert.match(reminderFor("pi", "UserPromptSubmit", { tasks: [] }), /todo_write/);
+});
+
 test("reminderFor codex without home keeps the generic fallback", () => {
   assert.match(reminderFor("codex", "SessionStart", { tasks: [] }), /update_plan \(or, without it: ranch-tasks plan "doing: \.\.\." "todo: \.\.\."\)/);
 });

@@ -70,3 +70,17 @@ test("doctor reports update_plan enabled from config.toml", async (t) => {
   const tool = codexCheck(report, "codex update_plan tool");
   assert.ok(tool.detail.startsWith("enabled"), tool.detail);
 });
+
+test("doctor runs the pi synthetic session end to end when Pi is installed", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "ranch-doctor-pi-"));
+  const saved = process.env.RANCH_HOME;
+  process.env.RANCH_HOME = home;
+  t.after(() => { if (saved === undefined) delete process.env.RANCH_HOME; else process.env.RANCH_HOME = saved; });
+  await install({ yes: true, agents: ["pi"], noInstructions: true });
+
+  const report = await doctor();
+  const hooks = codexCheck(report, "pi hooks");
+  assert.equal(hooks.ok, true, hooks.detail);
+  const synthetic = codexCheck(report, "pi synthetic event");
+  assert.equal(synthetic.ok, true, synthetic.detail);
+});

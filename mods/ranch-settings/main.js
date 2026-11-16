@@ -10,7 +10,7 @@ import { EdgeGrip } from "./lib/edge-grip.js";
 // Windows can't exec the POSIX sh launcher; it calls node on the .js entry.
 const isWin = () => appWindow()?.platform === "windows";
 const tasksCmd = (args) => tasksCommand(home(), args, isWin());
-const TASK_KEYS = ["claude", "codex", "opencode"];
+const TASK_KEYS = ["claude", "codex", "opencode", "pi"];
 const HERDR_MIN = [0, 1, 15];
 
 const displayName = (key, known) => (key === "terminal" ? "Terminal" : known.find((k) => k.key === key)?.name || key);
@@ -31,7 +31,7 @@ export default class RanchSettings extends View {
     // knownAgents() result: [{key, name, icon, tint, run, installed}]. It can take
     // ~30 s (it asks the login shell), so start from the last cached answer.
     this.known = shared("ranch.knownAgents") ?? null;
-    this.tasks = null; // null = checking; {agents: {claude, codex, opencode}} | {error: true}
+    this.tasks = null; // null = checking; {agents: {claude, codex, opencode, pi}} | {error: true}
     this.setup = null; // output of the last "Set up" run
     this.health = { git: "checking", herdr: "checking" };
     this.report = null; // agent -> last_event_at, from ~/.herdr/ranch/health.json
@@ -450,7 +450,7 @@ export default class RanchSettings extends View {
         const status = this.tasks.agents[key];
         const color = status === "installed" ? t.done : status === "outdated" || status === "needs approval" ? t.working : t.blocked;
         const group = [h_flex().flex_none().items_center().justify_between().gap(8)
-          .child(div().flex_1().min_w(0).truncate().child(key))
+          .child(div().flex_1().min_w(0).truncate().child(displayName(key, this.known ?? [])))
           .child(div().text_color(color).child(status))];
         // "last report N min ago" (fixes 3.8): when the agent last evented.
         const at = this.report?.[key] ? Date.parse(this.report[key]) : null;
