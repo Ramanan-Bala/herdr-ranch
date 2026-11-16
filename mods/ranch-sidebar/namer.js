@@ -14,7 +14,7 @@ import {
 } from "./lib/settings.js";
 import { folderLabel, subagentsWorking } from "./lib/format.js";
 import { homeCache } from "./lib/home.js";
-import { agentShort, collectInputs, buildModelPrompt } from "./namer-model.js";
+import { agentShort, collectInputs, buildModelPrompt, pickNamingAgent } from "./namer-model.js";
 
 const STORE_TTL = 2000;
 /** Shared state: { [tabId]: { state, at } } from Ranch's hooks (see lib/tasks.js). */
@@ -88,7 +88,8 @@ export class TabNamer {
         seen.add(tab.id);
         try {
           // Activity from Ranch's hooks, for tabs where Herdr shows no status.
-          const agent = agentsNow.find((a) => a.tab === tab.id) ?? paneAgent(panesNow, tab.id);
+          const agent = pickNamingAgent({ tabId: tab.id, agents: agentsNow, panes: panesNow, terminals: terminalsNow })
+            ?? paneAgent(panesNow, tab.id);
           if (agent) {
             const store = await this.loadStore(agent.address, space.machine, agent.app);
             const act = store?.session?.activity;
@@ -100,7 +101,7 @@ export class TabNamer {
               || [...parents].some((p) => subagentsWorking({ terminals: terminalsNow, parent: p, now }));
             if (act || subs) activity[tab.id] = subs ? { ...(act ?? {}), subsWorking: true } : act;
           }
-          if (settings.naming.enabled) await this.handleTab(space, tab, agentsNow, panesNow, settings);
+          if (settings.naming.enabled) await this.handleTab(space, tab, agentsNow, panesNow, settings, terminalsNow);
         } catch (err) {
           this.logOnce(err);
         }
@@ -115,11 +116,12 @@ export class TabNamer {
     }
   }
 
-  async handleTab(space, tab, agentsAll, panesAll, settings) {
+  async handleTab(space, tab, agentsAll, panesAll, settings, terminalsAll = []) {
     const naming = settings.naming;
     // An agent whose status report was cleared (Herdr shows status null) is
     // still an agent session: fall back to a pane running a known agent app.
-    const agent = agentsAll.find((a) => a.tab === tab.id) ?? paneAgent(panesAll, tab.id);
+    const agent = pickNamingAgent({ tabId: tab.id, agents: agentsAll, panes: panesAll, terminals: terminalsAll })
+      ?? paneAgent(panesAll, tab.id);
     const prev = this.prev.get(tab.id) ?? {};
 
     let store = null;
@@ -155,6 +157,7 @@ export class TabNamer {
       agentName: agent ? agentShort(agent.program.name) : null,
       repo: folderLabel(pane?.cwd ?? null, home()),
       settings,
+      context: [space.name],
     });
 
     // Optional model summary (R-TN-6): once per session, one attempt at most.
@@ -242,7 +245,7 @@ export class TabNamer {
     run("tab.rename", { id: tab.id, name: result.name });
     setShared(AUTONAMES_KEY, {
       ...(shared(AUTONAMES_KEY) ?? {}),
-      [tab.id]: { name: result.name, source: result.source, at: Date.now() },
+      [tab.id]: { name: result.name, source: result.source, prev: tab.named ? tab.name : null, at: Date.now() },
     });
     if (sessionId) {
       setShared(SESSIONS_KEY, rememberSession(shared(SESSIONS_KEY) ?? {}, sessionId, result.name));

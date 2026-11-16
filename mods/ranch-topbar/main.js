@@ -9,6 +9,7 @@ import {
   settings, knownAgents, nextCommand, setShared, home,
 } from "herdr";
 import { AUTONAMES_KEY, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
+import { ownership } from "./lib/naming.js";
 import { effectiveStatus, attentionQueue, closeNeedsConfirm, closeConfirmProps } from "./lib/format.js";
 import { readPanels } from "./state.js";
 import { VIEWER_KEY, viewerTab, isViewerTab, openViewerCommands, baseName } from "./lib/file-viewer.js";
@@ -301,9 +302,9 @@ export default class RanchTopbar extends View {
           .child(div().max_w(160).truncate().text_color(t.muted).child(space.name))
           .child(div().text_color(t.dim).flex_none().child("/")))
         .child(div().max_w(320).truncate().text_color(viewing ? t.muted : t.foreground).when(!viewing, el => el.font_semibold()).child(name))
-        .when(show.marker && tab.named && auto?.name === tab.name, el => el.child(div().id(`auto-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
-          .tooltip(`Named by the agent's session (source: ${auto.source ?? "agent"})`).child("auto")))
-        .when(show.marker && tab.named && auto?.name !== tab.name, el => el.child(div().id(`lock-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
+        .when(show.marker && tab.named && ownership(tab, auto) === "auto", el => el.child(div().id(`auto-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
+          .tooltip(`Named by the agent's session (source: ${auto?.source ?? "agent"})`).child("auto")))
+        .when(show.marker && tab.named && ownership(tab, auto) === "locked", el => el.child(div().id(`lock-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
           .tooltip("You named this tab. Reset name in the tab menu to let the agent name it.").child("✎")))
         .child(tabClose(`close-${tab.id}`, close));
     })();

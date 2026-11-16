@@ -31,6 +31,8 @@ const EDGE_TAIL_RE = /[^\p{L}\p{N}#)]+$/u;
 const AGENT_NAMES = "(?:Claude Code|OpenCode|Claude|Codex|Pi)";
 const AGENT_LEAD_RE = new RegExp(`^${AGENT_NAMES}(?:[\\s·—–:|,\\-]+|$)`, "iu");
 const AGENT_TAIL_RE = new RegExp(`(?:^|[\\s·—–:|,\\-]+)${AGENT_NAMES}$`, "iu");
+// Brand glyphs ("π Fix login", "OC | Fix login") are only stripped as a whole word.
+const BRAND_LEAD_RE = /^(?:π|OC)(?=[^\p{L}\p{N}]|$)/u;
 const USER_HOST_RE = /^[\w.\-+%]+@[A-Za-z0-9.\-]+:\s*/u;
 const ELLIPSIS_RE = /(?:\u2026|\.{3})$/;
 const SENTENCE_RE = /^[\s\S]*?[.?!](?=\s|$)/u;
@@ -80,7 +82,7 @@ export function cleanTitle(raw, { repo = null } = {}) {
   let prev = null;
   while (prev !== s) {
     prev = s;
-    s = trimEdges(s.replace(AGENT_LEAD_RE, "").replace(AGENT_TAIL_RE, ""));
+    s = trimEdges(s.replace(BRAND_LEAD_RE, "").replace(AGENT_LEAD_RE, "").replace(AGENT_TAIL_RE, ""));
   }
   s = s.replace(USER_HOST_RE, "");
   s = s.split(/\s+/).filter((t) => t && !isPathToken(t)).join(" ");
@@ -170,29 +172,42 @@ export function bestCandidate(inputs = {}) {
     defaultBranch,
     agentName,
     repo,
+    context = [],
   } = inputs;
+  const ctx = new Set(context.map(slug).filter(Boolean));
+  const skip = (name) => ctx.size > 0 && ctx.has(slug(name));
   if (agentTitle) {
     const cleaned = cleanTitle(agentTitle);
-    if (cleaned) {
+    if (cleaned && (agentTitleSource === "user" || !skip(cleaned))) {
       return { name: cleaned, source: agentTitleSource === "user" ? "agent_user" : "agent_auto" };
     }
   }
   if (terminalTitle) {
     const cleaned = cleanTitle(terminalTitle, { repo });
-    if (cleaned) return { name: cleaned, source: "agent_auto" };
+    if (cleaned && !skip(cleaned)) return { name: cleaned, source: "agent_auto" };
   }
   const prompt = firstPrompt ?? launchTask;
   if (prompt) {
     const cleaned = tidy(summarizePrompt(prompt));
-    if (cleaned) return { name: cleaned, source: "prompt" };
+    if (cleaned && !skip(cleaned)) return { name: cleaned, source: "prompt" };
   }
   if (branch) {
     const cleaned = tidy(humanizeBranch(branch, defaultBranch));
-    if (cleaned) return { name: cleaned, source: "branch" };
+    if (cleaned && !skip(cleaned)) return { name: cleaned, source: "branch" };
   }
-  const provisional = tidy(provisionalName(agentName, repo));
+  // Inside a space named after the repo, "Claude · ranch" just repeats it.
+  const provisional = tidy(provisionalName(agentName, skip(repo) ? null : repo));
   if (provisional) return { name: provisional, source: "provisional" };
   return null;
+}
+
+/** Lowercase word slug: "Ranch UI" -> "ranch-ui". */
+function slug(s) {
+  if (s == null) return "";
+  return String(s)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function tidy(s) {
@@ -201,10 +216,26 @@ function tidy(s) {
   return out || null;
 }
 
+/** Compare two tab names ignoring control characters and whitespace runs. */
+function sameName(a, b) {
+  return normalizeName(a) === normalizeName(b);
+}
+
+function normalizeName(s) {
+  return String(s ?? "")
+    .replace(/\p{Cc}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /** Who owns the tab's current name: "unnamed", "auto" (Ranch set it) or "locked". */
 export function ownership(tab, record) {
   if (!tab || !tab.named) return "unnamed";
-  return record && record.name === tab.name ? "auto" : "locked";
+  // Herdr may normalize our name, and a rename may not have landed at all
+  // (the tab still shows the previous auto name).
+  if (record && sameName(record.name, tab.name)) return "auto";
+  if (record && typeof record.prev === "string" && record.prev && sameName(record.prev, tab.name)) return "auto";
+  return "locked";
 }
 
 /** Disambiguate against sibling tabs: branch suffix first, then " 2", " 3", ... */
@@ -243,7 +274,7 @@ export function decide(ctx = {}) {
   if (own === "auto" && SOURCE_RANK[candidate.source] > recordRank(record)) {
     return { action: "none", reason: "downgrade" };
   }
-  if (name === tab.name) return { action: "none", reason: "same" };
+  if (sameName(name, tab.name)) return { action: "none", reason: "same" };
   if (
     own === "auto" &&
     record &&

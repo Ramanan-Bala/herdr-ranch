@@ -337,3 +337,49 @@ test("cleanTitle ignores bare Herdr terminal addresses", () => {
   assert.equal(cleanTitle("test"), "test");
   assert.equal(cleanTitle("t11 fix login"), "t11 fix login");
 });
+
+test("cleanTitle strips brand prefixes only as a whole word", () => {
+  assert.equal(cleanTitle("π ⠋ Fix login"), "Fix login");
+  assert.equal(cleanTitle("π > Fix login"), "Fix login");
+  assert.equal(cleanTitle("π ! Fix login"), "Fix login");
+  assert.equal(cleanTitle("OC | Fix login"), "Fix login");
+  assert.equal(cleanTitle("πcalc rewrite"), "πcalc rewrite");
+  assert.equal(cleanTitle("OCR pipeline"), "OCR pipeline");
+  assert.equal(cleanTitle("π"), null);
+  assert.equal(cleanTitle("π ⠋"), null);
+});
+
+test("ownership tolerates normalized names and a rename that never landed", () => {
+  assert.equal(ownership({ name: "Fix login", named: true }, { name: "Fix  login " }), "auto");
+  assert.equal(ownership({ name: "Fix login", named: true }, { name: "Fix login\u0000" }), "auto");
+  assert.equal(
+    ownership({ name: "Fix login", named: true }, { name: "Other", prev: "Fix login" }),
+    "auto",
+  );
+  assert.equal(
+    ownership({ name: "Fix login", named: true }, { name: "Other", prev: "Different" }),
+    "locked",
+  );
+  assert.equal(ownership({ name: "", named: false }, { name: "", prev: "Fix login" }), "unnamed");
+});
+
+test("bestCandidate skips names that repeat the context (space) name", () => {
+  assert.deepEqual(
+    bestCandidate({ terminalTitle: "Ranch", firstPrompt: "fix login", context: ["ranch"] }),
+    { name: "Fix login", source: "prompt" },
+  );
+  assert.equal(bestCandidate({ branch: "feat/ranch-ui", context: ["ranch-ui"] }), null);
+  assert.deepEqual(
+    bestCandidate({
+      agentTitle: "Ranch",
+      agentTitleSource: "user",
+      firstPrompt: "fix login",
+      context: ["ranch"],
+    }),
+    { name: "Ranch", source: "agent_user" },
+  );
+  assert.deepEqual(
+    bestCandidate({ agentName: "Claude", repo: "ranch", context: ["ranch"] }),
+    { name: "Claude", source: "provisional" },
+  );
+});
