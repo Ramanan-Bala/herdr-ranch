@@ -258,6 +258,12 @@ export default class RanchSession extends View {
    * falling back to the legacy flat <address>.json. Returns { parsed, text }.
    */
   async readStoreText(machine, homeDir, address, liveTitle = null) {
+    const r = await this.readStoreTextRaw(machine, homeDir, address, liveTitle);
+    this.applyAgentExit(r.parsed, machine);
+    return r;
+  }
+
+  async readStoreTextRaw(machine, homeDir, address, liveTitle = null) {
     const [terminal, legacy] = storeCandidates(address);
     if (!homeDir || !terminal) return { parsed: { ok: false, reason: "missing" }, text: null };
     try {
@@ -396,6 +402,74 @@ export default class RanchSession extends View {
     const info = this.terminals?.get(key)
       ?? { state: terminals().find((k) => k.address === agent.address)?.state ?? null, startedAt: null };
     return { state: info.state, app: adapterKey(agent.app), startedAt: info.startedAt };
+  }
+
+  // ---- OpenCode process exit ---------------------------------------------
+  // OpenCode never tells the plugin it is quitting (no session.deleted on
+  // /exit or Ctrl+C), so its store keeps state "running". On macOS/Linux
+  // Herdr stops reporting the pane as an agent and the list goes away; on
+  // Windows Herdr keeps the pane's agent, so the old list stayed. The plugin
+  // records its own process id (agent.pid, the per-TUI process): once that
+  // process is gone the session has ended, whatever Herdr still says.
+
+  /** The OpenCode plugin process id a parsed store names, else null. */
+  agentPid(parsed) {
+    const agent = parsed?.ok ? parsed.store?.agent : null;
+    if (!agent || adapterKey(agent.app) !== "opencode") return null;
+    return Number.isInteger(agent.pid) && agent.pid > 0 ? agent.pid : null;
+  }
+
+  /** Marks a parsed store's session ended when its OpenCode process is known gone. */
+  applyAgentExit(parsed, machine) {
+    const pid = this.agentPid(parsed);
+    if (pid == null || this.pidAlive?.get(`${pid}@${machine ?? ""}`)?.alive !== false) return false;
+    if (parsed.store.session?.state === "ended") return false;
+    parsed.store.session = { ...(parsed.store.session ?? {}), state: "ended" };
+    return true;
+  }
+
+  /**
+   * Checks (at most every 3 s per pid) whether the OpenCode processes behind
+   * the shown stores are still running; a gone one ends its session on screen.
+   * `process.kill(pid, 0)` works on Windows and POSIX; EPERM means alive.
+   * No node or a failed check leaves the store as it is.
+   */
+  checkAgentExits(s, cx) {
+    if (!s.chosen) return;
+    this.pidAlive ??= new Map();
+    const machine = s.machine ?? null;
+    const shown = [this.mainTasks(s).parsed, ...this.subTerminals(s).map((k) => this.subTasks.get(k.address)?.parsed)];
+    for (const parsed of shown) {
+      const pid = this.agentPid(parsed);
+      if (pid == null || parsed.store.session?.state === "ended") continue;
+      const key = `${pid}@${machine ?? ""}`;
+      const info = this.pidAlive.get(key) ?? { alive: null, at: 0, busy: false };
+      this.pidAlive.set(key, info);
+      if (info.alive === false || info.busy || Date.now() - info.at < 3000) continue;
+      info.busy = true;
+      cx.spawn(async (cx) => {
+        let alive = null;
+        try {
+          const r = await exec("node", ["-e",
+            "try{process.kill(Number(process.argv[1]),0)}catch(e){process.exit(e.code==='EPERM'?0:3)}",
+            String(pid)], { on: machine, timeout: 5000 });
+          alive = r.code === 0 ? true : r.code === 3 ? false : null;
+        } catch {}
+        info.alive = alive;
+        info.at = Date.now();
+        info.busy = false;
+        if (alive !== false) return;
+        let changed = false;
+        const all = [this.tasks?.parsed, ...this.taskCache.values(), ...[...this.subTasks.values()].map((e) => e.parsed)];
+        for (const p of all) if (this.applyAgentExit(p, machine)) changed = true;
+        if (changed) {
+          cx.notify();
+          this.publishTaskCount(this.session());
+        }
+      });
+    }
+    // Bounded: forget old entries.
+    while (this.pidAlive.size > 64) this.pidAlive.delete(this.pidAlive.keys().next().value);
   }
 
   /** Sweep stale store files on this machine (or a remote one), once per start. */
@@ -659,6 +733,7 @@ export default class RanchSession extends View {
     // machines' stale store files once per app start (fixes F5).
     if (s.chosen) {
       this.terminalInfo(`${s.chosen.address}@${s.machine ?? ""}`, s.chosen.address, s.machine, cx);
+      this.checkAgentExits(s, cx);
       if (s.machine) this.gcTasks(s.machine, cx);
     }
     // The tasks folder is only watched locally; poll a remote machine's store.
