@@ -134,10 +134,19 @@ export default class RanchTopbar extends View {
   render() {
     const t = theme();
     const stop = (_e, cx) => cx.stop_propagation();
-    // Close and new-tab share one box and icon size so they sit on the same line.
-    const iconButton = (id, icon, size, action) => div().id(id).size(22).flex_none().flex().items_center().justify_center().rounded(5)
+    const iconButton = (id, icon, size, action, box = 22) => div().id(id).size(box).flex_none().flex().items_center().justify_center().rounded(5)
       .text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(svg(icon).size(size));
+    // A tab in the strip: bottom-anchored and rounded on top. The bar's bottom
+    // line is a layer painted under the tabs, so the active tab covers it and
+    // opens into the terminal below. The inactive one keeps the same box
+    // (edges in the bar colour) so nothing shifts.
+    const TAB_H = 32;
+    const tabShell = (id, active) => h_flex().id(id).self_end().h(TAB_H).pl(10).pr(5).gap(7).min_w(0).flex_none()
+      .items_center().text_size(12.5).rounded_t(8).border_t(1).border_l(1).border_r(1)
+      .when(active, el => el.bg(t.background).border_color(t.border))
+      .when(!active, el => el.border_color(t.chrome).cursor_pointer().hover(s => s.bg(t.hover)));
+    const tabClose = (id, action) => iconButton(id, "mods/ranch-topbar/close.svg", 12, action, 18).rounded(4);
     const button = (id, child, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(child);
     const space = spaces().find(p => p.active);
@@ -274,8 +283,7 @@ export default class RanchTopbar extends View {
         : status === "blocked" ? div().size(7).rounded_full().bg(t.blocked).flex_none()
         : status === "done" ? svg("mods/ranch-topbar/check.svg").size(12).flex_none().text_color(t.done)
         : div().size(9).rounded_full().border(1).border_color(t.dim).flex_none();
-      return h_flex().id(`tab-${tab.id}`).h(26).gap(6).px(4).min_w(0).max_w(760).items_center().flex_none().text_size(12.5).rounded(6)
-        .when(viewing, el => el.opacity(0.6).cursor_pointer().hover(s => s.bg(t.hover)))
+      return tabShell(`tab-${tab.id}`, !viewing).max_w(560)
         .on_mouse_down("left", (e, cx) => {
           cx.stop_propagation();
           if (viewing) run("tab.select", { id: tab.id });
@@ -292,38 +300,40 @@ export default class RanchTopbar extends View {
         .when(show.space, el => el
           .child(div().max_w(160).truncate().text_color(t.muted).child(space.name))
           .child(div().text_color(t.dim).flex_none().child("/")))
-        .child(div().max_w(320).truncate().font_semibold().text_color(t.foreground).child(name))
+        .child(div().max_w(320).truncate().text_color(viewing ? t.muted : t.foreground).when(!viewing, el => el.font_semibold()).child(name))
         .when(show.marker && tab.named && auto?.name === tab.name, el => el.child(div().id(`auto-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
           .tooltip(`Named by the agent's session (source: ${auto.source ?? "agent"})`).child("auto")))
         .when(show.marker && tab.named && auto?.name !== tab.name, el => el.child(div().id(`lock-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
           .tooltip("You named this tab. Reset name in the tab menu to let the agent name it.").child("✎")))
-        .child(iconButton(`close-${tab.id}`, "mods/ranch-topbar/close.svg", 12, close));
+        .child(tabClose(`close-${tab.id}`, close));
     })();
 
-    // The open file (one at a time), as a closable tab after the new-tab button.
+    // The open file (one at a time), as the next tab in the strip.
     const fileTab = viewer && (() => {
       const want = shared(VIEWER_KEY);
       const name = want?.abs ? baseName(want.abs) : viewer.name;
       // A diff from the Changes panel shows the compare glyph instead of the file type.
       const icon = want?.diff ? { icon: "git-compare", color: "blocked" } : fileIcon(name);
-      return h_flex().id("file-tab").h(26).pl(8).pr(3).gap(6).flex_none().items_center().rounded(6).text_size(12.5).cursor_pointer()
-        .when(viewing, el => el.bg(t.raised).border(1).border_color(t.border))
-        .when(!viewing, el => el.hover(s => s.bg(t.hover)))
+      return tabShell("file-tab", viewing)
         .on_mouse_down("left", stop)
         .on_mouse_down("middle", (_e, cx) => { cx.stop_propagation(); run("tab.close", { id: viewer.id }); })
         .on_click(() => run("tab.select", { id: viewer.id }))
         .tooltip(want?.abs ? `${want.diff ? "Changes in " : ""}${want.abs.replace(home(), "~")}` : name)
         .child(svg(iconPath(icon.icon)).size(14).flex_none().text_color(t[icon.color] ?? t.muted))
         .child(div().max_w(220).truncate().text_color(viewing ? t.foreground : t.muted).when(viewing, el => el.font_semibold()).child(name))
-        .child(iconButton("file-tab-close", "mods/ranch-topbar/close.svg", 11, (_e, cx) => { cx.stop_propagation(); run("tab.close", { id: viewer.id }); }));
+        .child(tabClose("file-tab-close", (_e, cx) => { cx.stop_propagation(); run("tab.close", { id: viewer.id }); }));
     })();
 
-    return h_flex().id("root").size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
+    return h_flex().id("root").relative().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome)
       .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
       .children([
+        // The bar's bottom line, first so the tabs paint over it.
+        div().id("bar-line").absolute().left(0).right(0).bottom(0).h(1).bg(t.border),
         ...(left ? [left] : []),
-        iconButton("tab-new", "mods/ranch-topbar/plus.svg", 14, () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })),
-        ...(fileTab ? [div().id("file-tab-divider").w(1).h(16).flex_none().mx(4).bg(t.border), fileTab] : []),
+        ...(fileTab ? [fileTab] : []),
+        // New tab sits beside the strip, centred on the tabs (not the bar): they're bottom-anchored.
+        iconButton("tab-new", "mods/ranch-topbar/plus.svg", 14, () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 }), 24)
+          .self_end().mb((TAB_H - 24) / 2).ml(2),
         h_flex().id("spacer").flex_1().min_w(0),
         ...(attentionPill ? [attentionPill] : []),
         ...(show.launch ? [launch("launch-sparkle", svg("mods/ranch-topbar/sparkle.svg").size(14),
