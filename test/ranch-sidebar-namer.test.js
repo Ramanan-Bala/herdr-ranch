@@ -17,7 +17,7 @@ if (!existsSync(join(libDir, "naming.js"))) {
   }
 }
 
-const { agentShort, collectInputs, buildModelPrompt } = await import("../mods/ranch-sidebar/namer-model.js");
+const { agentShort, collectInputs, buildModelPrompt, pickNamingAgent } = await import("../mods/ranch-sidebar/namer-model.js");
 
 test("agentShort keeps the first word of a program name", () => {
   assert.equal(agentShort("Claude Code"), "Claude");
@@ -94,6 +94,50 @@ test("buildModelPrompt caps the prompt at 500 characters", () => {
   assert.ok(p.startsWith("Reply with only a 3-5 word title for this coding task: "));
   assert.ok(p.length <= 500 + 55);
   assert.equal(p.length, 55 + 500);
+});
+
+test("pickNamingAgent never picks a sub-agent over its parent", () => {
+  const agents = [
+    { address: "t1", tab: "tab1", pane: "p1", status: "working" },
+    { address: "t2", tab: "tab1", pane: "p2", status: "working" },
+  ];
+  const terminals = [{ address: "t2", parent: "t1" }];
+  assert.equal(
+    pickNamingAgent({ tabId: "tab1", agents, terminals }).address,
+    "t1",
+  );
+});
+
+test("pickNamingAgent falls back to the first sub-agent when no parent exists", () => {
+  const agents = [
+    { address: "t2", tab: "tab1", pane: "p2", status: "working" },
+    { address: "t3", tab: "tab1", pane: "p3", status: "idle" },
+  ];
+  const terminals = [{ address: "t2", parent: "t1" }, { address: "t3", parent: "t1" }];
+  assert.equal(pickNamingAgent({ tabId: "tab1", agents, terminals }).address, "t2");
+});
+
+test("pickNamingAgent prefers the focused pane, then a busy status", () => {
+  const agents = [
+    { address: "t1", tab: "tab1", pane: "p1", status: "idle" },
+    { address: "t2", tab: "tab1", pane: "p2", status: "working" },
+    { address: "t3", tab: "tab1", pane: "p3", status: "idle" },
+  ];
+  assert.equal(
+    pickNamingAgent({ tabId: "tab1", agents, panes: [{ pane: "p3", tab: "tab1", focused: true }] }).address,
+    "t3",
+  );
+  assert.equal(pickNamingAgent({ tabId: "tab1", agents }).address, "t2");
+  const blocked = [
+    { address: "t1", tab: "tab1", pane: "p1", status: "idle" },
+    { address: "t2", tab: "tab1", pane: "p2", status: "blocked" },
+  ];
+  assert.equal(pickNamingAgent({ tabId: "tab1", agents: blocked }).address, "t2");
+});
+
+test("pickNamingAgent returns null when the tab has no candidate", () => {
+  assert.equal(pickNamingAgent({ tabId: "tab1" }), null);
+  assert.equal(pickNamingAgent({ tabId: "tab1", agents: [{ address: "t1", tab: "tab2" }] }), null);
 });
 
 test("namer.js parses as valid module syntax", () => {
