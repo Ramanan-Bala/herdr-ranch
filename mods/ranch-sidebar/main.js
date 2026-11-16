@@ -12,6 +12,7 @@ import {
   buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials, diffSquares,
   normalizeCollapsed, topOfFresh, cardRows, moveIndex,
 } from "./model.js";
+import { isViewerTab } from "./lib/file-viewer.js";
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent, closeNeedsConfirm, closeConfirmProps } from "./lib/format.js";
 import {
   repoSummary, parsePr, createTtlCache, createLimiter, runGh, PR_JSON_FIELDS,
@@ -1289,9 +1290,12 @@ export default class RanchSidebar extends View {
       this.prCache = createTtlCache(s.refresh.prSec * 1000, { max: 500 });
     }
     const filter = shared(FILTER_KEY) ?? null;
+    // The file viewer tab lives only in the top bar (lib/file-viewer.js), not in this tree.
+    const paneList = panes();
+    const listed = spaces().map((sp) => ({ ...sp, tabs: (sp.tabs ?? []).filter((tb) => !isViewerTab(tb, paneList)) }));
     const tree = buildTree({
       home: home(),
-      machines: machines(), spaces: spaces(), agents: agents(), panes: panes(),
+      machines: machines(), spaces: listed, agents: agents(), panes: paneList,
       filter, now: Date.now(),
     });
 

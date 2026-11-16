@@ -19,6 +19,7 @@ import {
   setShared,
   window as appWindow,
 } from "herdr";
+import { isViewerTab } from "./lib/file-viewer.js";
 import {
   STATUS_LABEL,
   relativeTime,
@@ -159,8 +160,13 @@ export default class RanchSession extends View {
   /** The focused tab, its agents and the agent this copy shows. */
   session() {
     const focus = focused();
-    const tabId = focus?.tab ?? null;
     const space = spaces().find((sp) => sp.id === focus?.space) ?? null;
+    // The file viewer tab has no session: keep showing the terminal tab it was opened from.
+    this.lastTab ??= new Map();
+    const focusedTab = space?.tabs.find((tb) => tb.id === focus?.tab) ?? null;
+    const viewing = focusedTab && isViewerTab(focusedTab, panes());
+    if (focusedTab && !viewing) this.lastTab.set(space.id, focusedTab.id);
+    const tabId = viewing ? this.lastTab.get(space.id) ?? null : focus?.tab ?? null;
     const tab = space?.tabs.find((tb) => tb.id === tabId) ?? null;
     let inTab = tabId ? agents().filter((a) => a.tab === tabId) : [];
     // A Claude/Codex/OpenCode pane whose status report was cleared (Herdr shows

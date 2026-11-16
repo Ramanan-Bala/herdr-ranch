@@ -11,6 +11,8 @@ import {
 import { AUTONAMES_KEY, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
 import { effectiveStatus, attentionQueue, closeNeedsConfirm, closeConfirmProps } from "./lib/format.js";
 import { readPanels } from "./state.js";
+import { VIEWER_KEY, viewerTab, isViewerTab, openViewerCommands, baseName } from "./lib/file-viewer.js";
+import { fileIcon, iconPath } from "./lib/file-icons.js";
 
 // The right-panel stack ids this bar can toggle, in layout "panel-body".
 const PANELS = ["session", "files", "changes", "settings"];
@@ -34,6 +36,9 @@ export default class RanchTopbar extends View {
     let storedPanels = null;
     try { storedPanels = localStorage.getItem("panels"); } catch {}
     this.panels = readPanels(storedPanels, PANELS);
+    // A file opened before this copy started is not reopened; the last terminal tab per space.
+    this.viewerNonce = shared(VIEWER_KEY)?.nonce ?? null;
+    this.lastTab = new Map();
     // knownAgents(), null until the first check lands; the cached answer shows at once.
     this.agents = shared("ranch.knownAgents") ?? null;
     const loadAgents = async (cx) => {
@@ -129,10 +134,29 @@ export default class RanchTopbar extends View {
   render() {
     const t = theme();
     const stop = (_e, cx) => cx.stop_propagation();
+    // Close and new-tab share one box and icon size so they sit on the same line.
+    const iconButton = (id, icon, size, action) => div().id(id).size(22).flex_none().flex().items_center().justify_center().rounded(5)
+      .text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
+      .on_mouse_down("left", stop).on_click(action).child(svg(icon).size(size));
     const button = (id, child, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(child);
     const space = spaces().find(p => p.active);
-    const tab = space?.tabs.find(c => c.active);
+    const paneList = panes();
+    // Someone opened a file (Files tree, a menu): show it in this space's viewer tab.
+    const request = shared(VIEWER_KEY);
+    if (request?.nonce !== undefined && request.nonce !== this.viewerNonce) {
+      this.viewerNonce = request.nonce;
+      for (const [name, args] of openViewerCommands(space, paneList, request)) run(name, args);
+    }
+    const viewer = viewerTab(space, paneList);
+    const activeTab = space?.tabs.find(c => c.active);
+    const viewing = Boolean(viewer && activeTab?.id === viewer.id);
+    if (activeTab && !viewing) this.lastTab.set(space.id, activeTab.id);
+    // The file tab sits beside the terminal tab: while it shows, the bar keeps
+    // the last terminal tab on the left (inactive, click to go back).
+    const tab = viewing
+      ? space.tabs.find(c => c.id === this.lastTab.get(space.id) && !isViewerTab(c, paneList)) ?? space.tabs.find(c => !isViewerTab(c, paneList))
+      : activeTab;
     const root = layout(), sidebar = find(root, "sidebar"), w = window();
     // Old saved rails and a dragged-narrow sidebar can be smaller than the window buttons.
     const lightsPadding = w?.platform === "macos" && w.titlebar === "none" && !w.fullscreen && root?.traffic_lights
@@ -225,7 +249,7 @@ export default class RanchTopbar extends View {
     // branch pill, auto/lock marker, close.
     const left = tab && (() => {
       // Branch from the pane this tab shows: the agent's pane, else the focused/first pane.
-      const tabPanes = panes().filter(p => p.tab === tab.id);
+      const tabPanes = paneList.filter(p => p.tab === tab.id);
       const pane = tabPanes.find(p => p.program?.agent) ?? tabPanes.find(p => p.focused) ?? tabPanes[0];
       const program = pane?.program;
       const unnamed = /^tb\d+$/.test(tab.name) || (!tab.named && /^\d+$/.test(tab.name));
@@ -248,8 +272,13 @@ export default class RanchTopbar extends View {
         : status === "blocked" ? div().size(7).rounded_full().bg(t.blocked).flex_none()
         : status === "done" ? svg("mods/ranch-topbar/check.svg").size(12).flex_none().text_color(t.done)
         : div().size(9).rounded_full().border(1).border_color(t.dim).flex_none();
-      return h_flex().id(`tab-${tab.id}`).gap(6).px(2).min_w(0).max_w(760).items_center().flex_none().text_size(12.5)
-        .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); if (e.click_count === 2) run("tab.rename", { id: tab.id }); })
+      return h_flex().id(`tab-${tab.id}`).h(26).gap(6).px(4).min_w(0).max_w(760).items_center().flex_none().text_size(12.5).rounded(6)
+        .when(viewing, el => el.opacity(0.6).cursor_pointer().hover(s => s.bg(t.hover)))
+        .on_mouse_down("left", (e, cx) => {
+          cx.stop_propagation();
+          if (viewing) run("tab.select", { id: tab.id });
+          else if (e.click_count === 2) run("tab.rename", { id: tab.id });
+        })
         .on_mouse_down("right", (_e, cx) => {
           cx.stop_propagation();
           openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: tab.id, space: space.id } } });
@@ -274,15 +303,33 @@ export default class RanchTopbar extends View {
           .tooltip(`Named by the agent's session (source: ${auto.source ?? "agent"})`).child("auto")))
         .when(tab.named && auto?.name !== tab.name, el => el.child(div().id(`lock-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
           .tooltip("You named this tab. Reset name in the tab menu to let the agent name it.").child("✎")))
-        .child(div().id(`close-${tab.id}`).flex_none().text_color(t.dim).hover(s => s.text_color(t.foreground))
-          .on_mouse_down("left", stop).on_click(close).child(svg("mods/ranch-topbar/close.svg").size(12)));
+        .child(iconButton(`close-${tab.id}`, "mods/ranch-topbar/close.svg", 12, close));
+    })();
+
+    // The open file (one at a time), as a closable tab after the new-tab button.
+    const fileTab = viewer && (() => {
+      const want = shared(VIEWER_KEY);
+      const name = want?.abs ? baseName(want.abs) : viewer.name;
+      // A diff from the Changes panel shows the compare glyph instead of the file type.
+      const icon = want?.diff ? { icon: "git-compare", color: "blocked" } : fileIcon(name);
+      return h_flex().id("file-tab").h(26).pl(8).pr(3).gap(6).flex_none().items_center().rounded(6).text_size(12.5).cursor_pointer()
+        .when(viewing, el => el.bg(t.raised).border(1).border_color(t.border))
+        .when(!viewing, el => el.hover(s => s.bg(t.hover)))
+        .on_mouse_down("left", stop)
+        .on_mouse_down("middle", (_e, cx) => { cx.stop_propagation(); run("tab.close", { id: viewer.id }); })
+        .on_click(() => run("tab.select", { id: viewer.id }))
+        .tooltip(want?.abs ? `${want.diff ? "Changes in " : ""}${want.abs.replace(home(), "~")}` : name)
+        .child(svg(iconPath(icon.icon)).size(14).flex_none().text_color(t[icon.color] ?? t.muted))
+        .child(div().max_w(220).truncate().text_color(viewing ? t.foreground : t.muted).when(viewing, el => el.font_semibold()).child(name))
+        .child(iconButton("file-tab-close", "mods/ranch-topbar/close.svg", 11, (_e, cx) => { cx.stop_propagation(); run("tab.close", { id: viewer.id }); }));
     })();
 
     return h_flex().id("root").size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
       .children([
         ...(left ? [left] : []),
-        button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })),
+        iconButton("tab-new", "mods/ranch-topbar/plus.svg", 14, () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })),
+        ...(fileTab ? [div().id("file-tab-divider").w(1).h(16).flex_none().mx(4).bg(t.border), fileTab] : []),
         h_flex().id("spacer").flex_1().min_w(0),
         ...(attentionPill ? [attentionPill] : []),
         launch("launch-sparkle", svg("mods/ranch-topbar/sparkle.svg").size(14),
