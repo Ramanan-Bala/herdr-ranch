@@ -1,17 +1,21 @@
 import { View, div, image, svg } from "gpui-kit";
 import { Popover, v_flex, h_flex } from "gpui-base";
-import { theme, shared, setShared, run, exec, home, knownAgents, nextCommand, readTextFile, window as appWindow } from "herdr";
+import { theme, shared, setShared, run, exec, home, knownAgents, nextCommand, window as appWindow } from "herdr";
 import { runGh } from "./lib/git.js";
-import { relativeTime } from "./lib/format.js";
 import { SETTINGS_KEY, MAX_AGENTS, resolveSettings, withSetting } from "./lib/settings.js";
 import { tasksCommand } from "./lib/tasks-command.js";
 import { EdgeGrip } from "./lib/edge-grip.js";
+
+// Ranch settings panel: one flat list. Every row sits on the same grid
+// (label left, control right, 28px tall); sections are split by a hairline,
+// never boxed. System status stays quiet unless something needs the person.
 
 // Windows can't exec the POSIX sh launcher; it calls node on the .js entry.
 const isWin = () => appWindow()?.platform === "windows";
 const tasksCmd = (args) => tasksCommand(home(), args, isWin());
 const TASK_KEYS = ["claude", "codex", "opencode", "pi"];
 const HERDR_MIN = [0, 1, 15];
+const ROW_H = 28;
 
 const displayName = (key, known) => (key === "terminal" ? "Terminal" : known.find((k) => k.key === key)?.name || key);
 
@@ -34,9 +38,7 @@ export default class RanchSettings extends View {
     this.tasks = null; // null = checking; {agents: {claude, codex, opencode, pi}} | {error: true}
     this.setup = null; // output of the last "Set up" run
     this.health = { git: "checking", herdr: "checking" };
-    this.report = null; // agent -> last_event_at, from ~/.herdr/ranch/health.json
-    this.healthBusy = false; // a health load in flight: skip ticks until done
-    this.versionsAt = 0;     // ms, when git/herdr versions were last checked
+    this.healthBusy = false;
     this.upd = { state: "checking", installed: null, latest: null, message: "" };
     cx.spawn(async (cx) => {
       try {
@@ -50,15 +52,13 @@ export default class RanchSettings extends View {
     this.loadTasks(cx);
     cx.timer.every(60_000, (cx) => this.loadTasks(cx));
     this.loadHealth(cx);
+    // Version checks spawn processes: every 5 min is plenty.
+    cx.timer.every(5 * 60_000, (cx) => this.loadHealth(cx));
     this.checkUpdate(cx, false);
-    // Task-reporting health (the report file) refreshes every 30 s; the version
-    // checks spawn processes, so those wait for refreshHealth's 5-min gate.
-    cx.timer.every(30_000, (cx) => this.refreshHealth(cx));
     if (shared("ranch.health.gh") !== "ok") this.checkGh(cx);
     cx.spawn(async (cx) => {
       for (;;) if ((await nextCommand()) === "focus") {
         this.handle.focus();
-        this.refreshHealth(cx); // shown again: catch up on the report file
         this.checkUpdate(cx, false);
       }
     });
@@ -177,25 +177,9 @@ export default class RanchSettings extends View {
     });
   }
 
-  // One read of the per-agent report file: cheap, no processes spawned.
-  async loadReport() {
-    try {
-      const raw = await readTextFile(`${home()}/.herdr/ranch/health.json`);
-      const agents = JSON.parse(raw || "{}")?.agents ?? {};
-      this.report = Object.fromEntries(
-        Object.entries(agents)
-          .filter(([, v]) => v && typeof v.last_event_at === "string")
-          .map(([k, v]) => [k, v.last_event_at])
-      );
-    } catch {
-      this.report = null;
-    }
-  }
-
   loadHealth(cx) {
     if (this.healthBusy) return; // never overlapping loads
     this.healthBusy = true;
-    this.versionsAt = Date.now();
     cx.spawn(async (cx) => {
       try {
         const git = await exec("git", ["--version"]).then((r) => (r.code === 0 ? "ok" : "missing")).catch(() => "missing");
@@ -206,26 +190,11 @@ export default class RanchSettings extends View {
           })
           .catch(() => "missing");
         this.health = { git, herdr };
-        // Per-agent last event time (fixes 3.8), written by the adapters.
-        await this.loadReport();
       } finally {
         this.healthBusy = false;
       }
       cx.notify();
     });
-  }
-
-  // The health tick: the report file every time; version checks only every
-  // 5 min, so a 30 s tick stays a single cheap file read.
-  refreshHealth(cx) {
-    if (this.healthBusy) return;
-    if (Date.now() - this.versionsAt < 5 * 60_000) {
-      this.healthBusy = true;
-      cx.spawn(async (cx) => {
-        try { await this.loadReport(); } finally { this.healthBusy = false; }
-        cx.notify();
-      });
-    } else this.loadHealth(cx);
   }
 
   checkGh(cx) {
@@ -236,25 +205,33 @@ export default class RanchSettings extends View {
     });
   }
 
-  // ---- render helpers ----
+  // ---- building blocks ----
 
-  // A compact section: title with its description on one line, rows packed tight.
-  card(title, description, rows) {
+  /** A section: a heading and its rows; every section after the first starts with a hairline. */
+  section(id, title, rows, first = false) {
     const t = theme();
-    return v_flex().flex_none().rounded(6).border_1().border_color(t.border).bg(t.background).px(8).py(6).gap(2)
-      .child(h_flex().flex_none().items_baseline().gap(6).px(4).pb(2)
-        .child(div().flex_none().text_size(12).font_semibold().text_color(t.foreground).child(title))
-        .when(!!description, (e) => e.child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child(description))))
+    return v_flex().id(`section-${id}`).flex_none().gap(0).pt(first ? 4 : 10).pb(10)
+      .when(!first, (e) => e.border_t(1).border_color(t.border))
+      .child(div().flex_none().h(24).px(6).flex().items_center().text_size(11.5).font_semibold().text_color(t.muted).child(title))
       .children(rows);
   }
 
-  iconBtn(id, icon, action) {
+  /** The one row shape: label (and optional hint under it) left, control right. */
+  row(id, label, control, { onClick = null, hint = null, icon = null } = {}) {
     const t = theme();
-    return div().id(id).flex_none().size(22).rounded(6).flex().items_center().justify_center()
-      .text_color(action ? t.muted : t.border)
-      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .when(action, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(action))
-      .child(svg(`mods/ranch-settings/${icon}.svg`).size(13));
+    return h_flex().id(id).flex_none().min_h(ROW_H).px(6).gap(8).items_center().rounded(5)
+      .when(!!onClick, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(onClick))
+      .when(!!icon, (e) => e.child(icon))
+      .child(v_flex().flex_1().min_w(0).py(hint ? 4 : 0)
+        .child(div().truncate().child(label))
+        .when(!!hint, (e) => e.child(div().text_size(11).text_color(t.dim).child(hint))))
+      .when(!!control, (e) => e.child(control));
+  }
+
+  /** A hint line aligned with row labels. */
+  note(text, color = null) {
+    const t = theme();
+    return div().flex_none().px(6).pb(4).text_size(11).text_color(color ?? t.dim).child(text);
   }
 
   pill(id, on, toggle) {
@@ -270,45 +247,49 @@ export default class RanchSettings extends View {
       .child(div().size(8).rounded(4).bg(on ? t.accent_foreground : t.muted));
   }
 
-  switchRow(id, label, value, path, hint = null, onChange = null) {
-    const t = theme();
-    const toggle = () => {
-      const next = !value;
-      this.set(path, next);
-      if (onChange) onChange(next);
+  toggle(id, label, value, path, onChange = null) {
+    const flip = () => {
+      this.set(path, !value);
+      if (onChange) onChange(!value);
     };
-    return h_flex().id(id).flex_none().items_center().justify_between().gap(8).cursor_pointer()
-      .rounded(5).px(4).py(2).hover((s) => s.bg(t.hover))
-      .on_click(toggle)
-      .child(v_flex().flex_1().min_w(0).gap(1)
-        .child(div().truncate().child(label))
-        .when(!!hint, (e) => e.child(div().text_size(10.5).text_color(t.dim).child(hint))))
-      .child(this.pill(`${id}-pill`, value, toggle));
+    return this.row(id, label, this.pill(`${id}-pill`, value, flip), { onClick: flip });
   }
 
-  stepper(id, value, unit, min, max, step, path) {
+  /** Small text button; `primary` fills it with the accent. */
+  button(id, label, action, { primary = false, disabled = false } = {}) {
     const t = theme();
-    const clamp = (v) => Math.min(max, Math.max(min, v));
-    const btn = (bid, icon, delta) => div().id(`${id}-${bid}`).flex_none().size(20).rounded(6).flex().items_center().justify_center()
-      .text_color(t.muted).cursor_pointer()
+    return div().id(id).flex_none().h(22).px(8).flex().items_center().rounded(5).text_size(11.5)
+      .when(primary, (e) => e.bg(t.accent).text_color(t.accent_foreground).font_semibold())
+      .when(!primary, (e) => e.border_1().border_color(t.border).text_color(t.muted))
+      .when(disabled, (e) => e.opacity(0.5))
+      .when(!disabled, (e) => e.cursor_pointer()
+        .when(!primary, (el) => el.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click(action))
+      .child(label);
+  }
+
+  iconBtn(id, icon, action) {
+    const t = theme();
+    return div().id(id).flex_none().size(20).rounded(5).flex().items_center().justify_center()
+      .text_color(action ? t.dim : t.border)
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .hover((s) => s.bg(t.hover).text_color(t.foreground))
-      .on_click(() => this.set(path, clamp(value + delta)))
-      .child(svg(`mods/ranch-settings/${icon}.svg`).size(11));
-    return h_flex().flex_none().items_center().gap(6)
-      .child(div().min_w(34).text_right().text_color(t.muted).child(`${value}${unit}`))
-      .child(btn("dec", "minus", -step))
-      .child(btn("inc", "plus", step));
+      .when(action, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(action))
+      .child(svg(`mods/ranch-settings/${icon}.svg`).size(12));
   }
 
   seg(id, value, options, path) {
     const t = theme();
-    return h_flex().flex_none().gap(2).p(2).rounded(8).bg(t.input).border_1().border_color(t.border)
-      .children(options.map(([key, label]) => div().id(`${id}-${key}`).flex_none().px(8).py(3).rounded(6).text_size(11).cursor_pointer()
-        .when(key === value, (e) => e.bg(t.selected).text_color(t.foreground).font_semibold())
+    return h_flex().flex_none().gap(1).p(1).rounded(6).bg(t.input).border_1().border_color(t.border)
+      .children(options.map(([key, label]) => div().id(`${id}-${key}`).flex_none().px(7).h(20).flex().items_center().rounded(5).text_size(11).cursor_pointer()
+        .when(key === value, (e) => e.bg(t.selected).text_color(t.foreground))
         .when(key !== value, (e) => e.text_color(t.muted).hover((s) => s.bg(t.hover)))
         .on_click(() => this.set(path, key))
         .child(label)));
+  }
+
+  status(text, color) {
+    return div().flex_none().text_size(11.5).text_color(color).child(text);
   }
 
   agentIcon(key, k) {
@@ -325,7 +306,7 @@ export default class RanchSettings extends View {
 
   sectionAgents(t, s) {
     const known = this.known ?? [];
-    const row = (key, i) => {
+    const rows = s.agents.map((key, i) => {
       const k = known.find((a) => a.key === key);
       const checking = key !== "terminal" && this.known === null;
       const missing = key !== "terminal" && !checking && (!k || k.installed === false);
@@ -335,41 +316,33 @@ export default class RanchSettings extends View {
         agents.splice(to, 0, key);
         this.set("agents", agents);
       };
-      return h_flex().flex_none().items_center().gap(8)
-        .child(this.agentIcon(key, k))
-        .child(div().flex_1().min_w(0).truncate().child(displayName(key, known)))
-        .when(missing, (e) => e.child(div().flex_none().px(6).py(1).rounded(4).bg(t.input).text_size(10).text_color(t.dim).child("not installed")))
-        .when(checking, (e) => e.child(div().flex_none().text_size(10).text_color(t.dim).child("checking…")))
+      const controls = h_flex().flex_none().items_center().gap(2)
+        .when(missing, (e) => e.child(this.status("not installed", t.dim).mr(4)))
+        .when(checking, (e) => e.child(this.status("checking…", t.dim).mr(4)))
         .child(this.iconBtn(`agent-up-${key}`, "chevron-up", i > 0 ? () => move(i - 1) : null))
         .child(this.iconBtn(`agent-down-${key}`, "chevron-down", i < s.agents.length - 1 ? () => move(i + 1) : null))
         .child(this.iconBtn(`agent-remove-${key}`, "x", s.agents.length > 1 ? () => this.set("agents", s.agents.filter((a) => a !== key)) : null));
-    };
+      return this.row(`agent-${key}`, displayName(key, known), controls, { icon: this.agentIcon(key, k) });
+    });
     const choices = [
       ...known.filter((a) => a.run && !s.agents.includes(a.key)).map((a) => ({ key: a.key, name: a.name })),
       ...(s.agents.includes("terminal") ? [] : [{ key: "terminal", name: "Terminal" }]),
     ];
-    const full = s.agents.length >= MAX_AGENTS;
-    return this.card("Agents", `Launch buttons in the top bar (up to ${MAX_AGENTS})`, [
-      ...s.agents.map((key, i) => row(key, i)),
-      this.addAgentSelect(t, s, choices, full),
-    ]);
+    if (s.agents.length < MAX_AGENTS && choices.length) rows.push(this.addAgent(t, s, choices));
+    return this.section("agents", `Launch buttons · ${s.agents.length} of ${MAX_AGENTS}`, rows, true);
   }
 
-  /** "Add agent" as one dropdown: a select-style trigger and a list popover. */
-  addAgentSelect(t, s, choices, full) {
-    const disabled = full || !choices.length;
-    const label = full ? `Limit reached (${MAX_AGENTS} of ${MAX_AGENTS})` : choices.length ? "Add an agent…" : "All agents added";
-    const trigger = h_flex().id("agent-add").flex_none().h(24).px(10).gap(8).items_center().rounded(6)
-      .bg(t.input).border_1().border_color(this.addOpen ? t.accent : t.border)
-      .when(!disabled, (e) => e.cursor_pointer().hover((st) => st.border_color(t.muted)))
-      .child(svg("mods/ranch-settings/plus.svg").size(11).text_color(disabled ? t.border : t.muted))
-      .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(disabled ? t.dim : t.muted).child(label))
-      .when(!disabled, (e) => e.child(svg("mods/ranch-settings/chevron-down.svg").size(11).text_color(t.muted)));
-    if (disabled) return trigger;
+  /** "Add agent": a quiet row that opens a list of the agents not yet added. */
+  addAgent(t, s, choices) {
     const known = this.known ?? [];
-    const list = v_flex().id("agent-add-list").w(240).p(4).gap(1).rounded(8)
+    const trigger = h_flex().id("agent-add").flex_none().h(ROW_H).px(6).gap(8).items_center().rounded(5)
+      .cursor_pointer().text_color(t.muted).hover((st) => st.bg(t.hover).text_color(t.foreground))
+      .when(!!this.addOpen, (e) => e.bg(t.hover))
+      .child(div().flex_none().w(16).flex().items_center().justify_center().child(svg("mods/ranch-settings/plus.svg").size(12)))
+      .child(div().flex_1().min_w(0).truncate().child("Add agent"));
+    const list = v_flex().id("agent-add-list").w(220).p(4).gap(1).rounded(8)
       .border_1().border_color(t.border).bg(t.popover).shadow_lg()
-      .children(choices.map((c) => h_flex().id(`agent-add-${c.key}`).h(28).px(8).gap(8).items_center().rounded(5)
+      .children(choices.map((c) => h_flex().id(`agent-add-${c.key}`).h(ROW_H).px(8).gap(8).items_center().rounded(5)
         .cursor_pointer().hover((st) => st.bg(t.hover))
         .on_click((_e, cx) => {
           this.addOpen = false;
@@ -377,7 +350,7 @@ export default class RanchSettings extends View {
           cx.notify();
         })
         .child(this.agentIcon(c.key, known.find((a) => a.key === c.key)))
-        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(c.name))));
+        .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(c.name))));
     return Popover.new("agent-add-popover").anchor("top_left")
       .open(!!this.addOpen)
       .on_open_change((open, cx) => {
@@ -388,180 +361,111 @@ export default class RanchSettings extends View {
       .content(list);
   }
 
-  sectionCards(t, s) {
-    return this.card("Sidebar cards", "What each session card shows", [
-      this.switchRow("card-time", "Time in status", s.card.time, "card.time"),
-      this.switchRow("card-line3", "Diff stats line", s.card.line3, "card.line3"),
-      this.switchRow("card-pr", "Pull request link", s.card.pr, "card.pr"),
-    ]);
-  }
-
-  sectionSession(t, s) {
-    return this.card("Session details", "Sections of the session panel", [
-      this.switchRow("session-tasks", "Agent tasks", s.session.tasks, "session.tasks"),
-      this.switchRow("session-git", "Git status", s.session.git, "session.git"),
-      this.switchRow("session-commits", "Recent commits", s.session.commits, "session.commits"),
-      this.switchRow("session-subagents", "Subagents", s.session.subagents, "session.subagents"),
-    ]);
-  }
-
   sectionTopbar(t, s) {
-    return this.card("Top bar", "Status · logo · title · close · new tab", [
-      this.switchRow("topbar-status", "Agent status", s.topbar.status, "topbar.status"),
-      this.switchRow("topbar-logo", "Agent logo", s.topbar.logo, "topbar.logo"),
-      this.switchRow("topbar-space", "Space name before title", s.topbar.space, "topbar.space"),
-      this.switchRow("topbar-marker", "Naming marker (auto / ✎)", s.topbar.marker, "topbar.marker"),
-      this.switchRow("topbar-attention", "Needs-you pill", s.topbar.attention, "topbar.attention"),
-      this.switchRow("topbar-launch", "Start agent button", s.topbar.launch, "topbar.launch"),
+    return this.section("topbar", "Top bar", [
+      this.toggle("topbar-status", "Agent status", s.topbar.status, "topbar.status"),
+      this.toggle("topbar-logo", "Agent logo", s.topbar.logo, "topbar.logo"),
+      this.toggle("topbar-space", "Space name before title", s.topbar.space, "topbar.space"),
+      this.toggle("topbar-marker", "Naming marker", s.topbar.marker, "topbar.marker"),
+      this.toggle("topbar-attention", "Needs-you pill", s.topbar.attention, "topbar.attention"),
+      this.toggle("topbar-launch", "Start agent button", s.topbar.launch, "topbar.launch"),
     ]);
   }
 
   sectionStatus(t, s) {
-    return this.card("Status bar", "Repo · worktree · branch · machine", [
-      this.switchRow("statusbar-repo", "Repository", s.statusbar.repo, "statusbar.repo"),
-      this.switchRow("statusbar-worktree", "Worktree", s.statusbar.worktree, "statusbar.worktree"),
-      this.switchRow("statusbar-branch", "Branch", s.statusbar.branch, "statusbar.branch"),
-      this.switchRow("statusbar-machine", "Machine", s.statusbar.machine, "statusbar.machine"),
-      this.switchRow("usage-show", "Agent usage", s.usage.show, "usage.show", null,
+    return this.section("statusbar", "Status bar", [
+      this.toggle("statusbar-repo", "Repository", s.statusbar.repo, "statusbar.repo"),
+      this.toggle("statusbar-worktree", "Worktree", s.statusbar.worktree, "statusbar.worktree"),
+      this.toggle("statusbar-branch", "Branch", s.statusbar.branch, "statusbar.branch"),
+      this.toggle("statusbar-machine", "Machine", s.statusbar.machine, "statusbar.machine"),
+      this.toggle("usage-show", "Agent usage", s.usage.show, "usage.show",
         (next) => run(next ? "layout.show" : "layout.hide", { id: "usage" })),
     ]);
   }
 
-  sectionRefresh(t, s) {
-    return this.card("Refresh", "How often git and PRs refresh", [
-      h_flex().flex_none().items_center().justify_between().gap(8)
-        .child(div().flex_1().min_w(0).truncate().child("Remote git"))
-        .child(this.stepper("refresh-git", s.refresh.remoteGitSec, "s", 5, 300, 5, "refresh.remoteGitSec")),
-      h_flex().flex_none().items_center().justify_between().gap(8)
-        .child(div().flex_1().min_w(0).truncate().child("Pull request"))
-        .child(this.stepper("refresh-pr", s.refresh.prSec, "s", 30, 900, 30, "refresh.prSec")),
+  sectionCards(t, s) {
+    return this.section("cards", "Sidebar cards", [
+      this.toggle("card-time", "Time in status", s.card.time, "card.time"),
+      this.toggle("card-line3", "Diff stats", s.card.line3, "card.line3"),
+      this.toggle("card-pr", "Pull request link", s.card.pr, "card.pr"),
+    ]);
+  }
+
+  sectionSession(t, s) {
+    return this.section("session", "Session panel", [
+      this.toggle("session-tasks", "Agent tasks", s.session.tasks, "session.tasks"),
+      this.toggle("session-git", "Git status", s.session.git, "session.git"),
+      this.toggle("session-commits", "Recent commits", s.session.commits, "session.commits"),
+      this.toggle("session-subagents", "Subagents", s.session.subagents, "session.subagents"),
     ]);
   }
 
   sectionNaming(t, s) {
-    return this.card("Naming", "Automatic tab names", [
-      this.switchRow("naming-enabled", "Enabled", s.naming.enabled, "naming.enabled"),
-      h_flex().flex_none().items_center().justify_between().gap(8)
-        .child(div().flex_1().min_w(0).truncate().child("On exit"))
-        .child(this.seg("naming-exit", s.naming.exitMode, [["keep", "Keep name"], ["revert", "Revert"], ["check", "Add ✓"]], "naming.exitMode")),
-      this.switchRow("naming-follow", "Follow agent renames", s.naming.followAgent, "naming.followAgent"),
-      this.switchRow("naming-model", "Summarise with a model", s.naming.model, "naming.model",
-        "Sends the first prompt of each session to the model provider (via the claude CLI)."),
-      h_flex().flex_none().items_center().justify_between().gap(8)
-        .child(div().flex_1().min_w(0).truncate().child("Max length"))
-        .child(this.stepper("naming-maxlen", s.naming.maxLen, "", 16, 60, 4, "naming.maxLen")),
-      div().text_size(11).text_color(t.dim).child("Renaming a tab in Herdr never changes the agent's session."),
+    return this.section("naming", "Tab names", [
+      this.toggle("naming-enabled", "Name tabs automatically", s.naming.enabled, "naming.enabled"),
+      this.row("naming-exit", "When the agent exits",
+        this.seg("naming-exit", s.naming.exitMode, [["keep", "Keep"], ["revert", "Revert"], ["check", "Add ✓"]], "naming.exitMode")),
     ]);
   }
 
-  sectionTasks(t) {
+  // Task reporting, Ranch updates and tool health, each one line; details only
+  // when something needs the person.
+  sectionSystem(t) {
     const rows = [];
-    if (!this.tasks) {
-      rows.push(div().text_color(t.dim).child("Checking task reporting…"));
-    } else if (this.tasks.error) {
-      rows.push(div().text_color(t.dim).child("Task reporting isn't installed. Run `node bin/ranch-tasks install` from the Ranch repo."));
-    } else {
-      for (const key of TASK_KEYS) {
-        const status = this.tasks.agents[key];
-        const color = status === "installed" ? t.done : status === "outdated" || status === "needs approval" ? t.working : t.blocked;
-        const group = [h_flex().flex_none().items_center().justify_between().gap(8)
-          .child(div().flex_1().min_w(0).truncate().child(displayName(key, this.known ?? [])))
-          .child(div().text_color(color).child(status))];
-        // "last report N min ago" (fixes 3.8): when the agent last evented.
-        const at = this.report?.[key] ? Date.parse(this.report[key]) : null;
-        if (Number.isFinite(at)) {
-          const ago = Date.now() - at;
-          if (ago >= 0) {
-            group.push(div().text_size(11).text_color(t.dim).child(`last report ${relativeTime(ago)}`));
-          }
-        }
-        // Codex hooks waiting for trust: only Codex's own /hooks can approve them.
-        if (key === "codex" && status === "needs approval") {
-          group.push(div().text_size(11).text_color(t.dim).child("Codex: approve the Ranch hooks once with /hooks in Codex."));
-        }
-        rows.push(v_flex().gap(2).children(group));
-      }
-      const repair = TASK_KEYS.some((key) => this.tasks.agents[key] === "broken");
-      if (TASK_KEYS.some((key) => !["installed", "needs approval"].includes(this.tasks.agents[key]))) {
-        rows.push(h_flex().flex_none().justify_end()
-          .child(div().id("tasks-setup").flex_none().px(10).py(4).rounded(7).bg(t.accent).text_color(t.accent_foreground).font_semibold().cursor_pointer()
-            .on_click((_e, cx) => this.runSetup(cx))
-            .child(repair ? "Repair" : "Set up")));
-      }
-    }
-    if (this.setup) {
-      rows.push(div().text_size(11).text_color(t.dim).child(this.setup.split("\n").slice(0, 6).join("\n")));
-    }
-    rows.push(div().text_size(11).text_color(t.dim).child("Codex asks you to trust new hooks once (/hooks in Codex)."));
-    return this.card("Task reporting", "Which agents report their tasks", rows);
-  }
 
-  sectionHealth(t) {
-    const gh = shared("ranch.health.gh");
-    const word = (w) => (w === "ok" ? ["ok", t.done]
-      : w === "missing" ? ["missing", t.blocked]
-      : w === "signed-out" ? ["signed out", t.blocked]
-      : w === "old" ? ["too old", t.working]
-      : ["checking…", t.dim]);
-    return this.card("Health", "git, GitHub CLI and Herdr versions", [
-      ...[["git", this.health.git, "health-git"], ["gh (GitHub CLI)", gh, "health-gh"], ["Herdr app", this.health.herdr, "health-herdr"]].map(([label, w, id]) => {
-        const [word_, color] = word(w);
-        return h_flex().flex_none().items_center().justify_between().gap(8)
-          .child(div().flex_1().min_w(0).truncate().child(label))
-          .child(div().text_color(color).child(word_));
-      }),
-    ]);
-  }
+    // Task reporting
+    const tasks = this.tasks;
+    const pending = tasks?.agents ? TASK_KEYS.filter((k) => !["installed", "needs approval"].includes(tasks.agents[k])) : [];
+    const broken = pending.some((k) => tasks.agents[k] === "broken");
+    const taskStatus = !tasks ? this.status("checking…", t.dim)
+      : tasks.error ? this.status("not installed", t.blocked)
+      : pending.length ? h_flex().flex_none().items_center().gap(8)
+          .child(this.status(`${pending.length} to set up`, t.working))
+          .child(this.button("tasks-setup", broken ? "Repair" : "Set up", (_e, cx) => this.runSetup(cx), { primary: true }))
+      : this.status("on", t.done);
+    rows.push(this.row("sys-tasks", "Task reporting", taskStatus));
+    if (tasks?.error) rows.push(this.note("Run `node bin/ranch-tasks install` from the Ranch repo."));
+    if (pending.length) rows.push(this.note(pending.map((k) => `${displayName(k, this.known ?? [])} ${tasks.agents[k]}`).join(" · ")));
+    if (tasks?.agents?.codex === "needs approval") rows.push(this.note("Codex: approve the Ranch hooks once with /hooks.", t.working));
+    if (this.setup) rows.push(this.note(this.setup.split("\n").slice(0, 3).join("\n")));
 
-  sectionUpdates(t) {
+    // Ranch updates
     const u = this.upd;
-    const short = (sha) => (sha ? String(sha).slice(0, 7) : null);
     const [word, color] = {
       current: ["up to date", t.done],
       updated: ["up to date", t.done],
-      available: ["update available", t.working],
+      available: ["update ready", t.working],
       checking: ["checking…", t.dim],
       updating: ["updating…", t.dim],
-      error: ["error", t.blocked],
-      dev: ["dev install", t.working],
-      unsupported: ["not available", t.blocked],
+      error: ["check failed", t.blocked],
+      dev: ["dev install", t.dim],
+      unsupported: ["unavailable", t.dim],
     }[u.state] ?? ["checking…", t.dim];
     const busy = u.state === "checking" || u.state === "updating";
-    const message = u.message
-      || (u.state === "dev" ? "Symlinked dev install — run git pull in the repo."
-        : u.state === "unsupported" ? "This Ranch install predates updates. Ask your agent to reinstall Ranch once to enable them."
-          : "");
-    // Same chain as the "Set up" button in sectionTasks.
-    const button = (id, label, action, disabled) =>
-      div().id(id).flex_none().px(10).py(4).rounded(7).bg(t.accent).text_color(t.accent_foreground).font_semibold()
-        .when(!disabled, (e) => e.cursor_pointer().on_click(action))
-        .when(disabled, (e) => e.opacity(0.6))
-        .child(label);
-    const rows = [
-      h_flex().flex_none().items_center().justify_between().gap(8)
-        .child(div().flex_1().min_w(0).truncate().child("Installed"))
-        .child(div().text_color(t.muted).child(short(u.installed) ?? "unknown")),
-      h_flex().flex_none().items_center().justify_between().gap(8)
-        .child(div().flex_1().min_w(0).truncate().child("Latest"))
-        .child(div().text_color(t.muted).child(short(u.latest) ?? "—")),
-      h_flex().flex_none().items_center().justify_between().gap(8)
-        .child(div().flex_1().min_w(0).truncate().child("Status"))
-        .child(div().text_color(color).child(word)),
-    ];
-    if (message) rows.push(div().text_size(11).text_color(t.dim).child(message));
-    const showUpdate = u.state === "available" || u.state === "updating";
-    rows.push(h_flex().flex_none().justify_end().gap(8)
-      .child(button("updates-check", "Check now", (_e, cx) => this.checkUpdate(cx, true), busy))
-      .when(showUpdate, (e) => e.child(button("updates-update", "Update", (_e, cx) => this.runUpdate(cx), u.state === "updating"))));
-    return this.card("Updates", "Ranch layout and mods from GitHub main", rows);
-  }
+    const updControl = h_flex().flex_none().items_center().gap(8)
+      .child(this.status(word, color))
+      .child(u.state === "available" || u.state === "updating"
+        ? this.button("updates-update", "Update", (_e, cx) => this.runUpdate(cx), { primary: true, disabled: u.state === "updating" })
+        : this.button("updates-check", "Check", (_e, cx) => this.checkUpdate(cx, true), { disabled: busy }));
+    rows.push(this.row("sys-ranch", "Ranch", updControl));
+    const updNote = u.message
+      || (u.state === "dev" ? "Symlinked dev install: git pull in the repo."
+        : u.state === "unsupported" ? "This install predates updates. Reinstall Ranch once to enable them." : "");
+    if (updNote) rows.push(this.note(updNote, u.state === "error" ? t.blocked : null));
 
-  sectionFooter(t) {
-    return h_flex().flex_none().justify_end()
-      .child(div().id("open-herdr-settings").flex_none().px(10).py(4).rounded(7).border_1().border_color(t.border).text_color(t.muted).cursor_pointer()
-        .hover((s) => s.bg(t.hover).text_color(t.foreground))
-        .on_click(() => run("app.settings"))
-        .child("Herdr settings"));
+    // Tool health: a row only for what's wrong.
+    const gh = shared("ranch.health.gh");
+    const problems = [
+      this.health.git === "missing" && ["git", "missing"],
+      gh === "missing" && ["GitHub CLI", "missing"],
+      gh === "signed-out" && ["GitHub CLI", "signed out"],
+      this.health.herdr === "missing" && ["Herdr app", "missing"],
+      this.health.herdr === "old" && ["Herdr app", "too old"],
+    ].filter(Boolean);
+    for (const [label, what] of problems) rows.push(this.row(`sys-${label}`, label, this.status(what, t.blocked)));
+
+    rows.push(this.row("open-herdr-settings", "Herdr settings", this.status("Open", t.dim), { onClick: () => run("app.settings") }));
+    return this.section("system", "System", rows);
   }
 
   // ---- root ----
@@ -578,23 +482,19 @@ export default class RanchSettings extends View {
   renderBody(cx) {
     const t = theme(), s = this.s();
     return v_flex().id("ranch-settings").size_full().min_h(0).overflow_y_scrollbar().bg(t.surface)
-      .text_color(t.foreground).text_size(12.5).p(10).gap(8).track_focus(this.handle)
+      .text_color(t.foreground).text_size(12.5).px(8).pt(12).pb(16).track_focus(this.handle)
       .on_key_down((e, cx) => {
         if (e.key === "escape") run("pane.go", { direction: "left" });
       })
       .children([
-        div().flex_none().px(2).text_size(13).font_semibold().text_color(t.foreground).child("Ranch settings"),
+        div().flex_none().px(6).pb(6).text_size(13).font_semibold().text_color(t.foreground).child("Ranch settings"),
         this.sectionAgents(t, s),
         this.sectionTopbar(t, s),
         this.sectionStatus(t, s),
         this.sectionCards(t, s),
         this.sectionSession(t, s),
-        this.sectionRefresh(t, s),
         this.sectionNaming(t, s),
-        this.sectionTasks(t),
-        this.sectionHealth(t),
-        this.sectionUpdates(t),
-        this.sectionFooter(t),
+        this.sectionSystem(t),
       ]);
   }
 }
