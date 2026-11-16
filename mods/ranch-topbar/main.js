@@ -164,6 +164,7 @@ export default class RanchTopbar extends View {
       : 10;
     const panel = find(root, "panel"), body = find(root, "panel-body");
     this.syncPanel(space, panel, body, PANELS);
+    const show = resolveSettings(shared(SETTINGS_KEY)).topbar;
 
     // Group 1: agent launchers from Ranch settings, in order. "terminal" is a plain shell.
     const launch = (id, icon, tooltip, action) => {
@@ -200,7 +201,7 @@ export default class RanchTopbar extends View {
     const queue = attentionQueue(spaces(), shared("ranch.activity") ?? {}, Date.now());
     const blockedCount = queue.filter(e => e.status === "blocked").length;
     const doneCount = queue.length - blockedCount;
-    const attentionPill = queue.length ? (() => {
+    const attentionPill = show.attention && queue.length ? (() => {
       // The tooltip names the tab a click would actually go to.
       const entry = this.attentionTarget(queue, spaces());
       const entrySpace = spaces().find(p => p.id === entry.spaceId);
@@ -245,10 +246,11 @@ export default class RanchTopbar extends View {
       return el;
     };
 
-    // The current tab, inline on the bar (no pill): status ring, space / name,
-    // branch pill, auto/lock marker, close.
+    // The current tab, inline on the bar (no pill), in order: status, agent logo,
+    // [space /] title, [auto/lock marker], close. Repo, worktree and branch live
+    // in the bottom status bar. Optional parts follow Ranch settings (topbar.*).
     const left = tab && (() => {
-      // Branch from the pane this tab shows: the agent's pane, else the focused/first pane.
+      // The pane this tab shows: the agent's pane, else the focused/first pane.
       const tabPanes = paneList.filter(p => p.tab === tab.id);
       const pane = tabPanes.find(p => p.program?.agent) ?? tabPanes.find(p => p.focused) ?? tabPanes[0];
       const program = pane?.program;
@@ -283,25 +285,17 @@ export default class RanchTopbar extends View {
           cx.stop_propagation();
           openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: tab.id, space: space.id } } });
         })
-        // Agent logo first (the pane header is gone; its details live here now).
-        .when(Boolean(program?.icon), el => el.child(program.tint
+        .when(show.status, el => el.child(statusGlyph))
+        .when(show.logo && Boolean(program?.icon), el => el.child(program.tint
           ? svg(program.icon).size(15).flex_none().text_color(t.muted)
           : image(program.icon).size(15).flex_none()))
-        .child(statusGlyph)
-        .child(div().max_w(160).truncate().text_color(t.muted).child(space.name))
-        .child(div().text_color(t.dim).flex_none().child("/"))
-        .child(div().max_w(260).truncate().font_semibold().text_color(t.foreground).child(name))
-        .when(Boolean(pane?.branch), el => el.child(
-          // The focused pane's branch, as a pill.
-          h_flex().id(`branch-${tab.id}`).h(18).px(6).gap(4).flex_none().items_center().rounded(4).bg(t.raised)
-            .text_size(11).text_color(t.muted)
-            .child(svg("mods/ranch-topbar/git-branch.svg").size(11).flex_none().text_color(t.muted))
-            .child(div().max_w(220).truncate().child(pane.branch))))
-        .when(Boolean(pane?.cwd), el => el.child(div().id(`cwd-${tab.id}`).max_w(240).truncate().text_size(11).text_color(t.dim)
-          .tooltip(pane.cwd).child(pane.cwd.replace(home(), "~"))))
-        .when(tab.named && auto?.name === tab.name, el => el.child(div().id(`auto-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
+        .when(show.space, el => el
+          .child(div().max_w(160).truncate().text_color(t.muted).child(space.name))
+          .child(div().text_color(t.dim).flex_none().child("/")))
+        .child(div().max_w(320).truncate().font_semibold().text_color(t.foreground).child(name))
+        .when(show.marker && tab.named && auto?.name === tab.name, el => el.child(div().id(`auto-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
           .tooltip(`Named by the agent's session (source: ${auto.source ?? "agent"})`).child("auto")))
-        .when(tab.named && auto?.name !== tab.name, el => el.child(div().id(`lock-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
+        .when(show.marker && tab.named && auto?.name !== tab.name, el => el.child(div().id(`lock-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
           .tooltip("You named this tab. Reset name in the tab menu to let the agent name it.").child("✎")))
         .child(iconButton(`close-${tab.id}`, "mods/ranch-topbar/close.svg", 12, close));
     })();
@@ -332,8 +326,8 @@ export default class RanchTopbar extends View {
         ...(fileTab ? [div().id("file-tab-divider").w(1).h(16).flex_none().mx(4).bg(t.border), fileTab] : []),
         h_flex().id("spacer").flex_1().min_w(0),
         ...(attentionPill ? [attentionPill] : []),
-        launch("launch-sparkle", svg("mods/ranch-topbar/sparkle.svg").size(14),
-          `Start agent with a task ${keySuffix("N")}`, () => this.launch()),
+        ...(show.launch ? [launch("launch-sparkle", svg("mods/ranch-topbar/sparkle.svg").size(14),
+          `Start agent with a task ${keySuffix("N")}`, () => this.launch())] : []),
         ...launchers,
         div().id("panel-divider").w(1).h(18).flex_none().mx(6).bg(t.border),
         panelButton("session", `Session details ${keySuffix("1")}`, "mods/ranch-topbar/session.svg"),

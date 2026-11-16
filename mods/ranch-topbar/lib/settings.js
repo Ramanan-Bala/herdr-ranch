@@ -26,6 +26,11 @@ export const DEFAULTS = Object.freeze({
   agents: ["claude", "codex", "opencode", "terminal"],
   card: { time: true, line3: true, pr: true },
   session: { tasks: true, git: true, commits: true, subagents: true },
+  // What the top bar shows for the current tab, left to right (close and new-tab always show),
+  // plus the attention pill and "start agent" button on the right.
+  topbar: { status: true, logo: true, space: false, marker: false, attention: true, launch: true },
+  // What the bottom status bar shows, left to right.
+  statusbar: { repo: true, worktree: true, branch: true, machine: true },
   // Whether the agent usage bar shows in the status bar.
   usage: { show: true },
   refresh: { remoteGitSec: 15, prSec: 120 },

@@ -848,3 +848,12 @@ test("createLimiter: a synchronous throw or plain value never leaks the slot", a
   assert.equal(limiter.active, 0);
   assert.equal(await limiter.run(async () => "after"), "after");
 });
+
+test("repoLabels: main checkout, linked worktree, bare repo", async () => {
+  const { repoLabels } = await import("../lib/git.js");
+  assert.deepEqual(repoLabels("/x/ranch", "/x/ranch/.git"), { repo: "ranch", worktree: null });
+  assert.deepEqual(repoLabels("/x/wt/feat-a", "/x/ranch/.git"), { repo: "ranch", worktree: "feat-a" });
+  assert.deepEqual(repoLabels("/x/wt/feat-b", "/x/ranch.git"), { repo: "ranch", worktree: "feat-b" });
+  assert.deepEqual(repoLabels("/x/ranch/", null), { repo: "ranch", worktree: null });
+  assert.deepEqual(repoLabels("C:\\src\\ranch", "C:\\src\\ranch\\.git"), { repo: "ranch", worktree: null });
+});

@@ -1,7 +1,8 @@
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { theme, run, props, window, shared, setShared, updates, layout, agents, spaces } from "herdr";
-import { FILTER_KEY } from "./lib/settings.js";
+import { theme, run, props, window, shared, setShared, updates, layout, agents, spaces, panes, exec } from "herdr";
+import { FILTER_KEY, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
+import { repoLabels } from "./lib/git.js";
 import { effectiveStatus } from "./lib/format.js";
 
 function find(node, id) {
@@ -52,7 +53,57 @@ function blockedTarget() {
   return null;
 }
 
+// The pane the active tab shows: its agent's pane, else the focused/first pane.
+function activePane() {
+  const space = spaces().find((s) => s.active);
+  const tab = space?.tabs.find((c) => c.active);
+  const tabPanes = tab ? panes().filter((p) => p.tab === tab.id) : [];
+  const pane = tabPanes.find((p) => p.program?.agent) ?? tabPanes.find((p) => p.focused) ?? tabPanes[0];
+  return { space, pane };
+}
+
+// How long a repo/worktree/branch lookup for one folder stays fresh.
+const REPO_TTL_MS = 15_000;
+
 export default class RanchChrome extends View {
+  init(p, cx) {
+    if (!p?.status) return;
+    // Status bar only: repo, worktree and branch of the active pane's folder,
+    // keyed by "machine|cwd". Render can't spawn, so a 1 s tick does the lookups.
+    this.repoInfo = new Map();
+    this.repoBusy = false;
+    cx.timer.every(1000, (cx) => this.pollRepo(cx));
+  }
+
+  pollRepo(cx) {
+    if (this.repoBusy) return;
+    const { space, pane } = activePane();
+    if (!pane?.cwd) return;
+    const machine = space?.machine ?? null;
+    const key = `${machine ?? ""}|${pane.cwd}`;
+    const hit = this.repoInfo.get(key);
+    if (hit && Date.now() - hit.at < REPO_TTL_MS) return;
+    this.repoBusy = true;
+    cx.spawn(async (cx) => {
+      let info = { repo: null, worktree: null, branch: null };
+      try {
+        const r = await exec("git", ["rev-parse", "--show-toplevel", "--path-format=absolute", "--git-common-dir", "--abbrev-ref", "HEAD"],
+          { cwd: pane.cwd, on: machine, timeout: 10_000 });
+        if (r.code === 0) {
+          const [top, common, head] = (r.stdout || "").split("\n").map((l) => l.trim());
+          if (top) info = { ...repoLabels(top, common || null), branch: head && head !== "HEAD" ? head : null };
+        }
+      } catch {
+        // Unreachable machine or no git: show nothing for this folder until the TTL passes.
+      } finally {
+        this.repoBusy = false;
+      }
+      if (this.repoInfo.size > 64) this.repoInfo.clear();
+      this.repoInfo.set(key, { ...info, at: Date.now() });
+      cx.notify();
+    });
+  }
+
   button(id, label, action, size = 26) {
     const t = theme();
     return div().id(id).size(size).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))
@@ -61,13 +112,25 @@ export default class RanchChrome extends View {
   render() {
     const t = theme();
     const collapsed = narrow();
-    // Bottom status bar, left end: just the machine the active space runs on.
+    // Bottom status bar, left end: repo, worktree, branch, machine of the active
+    // tab (each one optional in Ranch settings, statusbar.*).
     if (props()?.status) {
-      const space = spaces().find((s) => s.active);
-      return h_flex().size_full().px(14).gap(16).items_center().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8).text_color(t.muted)
-        .child(h_flex().gap(6).items_center().min_w(0)
-          .child(svg(`mods/ranch-chrome/${space?.machine ? "server" : "laptop"}.svg`).size(13).flex_none())
-          .child(div().truncate().child(space?.machine ?? "This computer")));
+      const show = resolveSettings(shared(SETTINGS_KEY)).statusbar;
+      const { space, pane } = activePane();
+      const info = pane?.cwd ? this.repoInfo?.get(`${space?.machine ?? ""}|${pane.cwd}`) : null;
+      const branch = pane?.branch || info?.branch;
+      const item = (id, icon, text, tip) => h_flex().id(id).gap(5).items_center().min_w(0).flex_shrink(1)
+        .when(Boolean(tip), (el) => el.tooltip(tip))
+        .child(svg(`mods/ranch-chrome/${icon}.svg`).size(12).flex_none().text_color(t.dim))
+        .child(div().truncate().child(text));
+      const items = [
+        show.repo && info?.repo ? item("sb-repo", "folder", info.repo, "Repository") : null,
+        show.worktree && info?.worktree ? item("sb-worktree", "layers", info.worktree, "Worktree") : null,
+        show.branch && branch ? item("sb-branch", "git-branch", branch, "Branch") : null,
+        show.machine ? item("sb-machine", space?.machine ? "server" : "laptop", space?.machine ?? "This computer", "Machine") : null,
+      ].filter(Boolean);
+      return h_flex().size_full().min_w(0).px(12).gap(14).items_center().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8).text_color(t.muted)
+        .children(items);
     }
     if (props()?.footer) {
       const counts = statusCounts();

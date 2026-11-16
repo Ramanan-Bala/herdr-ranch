@@ -238,13 +238,14 @@ export default class RanchSettings extends View {
 
   // ---- render helpers ----
 
+  // A compact section: title with its description on one line, rows packed tight.
   card(title, description, rows) {
     const t = theme();
-    return v_flex().flex_none().rounded(8).border_1().border_color(t.border).bg(t.background).p(12).gap(10)
-      .child(v_flex().gap(2)
-        .child(div().text_size(12.5).font_semibold().text_color(t.foreground).child(title))
-        .when(!!description, (e) => e.child(div().text_size(11).text_color(t.dim).child(description))))
-      .children(rows.flatMap((row, i) => (i === 0 ? [row] : [div().h(1).flex_none().bg(t.border), row])));
+    return v_flex().flex_none().rounded(6).border_1().border_color(t.border).bg(t.background).px(8).py(6).gap(2)
+      .child(h_flex().flex_none().items_baseline().gap(6).px(4).pb(2)
+        .child(div().flex_none().text_size(12).font_semibold().text_color(t.foreground).child(title))
+        .when(!!description, (e) => e.child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child(description))))
+      .children(rows);
   }
 
   iconBtn(id, icon, action) {
@@ -258,7 +259,7 @@ export default class RanchSettings extends View {
 
   pill(id, on, toggle) {
     const t = theme();
-    return div().id(id).flex_none().w(32).h(18).rounded(9).p(2).flex().items_center().border_1().border_color(t.border)
+    return div().id(id).flex_none().w(26).h(14).rounded(7).p(2).flex().items_center().border_1().border_color(t.border)
       .bg(on ? t.accent : t.input).cursor_pointer()
       .when(on, (e) => e.justify_end())
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -266,7 +267,7 @@ export default class RanchSettings extends View {
         cx.stop_propagation();
         toggle();
       })
-      .child(div().size(12).rounded(9).bg(on ? t.accent_foreground : t.muted));
+      .child(div().size(8).rounded(4).bg(on ? t.accent_foreground : t.muted));
   }
 
   switchRow(id, label, value, path, hint = null, onChange = null) {
@@ -277,11 +278,11 @@ export default class RanchSettings extends View {
       if (onChange) onChange(next);
     };
     return h_flex().id(id).flex_none().items_center().justify_between().gap(8).cursor_pointer()
-      .rounded(6).px(6).py(4).hover((s) => s.bg(t.hover))
+      .rounded(5).px(4).py(2).hover((s) => s.bg(t.hover))
       .on_click(toggle)
       .child(v_flex().flex_1().min_w(0).gap(1)
         .child(div().truncate().child(label))
-        .when(!!hint, (e) => e.child(div().text_size(11).text_color(t.dim).child(hint))))
+        .when(!!hint, (e) => e.child(div().text_size(10.5).text_color(t.dim).child(hint))))
       .child(this.pill(`${id}-pill`, value, toggle));
   }
 
@@ -358,7 +359,7 @@ export default class RanchSettings extends View {
   addAgentSelect(t, s, choices, full) {
     const disabled = full || !choices.length;
     const label = full ? `Limit reached (${MAX_AGENTS} of ${MAX_AGENTS})` : choices.length ? "Add an agent…" : "All agents added";
-    const trigger = h_flex().id("agent-add").flex_none().h(28).px(10).gap(8).items_center().rounded(6)
+    const trigger = h_flex().id("agent-add").flex_none().h(24).px(10).gap(8).items_center().rounded(6)
       .bg(t.input).border_1().border_color(this.addOpen ? t.accent : t.border)
       .when(!disabled, (e) => e.cursor_pointer().hover((st) => st.border_color(t.muted)))
       .child(svg("mods/ranch-settings/plus.svg").size(11).text_color(disabled ? t.border : t.muted))
@@ -404,10 +405,24 @@ export default class RanchSettings extends View {
     ]);
   }
 
+  sectionTopbar(t, s) {
+    return this.card("Top bar", "Status · logo · title · close · new tab", [
+      this.switchRow("topbar-status", "Agent status", s.topbar.status, "topbar.status"),
+      this.switchRow("topbar-logo", "Agent logo", s.topbar.logo, "topbar.logo"),
+      this.switchRow("topbar-space", "Space name before title", s.topbar.space, "topbar.space"),
+      this.switchRow("topbar-marker", "Naming marker (auto / ✎)", s.topbar.marker, "topbar.marker"),
+      this.switchRow("topbar-attention", "Needs-you pill", s.topbar.attention, "topbar.attention"),
+      this.switchRow("topbar-launch", "Start agent button", s.topbar.launch, "topbar.launch"),
+    ]);
+  }
+
   sectionStatus(t, s) {
-    return this.card("Status bar", "Bottom bar contents", [
-      this.switchRow("usage-show", "Show agent usage", s.usage.show, "usage.show",
-        "Plan limits and session usage at the bottom right",
+    return this.card("Status bar", "Repo · worktree · branch · machine", [
+      this.switchRow("statusbar-repo", "Repository", s.statusbar.repo, "statusbar.repo"),
+      this.switchRow("statusbar-worktree", "Worktree", s.statusbar.worktree, "statusbar.worktree"),
+      this.switchRow("statusbar-branch", "Branch", s.statusbar.branch, "statusbar.branch"),
+      this.switchRow("statusbar-machine", "Machine", s.statusbar.machine, "statusbar.machine"),
+      this.switchRow("usage-show", "Agent usage", s.usage.show, "usage.show", null,
         (next) => run(next ? "layout.show" : "layout.hide", { id: "usage" })),
     ]);
   }
@@ -563,18 +578,17 @@ export default class RanchSettings extends View {
   renderBody(cx) {
     const t = theme(), s = this.s();
     return v_flex().id("ranch-settings").size_full().min_h(0).overflow_y_scrollbar().bg(t.surface)
-      .text_color(t.foreground).text_size(13).p(14).gap(14).track_focus(this.handle)
+      .text_color(t.foreground).text_size(12.5).p(10).gap(8).track_focus(this.handle)
       .on_key_down((e, cx) => {
         if (e.key === "escape") run("pane.go", { direction: "left" });
       })
       .children([
-        v_flex().flex_none().gap(2)
-          .child(div().text_size(14).font_semibold().text_color(t.foreground).child("Ranch settings"))
-          .child(div().text_size(11).text_color(t.dim).child("Sidebar, session panel and agent options")),
+        div().flex_none().px(2).text_size(13).font_semibold().text_color(t.foreground).child("Ranch settings"),
         this.sectionAgents(t, s),
+        this.sectionTopbar(t, s),
+        this.sectionStatus(t, s),
         this.sectionCards(t, s),
         this.sectionSession(t, s),
-        this.sectionStatus(t, s),
         this.sectionRefresh(t, s),
         this.sectionNaming(t, s),
         this.sectionTasks(t),
