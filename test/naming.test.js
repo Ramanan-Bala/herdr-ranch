@@ -13,6 +13,9 @@ import {
   exitAction,
   rememberSession,
   recallSession,
+  sessionChanged,
+  withRecordSession,
+  isLauncherName,
 } from "../lib/naming.js";
 
 test("SOURCE_RANK ranks sources, lower wins", () => {
@@ -381,5 +384,78 @@ test("bestCandidate skips names that repeat the context (space) name", () => {
   assert.deepEqual(
     bestCandidate({ agentName: "Claude", repo: "ranch", context: ["ranch"] }),
     { name: "Claude", source: "provisional" },
+  );
+});
+
+// ------------------------------------------------- session switches (Pi /resume)
+
+test("decide renames to a weaker source when the agent switched sessions", () => {
+  const tab = { name: "Subagent Research", named: true };
+  const record = { name: "Subagent Research", source: "agent_user", at: 99000, session: "A" };
+  // same session: still guarded
+  assert.deepEqual(
+    decide({ tab, record, candidate: { name: "Is it possible", source: "prompt" }, now: 100000, sessionId: "A" }),
+    { action: "none", reason: "downgrade" },
+  );
+  // another session: downgrade and throttle no longer apply
+  assert.deepEqual(
+    decide({ tab, record, candidate: { name: "Is it possible", source: "prompt" }, now: 100000, sessionId: "B" }),
+    { action: "rename", name: "Is it possible", source: "prompt" },
+  );
+  // no session info on either side: old behaviour
+  assert.deepEqual(
+    decide({ tab, record: { ...record, session: undefined }, candidate: { name: "Y", source: "prompt" }, now: 100000, sessionId: "B" }),
+    { action: "none", reason: "downgrade" },
+  );
+  assert.deepEqual(
+    decide({ tab, record, candidate: { name: "Y", source: "prompt" }, now: 100000 }),
+    { action: "none", reason: "downgrade" },
+  );
+});
+
+test("decide still never touches a locked tab on a session switch", () => {
+  const tab = { name: "My own name", named: true };
+  const record = { name: "Subagent Research", source: "agent_user", at: 0, session: "A" };
+  assert.deepEqual(
+    decide({ tab, record, candidate: { name: "X", source: "prompt" }, now: 100000, sessionId: "B" }),
+    { action: "none", reason: "locked" },
+  );
+});
+
+test("sessionChanged and withRecordSession", () => {
+  assert.equal(sessionChanged({ session: "A" }, "B"), true);
+  assert.equal(sessionChanged({ session: "A" }, "A"), false);
+  assert.equal(sessionChanged({ session: "A" }, null), false);
+  assert.equal(sessionChanged({}, "B"), false);
+  assert.equal(sessionChanged(undefined, "B"), false);
+
+  const legacy = { name: "Subagent Research", source: "agent_user", at: 1 };
+  assert.deepEqual(
+    withRecordSession(legacy, { X: "Other", A: "Subagent Research", C: "Subagent Research" }),
+    { ...legacy, session: "C" }, // most recent wins
+  );
+  assert.equal(withRecordSession(legacy, { X: "Other" }), legacy);
+  const stamped = { ...legacy, session: "A" };
+  assert.equal(withRecordSession(stamped, { C: "Subagent Research" }), stamped);
+  assert.equal(withRecordSession(undefined, {}), undefined);
+});
+
+// --------------------------------------- launcher-named tabs (Herdr New menu)
+
+test("a tab named after its agent by the launcher is not locked", () => {
+  for (const name of ["Pi", "Claude Code", "codex", "OpenCode", "Pi 2", " zsh "]) {
+    assert.equal(isLauncherName(name), true, name);
+    assert.equal(ownership({ name, named: true }, undefined), "unnamed", name);
+  }
+  for (const name of ["Pi research", "My tab", "Fix login", "", null]) assert.equal(isLauncherName(name), false, String(name));
+  assert.equal(ownership({ name: "Pi research", named: true }, undefined), "locked");
+  assert.deepEqual(
+    decide({
+      tab: { name: "Pi", named: true },
+      record: undefined,
+      candidate: { name: "Debug PI Session Name Not Updating", source: "agent_user" },
+      now: 1000,
+    }),
+    { action: "rename", name: "Debug PI Session Name Not Updating", source: "agent_user" },
   );
 });

@@ -228,9 +228,20 @@ function normalizeName(s) {
     .trim();
 }
 
+// Names Herdr's New menu (and similar launchers) give a tab after its agent or
+// shell: nobody chose them, so they don't lock the tab.
+const LAUNCHER_NAMES = [...GENERIC_TITLES, "claude code", "gemini", "gemini cli", "amp", "cursor agent", "aider", "goose", "jcode"];
+
+/** True for a launcher's default tab name: "Pi", "Claude Code", "Pi 2"… */
+export function isLauncherName(name) {
+  const low = String(name ?? "").trim().toLowerCase().replace(/\s+\d+$/, "");
+  return Boolean(low) && LAUNCHER_NAMES.includes(low);
+}
+
 /** Who owns the tab's current name: "unnamed", "auto" (Ranch set it) or "locked". */
 export function ownership(tab, record) {
   if (!tab || !tab.named) return "unnamed";
+  if (isLauncherName(tab.name)) return "unnamed";
   // Herdr may normalize our name, and a rename may not have landed at all
   // (the tab still shows the previous auto name).
   if (record && sameName(record.name, tab.name)) return "auto";
@@ -263,6 +274,7 @@ export function decide(ctx = {}) {
     siblingNames = [],
     branch = null,
     minIntervalMs = 15000,
+    sessionId = null,
   } = ctx;
   if (editing) return { action: "none", reason: "editing" };
   const own = ownership(tab, record);
@@ -271,12 +283,16 @@ export function decide(ctx = {}) {
   const ownName = tab && tab.name ? String(tab.name).toLowerCase() : "";
   const sibs = siblingNames.filter((s) => String(s).toLowerCase() !== ownName);
   const name = dedupe(candidate.name, sibs, branch);
-  if (own === "auto" && SOURCE_RANK[candidate.source] > recordRank(record)) {
+  // The agent switched sessions (e.g. Pi's /resume) since Ranch named the tab:
+  // the old name belongs to another session, so its rank and timing no longer apply.
+  const switched = own === "auto" && sessionChanged(record, sessionId);
+  if (own === "auto" && !switched && SOURCE_RANK[candidate.source] > recordRank(record)) {
     return { action: "none", reason: "downgrade" };
   }
   if (sameName(name, tab.name)) return { action: "none", reason: "same" };
   if (
     own === "auto" &&
+    !switched &&
     record &&
     record.at &&
     now - record.at < minIntervalMs &&
@@ -285,6 +301,22 @@ export function decide(ctx = {}) {
     return { action: "none", reason: "throttled" };
   }
   return { action: "rename", name, source: candidate.source };
+}
+
+/** True when the auto-name record was set for a different session than `sessionId`. */
+export function sessionChanged(record, sessionId) {
+  return Boolean(record && typeof record.session === "string" && record.session && sessionId && record.session !== sessionId);
+}
+
+/**
+ * The auto-name record with its session: records written before the session
+ * was stored get it from the remembered session names (the most recent
+ * session that was given this name).
+ */
+export function withRecordSession(record, sessions) {
+  if (!record || typeof record.session === "string" || !sessions) return record;
+  const ids = Object.keys(sessions).filter((id) => sessions[id] === record.name);
+  return ids.length ? { ...record, session: ids[ids.length - 1] } : record;
 }
 
 function recordRank(record) {

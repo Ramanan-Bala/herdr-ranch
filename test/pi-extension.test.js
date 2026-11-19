@@ -5,7 +5,10 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import ranchTasks, { TODO_TOOL, normalizeTodos, ranchCommand, todoSummary, toolResponse } from "../adapters/pi-extension.js";
+import ranchTasks, {
+  TODO_TOOL, autoNameEnabled, cleanSessionTitle, generateSessionTitle, normalizeTodos, ranchCommand,
+  sessionSnapshot, titlePrompt, todoSummary, toolResponse,
+} from "../adapters/pi-extension.js";
 
 function withEnv(t, vars) {
   const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
@@ -188,4 +191,221 @@ test("without HC_TERMINAL_ID the tool is registered and nothing is spawned", { s
   handlers.session_shutdown[0]({ reason: "quit" }, ctx);
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(existsSync(log), false);
+});
+
+// ------------------------------------------------------------ sessionSnapshot
+
+const msg = (message) => ({ type: "message", message });
+const todoResult = (todos, isError = false) => msg({ role: "toolResult", toolName: "todo_write", details: { todos }, isError });
+
+test("sessionSnapshot reads the name, the branch's latest todo list and first prompt", () => {
+  const snap = sessionSnapshot({
+    getSessionName: () => " Auth refactor ",
+    getBranch: () => [
+      { type: "session_info", name: "x" },
+      msg({ role: "user", content: [{ type: "text", text: "fix the login loop" }] }),
+      todoResult([{ content: "old", status: "pending" }]),
+      msg({ role: "user", content: "later prompt" }),
+      todoResult([{ content: "a", status: "completed" }, { content: "b", status: "in_progress", activeForm: "Doing b" }]),
+      todoResult([{ content: "ignored", status: "pending" }], true),
+      msg({ role: "toolResult", toolName: "bash", details: { todos: [{ content: "no", status: "pending" }] } }),
+    ],
+  });
+  assert.deepEqual(snap, {
+    session_name: "Auth refactor",
+    todos: [{ content: "a", status: "completed" }, { content: "b", status: "in_progress", activeForm: "Doing b" }],
+    first_prompt: "fix the login loop",
+  });
+});
+
+test("sessionSnapshot: no name is null, no todo_write is an empty list, unreadable parts are left out", () => {
+  assert.deepEqual(sessionSnapshot({ getSessionName: () => undefined, getBranch: () => [] }), { session_name: null, todos: [] });
+  assert.deepEqual(sessionSnapshot({
+    getSessionName: () => { throw new Error("x"); },
+    getBranch: () => { throw new Error("x"); },
+  }), {});
+  assert.deepEqual(sessionSnapshot(undefined), {});
+});
+
+test("the extension sends the snapshot on start and SessionSync on rename and /tree", { skip: process.platform === "win32" ? "POSIX fake executable" : false }, async (t) => {
+  const { log } = fakeCliHome(t, "");
+  const { pi, handlers } = fakePi();
+  ranchTasks(pi);
+  let branch = [todoResult([{ content: "a", status: "pending" }])];
+  const ctx = {
+    sessionManager: { getSessionId: () => "ses-pi", getSessionName: () => "Named", getBranch: () => branch },
+    cwd: "/tmp/project",
+  };
+  await handlers.session_start[0]({ reason: "resume" }, ctx);
+  handlers.session_info_changed[0]({ name: " Renamed " }, ctx);
+  handlers.session_info_changed[0]({}, ctx);
+  branch = [];
+  handlers.session_tree[0]({ newLeafId: "x" }, ctx);
+
+  const payloads = (await waitForLines(log, 4)).map((line) => JSON.parse(line));
+  assert.deepEqual(payloads[0], {
+    hook_event_name: "SessionStart", session_id: "ses-pi", source: "resume", cwd: "/tmp/project",
+    session_name: "Named", todos: [{ content: "a", status: "pending" }],
+  });
+  assert.deepEqual(payloads[1], { hook_event_name: "SessionSync", session_id: "ses-pi", session_name: "Renamed" });
+  assert.deepEqual(payloads[2], { hook_event_name: "SessionSync", session_id: "ses-pi", session_name: null });
+  assert.deepEqual(payloads[3], { hook_event_name: "SessionSync", session_id: "ses-pi", session_name: "Named", todos: [] });
+});
+
+// ------------------------------------------------------- automatic session name
+
+test("autoNameEnabled is on unless RANCH_PI_AUTONAME turns it off", () => {
+  assert.equal(autoNameEnabled({}), true);
+  assert.equal(autoNameEnabled({ RANCH_PI_AUTONAME: "1" }), true);
+  for (const v of ["0", "false", "OFF", "no"]) assert.equal(autoNameEnabled({ RANCH_PI_AUTONAME: v }), false);
+});
+
+test("cleanSessionTitle keeps one short line and drops labels, quotes and SKIP", () => {
+  assert.equal(cleanSessionTitle('"Fix Login Redirect Loop."'), "Fix Login Redirect Loop");
+  assert.equal(cleanSessionTitle("Title: Pi Session Names\nextra"), "Pi Session Names");
+  assert.equal(cleanSessionTitle("**Auth Refactor**"), "Auth Refactor");
+  assert.equal(cleanSessionTitle("SKIP"), null);
+  assert.equal(cleanSessionTitle("  "), null);
+  assert.ok(cleanSessionTitle("word ".repeat(30)).length <= 60);
+});
+
+test("titlePrompt embeds the request", () => {
+  assert.match(titlePrompt("fix the login loop"), /<request>\nfix the login loop\n<\/request>/);
+});
+
+test("generateSessionTitle asks the current model and cleans the reply", async () => {
+  const calls = [];
+  const ctx = {
+    sessionManager: { getSessionId: () => "ses-1" },
+    model: { provider: "anthropic", id: "claude-opus-5-5" },
+    modelRegistry: {
+      getAvailable: () => [{ provider: "anthropic", id: "claude-haiku-4-5" }], // never picked
+      hasConfiguredAuth: () => true,
+      complete: async (model, context, options) => {
+        calls.push({ model, context, options });
+        return { stopReason: "stop", content: [{ type: "text", text: "Pi Session Auto Names" }] };
+      },
+    },
+  };
+  assert.equal(await generateSessionTitle(ctx, "make pi session names automatic"), "Pi Session Auto Names");
+  assert.equal(calls[0].model.id, "claude-opus-5-5");
+  assert.match(calls[0].context.messages[0].content[0].text, /make pi session names automatic/);
+  assert.equal(calls[0].options.thinkingEnabled, false); // complete() fallback disables thinking
+  assert.equal(calls[0].options.sessionId, "ses-1"); // providers like opencode-go require it
+
+  // streamSimple (preferred): no `reasoning` option, so thinking stays off
+  const simple = [];
+  const viaStream = {
+    ...ctx,
+    modelRegistry: {
+      ...ctx.modelRegistry,
+      streamSimple: (model, context, options) => {
+        simple.push(options);
+        return { result: async () => ({ stopReason: "stop", content: [{ type: "text", text: "Streamed Title" }] }) };
+      },
+    },
+  };
+  assert.equal(await generateSessionTitle(viaStream, "make pi session names automatic"), "Streamed Title");
+  assert.equal(simple[0].reasoning, undefined);
+  assert.equal(simple[0].maxTokens, 512);
+  // a reply cut short while thinking has no text: no title
+  viaStream.modelRegistry.streamSimple = () => ({ result: async () => ({ stopReason: "length", content: [{ type: "thinking", thinking: "hmm" }] }) });
+  assert.equal(await generateSessionTitle(viaStream, "x"), null);
+
+  ctx.modelRegistry.complete = async () => ({ stopReason: "error", errorMessage: "overloaded", content: [] });
+  await assert.rejects(generateSessionTitle(ctx, "x"), /overloaded/); // failures reject so they can be retried
+  ctx.modelRegistry.hasConfiguredAuth = () => false;
+  assert.equal(await generateSessionTitle(ctx, "x"), null);
+  assert.equal(await generateSessionTitle({}, "x"), null);
+});
+
+test("the extension names an unnamed session once from its first prompt", async (t) => {
+  withEnv(t, { HC_TERMINAL_ID: undefined, RANCH_PI_AUTONAME: undefined });
+  const { pi, handlers } = fakePi();
+  let name;
+  const named = [];
+  pi.getSessionName = () => name;
+  pi.setSessionName = (n) => { name = n; named.push(n); };
+  let calls = 0;
+  const ctx = {
+    sessionManager: { getSessionId: () => "s1", getBranch: () => [] },
+    model: { provider: "anthropic", id: "claude-haiku-4-5" },
+    modelRegistry: { complete: async () => { calls++; return { stopReason: "stop", content: [{ type: "text", text: "Fix Login Loop" }] }; } },
+  };
+  ranchTasks(pi);
+  await handlers.before_agent_start[0]({ prompt: "fix the login redirect loop", systemPrompt: "" }, ctx);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(named, ["Fix Login Loop"]);
+  await handlers.before_agent_start[0]({ prompt: "and another thing please", systemPrompt: "" }, ctx);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(calls, 1); // once per session
+});
+
+test("the extension leaves named sessions, short prompts and opted-out users alone", async (t) => {
+  withEnv(t, { HC_TERMINAL_ID: undefined, RANCH_PI_AUTONAME: undefined });
+  const run = async (prompt, { name, sid = "s1" } = {}) => {
+    const { pi, handlers } = fakePi();
+    const named = [];
+    pi.getSessionName = () => name;
+    pi.setSessionName = (n) => named.push(n);
+    const ctx = {
+      sessionManager: { getSessionId: () => sid, getBranch: () => [] },
+      model: { provider: "p", id: "m" },
+      modelRegistry: { complete: async () => ({ stopReason: "stop", content: [{ type: "text", text: "Some Title" }] }) },
+    };
+    ranchTasks(pi);
+    await handlers.before_agent_start[0]({ prompt, systemPrompt: "" }, ctx);
+    await new Promise((r) => setTimeout(r, 20));
+    return named;
+  };
+  assert.deepEqual(await run("fix the login redirect loop", { name: "Mine" }), []);
+  assert.deepEqual(await run("hi"), []);
+  assert.deepEqual(await run("/model something long enough"), []);
+  process.env.RANCH_PI_AUTONAME = "0";
+  assert.deepEqual(await run("fix the login redirect loop"), []);
+});
+
+test("a failed title call is retried on the next prompt, at most 3 calls", async (t) => {
+  withEnv(t, { HC_TERMINAL_ID: undefined, RANCH_PI_AUTONAME: undefined });
+  const { pi, handlers } = fakePi();
+  let name;
+  pi.getSessionName = () => name;
+  pi.setSessionName = (n) => { name = n; };
+  const replies = [
+    { stopReason: "error", errorMessage: "overloaded", content: [] },
+    { stopReason: "error", errorMessage: "overloaded", content: [] },
+    { stopReason: "stop", content: [{ type: "text", text: "Third Time Lucky" }] },
+  ];
+  let calls = 0;
+  const ctx = {
+    sessionManager: { getSessionId: () => "s1", getBranch: () => [] },
+    model: { provider: "p", id: "m" },
+    modelRegistry: { complete: async () => replies[calls++] },
+  };
+  ranchTasks(pi);
+  const prompt = async () => {
+    await handlers.before_agent_start[0]({ prompt: "fix the login redirect loop", systemPrompt: "" }, ctx);
+    await new Promise((r) => setTimeout(r, 20));
+  };
+  await prompt();
+  assert.equal(name, undefined);
+  await prompt();
+  assert.equal(name, undefined);
+  await prompt();
+  assert.equal(name, "Third Time Lucky");
+  await prompt();
+  assert.equal(calls, 3);
+
+  // a SKIP answer settles the session: no retry
+  const second = fakePi();
+  let skipCalls = 0;
+  second.pi.getSessionName = () => undefined;
+  second.pi.setSessionName = () => assert.fail("must not name");
+  ranchTasks(second.pi);
+  const skipCtx = { ...ctx, modelRegistry: { complete: async () => { skipCalls++; return { stopReason: "stop", content: [{ type: "text", text: "SKIP" }] }; } } };
+  for (let i = 0; i < 3; i++) {
+    await second.handlers.before_agent_start[0]({ prompt: "just testing this thing", systemPrompt: "" }, skipCtx);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal(skipCalls, 1);
 });
