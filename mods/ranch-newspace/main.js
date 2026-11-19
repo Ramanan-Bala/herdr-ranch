@@ -7,7 +7,7 @@
 // a remote), and the in-dialog browser lists folders there too.
 
 import { View, div, svg } from "gpui-kit";
-import { Popover, h_flex, v_flex, InputState, Input } from "gpui-base";
+import { Popover, h_flex, v_flex, InputState, Input, Scrollbar, ScrollHandle } from "gpui-base";
 import { run, props, closeOverlay, theme, settings, spaces, machines, exec, home, pickFolder, checking } from "herdr";
 import {
   expandHome,
@@ -167,6 +167,9 @@ export default class RanchNewSpace extends View {
     // The in-dialog folder browser: which folder it shows, the name filter it
     // took from the field, its rows and the reading state.
     this.browse = { open: false, path: "", filter: "", state: "idle", dirs: [], truncated: false, error: null, hl: null, gen: 0 };
+    // Scroll position of the browser list, so ↑/↓ can keep the highlighted row
+    // on screen (track_scroll on #browser-list).
+    this.browserScroll = ScrollHandle.new();
     this.typedSeq = 0; // drops a listing a keystroke queued before the last one
 
     // The home lookup for the target machine, cached per view (lib/home.js):
@@ -578,6 +581,9 @@ export default class RanchNewSpace extends View {
           ? (step > 0 ? 0 : rows.length - 1)
           : (at + step + rows.length) % rows.length;
         this.browse = { ...this.browse, hl: rows.length ? next : null };
+        // Keep the highlighted row visible. The Up row is the scroll area's
+        // first direct child, so folder i sits at child i + 1.
+        if (rows.length) this.browserScroll.scroll_to_item(next + 1);
         cx.stop_propagation();
         cx.notify();
         return;
@@ -851,13 +857,23 @@ export default class RanchNewSpace extends View {
       body = [line("state", b.filter ? `No folders match “${b.filter}”` : "No folders here", t.dim)];
     } else body = rows.map(row);
 
+    // The list gets a height of its own: content height while the rows fit,
+    // then LIST_H so it scrolls instead of growing the dialog. overflow_hidden
+    // and overflow_y_scroll on the inner area, with a named Scrollbar beside
+    // it, because overflow_y_scrollbar() wraps the element and its sizing
+    // never reaches the rows (see ranch-changes renderChanges).
+    const count = 1 + body.length + (b.truncated ? 1 : 0);
+    const listH = Math.min(LIST_H, count * BROWSER_ROW_H + Math.max(0, count - 1) * 1 + 8);
     return v_flex().id("folder-browser").w_full().rounded(8).border_1().border_color(t.border)
       .bg(t.surface).overflow_hidden()
       .child(header)
-      .child(v_flex().w_full().max_h(LIST_H).p(4).gap(1).overflow_y_scrollbar()
-        .child(up)
-        .children(body)
-        .when(b.truncated, (e) => e.child(line("more", "Showing the first 500 folders", t.dim))));
+      .child(v_flex().relative().w_full().h(listH).flex_none()
+        .child(v_flex().id("browser-list").absolute().inset_0().overflow_y_scroll().p(4).gap(1)
+          .track_scroll(this.browserScroll)
+          .child(up)
+          .children(body)
+          .when(b.truncated, (e) => e.child(line("more", "Showing the first 500 folders", t.dim))))
+        .child(Scrollbar.vertical("browser-list").absolute().inset_0()));
   }
 
   /** The line under the folder field: what the folder turned out to be. */
@@ -908,8 +924,14 @@ export default class RanchNewSpace extends View {
           .when(this.worktree !== "new", (e) => e.text_color(t.muted))
           .child("New worktree…")));
 
-    return this.row(t, "Worktree", v_flex().w_full().gap(1).max_h(26 * 6 + 2).overflow_y_scrollbar()
-      .children(rows).child(newRow), { start: true });
+    // Same fixed-height pattern as the folder browser: the list scrolls inside
+    // a box that is only as tall as its rows, up to six of them.
+    const count = rows.length + 1;
+    const listH = Math.min(26 * 6 + 2, count * 26 + Math.max(0, count - 1) * 1);
+    return this.row(t, "Worktree", v_flex().relative().w_full().h(listH).flex_none()
+      .child(v_flex().id("worktree-list").absolute().inset_0().overflow_y_scroll().gap(1)
+        .children(rows).child(newRow))
+      .child(Scrollbar.vertical("worktree-list").absolute().inset_0()), { start: true });
   }
 
   branchField(t) {
