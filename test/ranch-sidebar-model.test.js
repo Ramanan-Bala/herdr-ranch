@@ -9,8 +9,10 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 // lib/ must be inside the mod folder before its imports resolve.
 execFileSync("sh", [join(root, "scripts/sync-lib.sh")]);
 
-const { buildTree, nestWorktrees, BADGE_COLORS, initials, badgeColorIndex, diffSquares, worktreeName, branchLine } =
-  await import(pathToFileURL(join(root, "mods/ranch-sidebar/model.js")).href);
+const {
+  buildTree, nestWorktrees, BADGE_COLORS, initials, badgeColorIndex, diffSquares, worktreeName, branchLine,
+  keptKey, spaceFolder, normalizeKept, refreshKept, forgetKept, applyKeptFolders,
+} = await import(pathToFileURL(join(root, "mods/ranch-sidebar/model.js")).href);
 
 const NOW = Date.parse("2026-11-11T10:00:00Z");
 const MIN = 60_000;
@@ -393,4 +395,140 @@ test("branchLine: no checkout or no branch is null", () => {
   assert.equal(branchLine("x", undefined), null);
   assert.equal(branchLine("x", {}), null);
   assert.equal(branchLine("x", { branch: null }), null);
+});
+
+// ---------------------------------------------------------------------------
+// Kept (dormant) folders
+
+test("spaceFolder: first tab's live cwd wins, then SpaceInfo.folder", () => {
+  const sp = { tabs: [{ id: "t1" }, { id: "t2" }], folder: "/fallback" };
+  assert.equal(spaceFolder(sp, [{ tab: "t1", cwd: null }, { tab: "t2", cwd: "/live" }]), "/live");
+  assert.equal(spaceFolder(sp, []), "/fallback");
+  assert.equal(spaceFolder({ tabs: [], folder: "/only" }, []), "/only");
+  assert.equal(spaceFolder(null, []), null);
+  // A pane for a tab not in the space is ignored.
+  assert.equal(spaceFolder(sp, [{ tab: "other", cwd: "/nope" }]), "/fallback");
+});
+
+test("keptKey: machine-local and remote keys differ", () => {
+  assert.equal(keptKey(null, "/repo"), "|/repo");
+  assert.equal(keptKey("box", "/repo"), "box|/repo");
+  assert.notEqual(keptKey(null, "/repo"), keptKey("box", "/repo"));
+});
+
+test("normalizeKept: junk is dropped, defaults filled, duplicates deduped", () => {
+  const list = normalizeKept([
+    null, "x", 42, [],
+    { machine: "box", folder: "/repo", name: "Repo", named: true, color: "#fff" },
+    { machine: "box", folder: "/repo", name: "dupe" },
+    { folder: "/solo" },
+    { folder: "" },
+    { machine: 7, folder: "/typed" },
+  ]);
+  assert.deepEqual(list, [
+    { machine: "box", folder: "/repo", raw: null, name: "Repo", named: true, color: "#fff" },
+    { machine: null, folder: "/solo", raw: null, name: "/solo", named: false, color: null },
+    { machine: "7", folder: "/typed", raw: null, name: "/typed", named: false, color: null },
+  ]);
+  assert.deepEqual(normalizeKept(null), []);
+  assert.deepEqual(normalizeKept({}), []);
+});
+
+test("refreshKept: new live folders append, existing ones update in place", () => {
+  const kept = [{ machine: null, folder: "/a", raw: null, name: "A", named: false, color: null }];
+  const { list, changed } = refreshKept(kept, [
+    { machine: null, folder: "/a", raw: "/a", name: "A renamed", named: true, color: "ansi2" },
+    { machine: null, folder: "/b", raw: "/b", name: "B", named: false, color: null },
+  ]);
+  assert.equal(changed, true);
+  assert.deepEqual(list.map((e) => e.folder), ["/a", "/b"]);
+  assert.equal(list[0].name, "A renamed");
+  assert.equal(list[0].named, true);
+  assert.equal(list[0].color, "ansi2");
+});
+
+test("refreshKept: no change means changed stays false", () => {
+  const kept = [{ machine: null, folder: "/a", raw: "/a", name: "A", named: false, color: null }];
+  const live = [{ machine: null, folder: "/a", raw: "/a", name: "A", named: false, color: null }];
+  assert.equal(refreshKept(kept, live).changed, false);
+});
+
+test("refreshKept: a later git top upgrades the raw entry instead of duplicating", () => {
+  const kept = [{ machine: null, folder: "/repo/sub", raw: "/repo/sub", name: "sub", named: false, color: null }];
+  const { list, changed } = refreshKept(kept, [
+    { machine: null, folder: "/repo", raw: "/repo/sub", name: "repo", named: false, color: null },
+  ]);
+  assert.equal(changed, true);
+  assert.equal(list.length, 1);
+  assert.equal(list[0].folder, "/repo");
+  assert.equal(list[0].raw, "/repo/sub");
+});
+
+test("refreshKept: two spaces in one repo collapse to one entry", () => {
+  const { list } = refreshKept([], [
+    { machine: null, folder: "/repo", raw: "/repo/sub", name: "repo", named: false, color: null },
+    { machine: null, folder: "/repo", raw: "/repo/other", name: "repo", named: false, color: null },
+  ]);
+  assert.equal(list.length, 1);
+});
+
+test("refreshKept: a resolved live space folds a stale unresolved duplicate", () => {
+  const kept = [
+    { machine: null, folder: "/repo", raw: "/repo/other", name: "repo", named: false, color: null },
+    { machine: null, folder: "/repo/sub2", raw: "/repo/sub2", name: "sub2", named: false, color: null },
+  ];
+  const { list, changed } = refreshKept(kept, [
+    { machine: null, folder: "/repo", raw: "/repo/sub2", name: "repo", named: false, color: null },
+  ]);
+  assert.equal(changed, true);
+  assert.equal(list.length, 1);
+  assert.equal(list[0].folder, "/repo");
+  assert.equal(list[0].raw, "/repo/sub2");
+});
+
+test("refreshKept: a second pass over an upgraded entry adds nothing", () => {
+  const first = refreshKept([], [{ machine: null, folder: "/repo", raw: "/repo/sub", name: "repo", named: false, color: null }]);
+  const second = refreshKept(first.list, [{ machine: null, folder: "/repo", raw: "/repo/sub", name: "repo", named: false, color: null }]);
+  assert.equal(second.changed, false);
+  assert.equal(second.list.length, 1);
+});
+
+test("forgetKept: removes only the matching machine+folder", () => {
+  const kept = normalizeKept([
+    { machine: null, folder: "/a" },
+    { machine: "box", folder: "/a" },
+    { machine: null, folder: "/b" },
+  ]);
+  const after = forgetKept(kept, null, "/a");
+  assert.deepEqual(after.map((e) => keptKey(e.machine, e.folder)), ["box|/a", "|/b"]);
+});
+
+test("applyKeptFolders: dormant entries append to their machine group", () => {
+  const tree = {
+    showMachines: false,
+    groups: [{ machine: null, label: "This Mac", state: "ready", blocked: 0, spaces: [{ space: "s1" }] }],
+  };
+  const out = applyKeptFolders(tree, [{ machine: null, folder: "/a", name: "A" }]);
+  assert.equal(out.groups.length, 1);
+  assert.deepEqual(out.groups[0].kept.map((e) => e.folder), ["/a"]);
+  assert.equal(out.showMachines, false);
+  // Input untouched (no kept key on the original group).
+  assert.equal(tree.groups[0].kept, undefined);
+});
+
+test("applyKeptFolders: a machine with only dormant folders gets its own group", () => {
+  const tree = { showMachines: false, groups: [{ machine: null, label: "This Mac", state: "ready", blocked: 0, spaces: [] }] };
+  const out = applyKeptFolders(tree, [{ machine: "box", folder: "/a", name: "A" }]);
+  assert.equal(out.groups.length, 2);
+  assert.equal(out.showMachines, true);
+  assert.deepEqual(out.groups.map((g) => g.machine), [null, "box"]);
+  assert.equal(out.groups[1].state, "unavailable");
+  assert.deepEqual(out.groups[1].kept.map((e) => e.folder), ["/a"]);
+});
+
+test("applyKeptFolders: no dormant entries keeps groups with empty kept arrays", () => {
+  const tree = { showMachines: false, groups: [{ machine: null, label: "This Mac", state: "ready", blocked: 0, spaces: [] }] };
+  const out = applyKeptFolders(tree, []);
+  assert.deepEqual(out.groups[0].kept, []);
+  assert.equal(out.showMachines, false);
 });

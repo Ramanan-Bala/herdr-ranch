@@ -255,7 +255,7 @@ test("closeConfirmProps", async () => {
   const { closeConfirmProps } = await import("../lib/format.js");
   const last = {
     title: "Close this tab?",
-    detail: "An agent here is still working, and this is the space's last tab: the space closes with it.",
+    detail: "An agent here is still working, and this is the space's last tab: the folder stays in the sidebar.",
     command: { name: "tab.close", args: { id: "t1", confirmed: true } },
   };
   const notLast = {

@@ -249,7 +249,7 @@ export function closeNeedsConfirm({ tabId, tab, agents, panes, activity, now }) 
 export function closeConfirmProps(tabId, lastTab) {
   return {
     title: "Close this tab?",
-    detail: lastTab ? "An agent here is still working, and this is the space's last tab: the space closes with it." : "An agent here is still working. Its terminal closes with the tab.",
+    detail: lastTab ? "An agent here is still working, and this is the space's last tab: the folder stays in the sidebar." : "An agent here is still working. Its terminal closes with the tab.",
     command: { name: "tab.close", args: { id: tabId, confirmed: true } },
   };
 }
