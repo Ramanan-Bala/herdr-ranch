@@ -228,9 +228,20 @@ function normalizeName(s) {
     .trim();
 }
 
+// Names Herdr's New menu (and similar launchers) give a tab after its agent or
+// shell: nobody chose them, so they don't lock the tab.
+const LAUNCHER_NAMES = [...GENERIC_TITLES, "claude code", "gemini", "gemini cli", "amp", "cursor agent", "aider", "goose", "jcode"];
+
+/** True for a launcher's default tab name: "Pi", "Claude Code", "Pi 2"… */
+export function isLauncherName(name) {
+  const low = String(name ?? "").trim().toLowerCase().replace(/\s+\d+$/, "");
+  return Boolean(low) && LAUNCHER_NAMES.includes(low);
+}
+
 /** Who owns the tab's current name: "unnamed", "auto" (Ranch set it) or "locked". */
 export function ownership(tab, record) {
   if (!tab || !tab.named) return "unnamed";
+  if (isLauncherName(tab.name)) return "unnamed";
   // Herdr may normalize our name, and a rename may not have landed at all
   // (the tab still shows the previous auto name).
   if (record && sameName(record.name, tab.name)) return "auto";

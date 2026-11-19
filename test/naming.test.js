@@ -15,6 +15,7 @@ import {
   recallSession,
   sessionChanged,
   withRecordSession,
+  isLauncherName,
 } from "../lib/naming.js";
 
 test("SOURCE_RANK ranks sources, lower wins", () => {
@@ -437,4 +438,24 @@ test("sessionChanged and withRecordSession", () => {
   const stamped = { ...legacy, session: "A" };
   assert.equal(withRecordSession(stamped, { C: "Subagent Research" }), stamped);
   assert.equal(withRecordSession(undefined, {}), undefined);
+});
+
+// --------------------------------------- launcher-named tabs (Herdr New menu)
+
+test("a tab named after its agent by the launcher is not locked", () => {
+  for (const name of ["Pi", "Claude Code", "codex", "OpenCode", "Pi 2", " zsh "]) {
+    assert.equal(isLauncherName(name), true, name);
+    assert.equal(ownership({ name, named: true }, undefined), "unnamed", name);
+  }
+  for (const name of ["Pi research", "My tab", "Fix login", "", null]) assert.equal(isLauncherName(name), false, String(name));
+  assert.equal(ownership({ name: "Pi research", named: true }, undefined), "locked");
+  assert.deepEqual(
+    decide({
+      tab: { name: "Pi", named: true },
+      record: undefined,
+      candidate: { name: "Debug PI Session Name Not Updating", source: "agent_user" },
+      now: 1000,
+    }),
+    { action: "rename", name: "Debug PI Session Name Not Updating", source: "agent_user" },
+  );
 });
