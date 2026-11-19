@@ -6,7 +6,7 @@ import {
   spaces, agents, panes, terminals, shared, setShared, run, exec, readTextFile, home,
 } from "herdr";
 import {
-  decide, exitAction, rememberSession, recallSession, ownership, cleanTitle,
+  decide, exitAction, rememberSession, recallSession, ownership, cleanTitle, sessionChanged, withRecordSession, SOURCE_RANK,
 } from "./lib/naming.js";
 import { listVisible, parseStore, storeCandidates, withPointerIdentity } from "./lib/tasks.js";
 import {
@@ -145,7 +145,7 @@ export class TabNamer {
       return;
     }
 
-    const record = shared(AUTONAMES_KEY)?.[tab.id];
+    const record = withRecordSession(shared(AUTONAMES_KEY)?.[tab.id], shared(SESSIONS_KEY));
     const own = ownership(tab, record);
 
     let candidate = collectInputs({
@@ -171,6 +171,16 @@ export class TabNamer {
       if (recalled) candidate = { name: recalled, source: "agent_auto" };
     }
 
+    // Session switch in the same agent (Pi /resume, Claude /resume…): the
+    // resumed session's remembered name beats a weaker fresh guess.
+    const sessionId = store?.session?.id ?? null;
+    if (own === "auto" && sessionChanged(record, sessionId)) {
+      const recalled = recallSession(shared(SESSIONS_KEY) ?? {}, sessionId);
+      if (recalled && (!candidate || SOURCE_RANK[candidate.source] > SOURCE_RANK.agent_auto)) {
+        candidate = { name: recalled, source: "agent_auto" };
+      }
+    }
+
     const result = decide({
       tab,
       record,
@@ -179,10 +189,11 @@ export class TabNamer {
       editing: this.isEditing(tab.id),
       siblingNames: space.tabs.filter((t) => t.id !== tab.id).map((t) => t.name),
       branch: pane?.branch ?? null,
+      sessionId,
     });
 
     if (result.action === "rename") {
-      this.applyRename(space, tab, result, store?.session?.id ?? null);
+      this.applyRename(space, tab, result, sessionId);
     } else if (own === "locked" && candidate) {
       // Reset name -> unnamed -> next tick picks the current AI name at once.
       this.locked.set(tab.id, candidate);
@@ -245,7 +256,11 @@ export class TabNamer {
     run("tab.rename", { id: tab.id, name: result.name });
     setShared(AUTONAMES_KEY, {
       ...(shared(AUTONAMES_KEY) ?? {}),
-      [tab.id]: { name: result.name, source: result.source, prev: tab.named ? tab.name : null, at: Date.now() },
+      [tab.id]: {
+        name: result.name, source: result.source, prev: tab.named ? tab.name : null, at: Date.now(),
+        // The session this name was for; a different one lifts the rank/throttle guard.
+        session: sessionId ?? shared(AUTONAMES_KEY)?.[tab.id]?.session ?? null,
+      },
     });
     if (sessionId) {
       setShared(SESSIONS_KEY, rememberSession(shared(SESSIONS_KEY) ?? {}, sessionId, result.name));
