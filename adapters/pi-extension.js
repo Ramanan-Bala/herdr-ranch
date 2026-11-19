@@ -100,30 +100,10 @@ export function sessionSnapshot(sessionManager) {
 // ------------------------------------------------------------ auto session name
 
 const TITLE_TIMEOUT_MS = 20000;
-const SMALL_MODEL = [/haiku/i, /flash-lite/i, /\bmini\b|-mini/i, /nano/i, /flash/i, /\bsmall\b|-small/i, /\blite\b|-lite/i];
 
 /** True unless RANCH_PI_AUTONAME turns automatic session names off. */
 export function autoNameEnabled(env = process.env) {
   return !/^(0|false|off|no)$/i.test(String(env.RANCH_PI_AUTONAME ?? "").trim());
-}
-
-/** A cheap model from the current provider for titles, else the current model. */
-export function pickTitleModel(registry, current) {
-  if (!current) return null;
-  let available = [];
-  try {
-    available = registry?.getAvailable?.() ?? [];
-  } catch {
-    available = [];
-  }
-  const sameProvider = available.filter((m) => m && m.provider === current.provider && typeof m.id === "string");
-  for (const pattern of SMALL_MODEL) {
-    // Newest-looking id first (claude-haiku-4-5 over claude-3-haiku).
-    const found = sameProvider.filter((m) => pattern.test(m.id))
-      .sort((a, b) => b.id.localeCompare(a.id, undefined, { numeric: true }));
-    if (found.length) return found[0];
-  }
-  return current;
 }
 
 /** The model's raw reply cleaned to a short session title, or null. */
@@ -148,10 +128,10 @@ export function titlePrompt(prompt) {
   ].join("\n");
 }
 
-/** Asks a model for a title for `prompt`; resolves to the title or null. */
+/** Asks the session's current model for a title for `prompt`; resolves to the title or null. */
 export async function generateSessionTitle(ctx, prompt, signal) {
   const registry = ctx?.modelRegistry;
-  const model = pickTitleModel(registry, ctx?.model);
+  const model = ctx?.model; // the model the person is already using: always present and authorized
   if (!model || !registry) return null;
   if (typeof registry.hasConfiguredAuth === "function" && !registry.hasConfiguredAuth(model)) return null;
   const context = { messages: [{ role: "user", content: [{ type: "text", text: titlePrompt(prompt) }], timestamp: Date.now() }] };

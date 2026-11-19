@@ -6,7 +6,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import ranchTasks, {
-  TODO_TOOL, autoNameEnabled, cleanSessionTitle, generateSessionTitle, normalizeTodos, pickTitleModel, ranchCommand,
+  TODO_TOOL, autoNameEnabled, cleanSessionTitle, generateSessionTitle, normalizeTodos, ranchCommand,
   sessionSnapshot, titlePrompt, todoSummary, toolResponse,
 } from "../adapters/pi-extension.js";
 
@@ -260,22 +260,6 @@ test("autoNameEnabled is on unless RANCH_PI_AUTONAME turns it off", () => {
   for (const v of ["0", "false", "OFF", "no"]) assert.equal(autoNameEnabled({ RANCH_PI_AUTONAME: v }), false);
 });
 
-test("pickTitleModel prefers the newest small model of the current provider", () => {
-  const current = { provider: "anthropic", id: "claude-opus-5-5" };
-  const registry = { getAvailable: () => [
-    { provider: "openai", id: "gpt-5-mini" },
-    { provider: "anthropic", id: "claude-3-haiku" },
-    { provider: "anthropic", id: "claude-haiku-4-5" },
-    current,
-  ] };
-  assert.equal(pickTitleModel(registry, current).id, "claude-haiku-4-5");
-  const google = { provider: "google", id: "gemini-2.5-pro" };
-  assert.equal(pickTitleModel({ getAvailable: () => [google, { provider: "google", id: "gemini-2.5-flash" }] }, google).id, "gemini-2.5-flash");
-  assert.equal(pickTitleModel({ getAvailable: () => [google] }, google), google); // "gemini" is not "mini"
-  assert.equal(pickTitleModel({ getAvailable: () => { throw new Error("x"); } }, current), current);
-  assert.equal(pickTitleModel({}, null), null);
-});
-
 test("cleanSessionTitle keeps one short line and drops labels, quotes and SKIP", () => {
   assert.equal(cleanSessionTitle('"Fix Login Redirect Loop."'), "Fix Login Redirect Loop");
   assert.equal(cleanSessionTitle("Title: Pi Session Names\nextra"), "Pi Session Names");
@@ -289,12 +273,12 @@ test("titlePrompt embeds the request", () => {
   assert.match(titlePrompt("fix the login loop"), /<request>\nfix the login loop\n<\/request>/);
 });
 
-test("generateSessionTitle asks the small model and cleans the reply", async () => {
+test("generateSessionTitle asks the current model and cleans the reply", async () => {
   const calls = [];
   const ctx = {
     model: { provider: "anthropic", id: "claude-opus-5-5" },
     modelRegistry: {
-      getAvailable: () => [{ provider: "anthropic", id: "claude-haiku-4-5" }],
+      getAvailable: () => [{ provider: "anthropic", id: "claude-haiku-4-5" }], // never picked
       hasConfiguredAuth: () => true,
       complete: async (model, context, options) => {
         calls.push({ model, context, options });
@@ -303,7 +287,7 @@ test("generateSessionTitle asks the small model and cleans the reply", async () 
     },
   };
   assert.equal(await generateSessionTitle(ctx, "make pi session names automatic"), "Pi Session Auto Names");
-  assert.equal(calls[0].model.id, "claude-haiku-4-5");
+  assert.equal(calls[0].model.id, "claude-opus-5-5");
   assert.match(calls[0].context.messages[0].content[0].text, /make pi session names automatic/);
   assert.equal(calls[0].options.thinkingEnabled, false); // complete() fallback disables thinking
 
