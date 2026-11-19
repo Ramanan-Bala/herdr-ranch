@@ -17,6 +17,10 @@ import { homeCache } from "./lib/home.js";
 import { agentShort, collectInputs, buildModelPrompt, pickNamingAgent } from "./namer-model.js";
 
 const STORE_TTL = 2000;
+/** How long a pass may run before the next tick replaces it. A Herdr read
+ * that never settles (seen across a mod reload) once froze naming and the
+ * sidebar's activity for good, because every later tick saw `running`. */
+export const PASS_STALL_MS = 15000;
 /** Shared state: { [tabId]: { state, at } } from Ranch's hooks (see lib/tasks.js). */
 export const ACTIVITY_KEY = "ranch.activity";
 
@@ -54,16 +58,19 @@ export class TabNamer {
 
   /** One cheap, idempotent pass over all tabs; async work happens in a spawn. */
   tick(cx) {
-    // A slow pass (remote exec) must not overlap the next tick.
-    if (this.running) return;
+    // A slow pass (remote exec) must not overlap the next tick, but a stalled
+    // one is replaced; its late results are dropped by generation.
+    if (this.running && Date.now() - (this.runningAt ?? 0) < PASS_STALL_MS) return;
+    const gen = (this.passGen = (this.passGen ?? 0) + 1);
     this.running = true;
+    this.runningAt = Date.now();
     cx.spawn(async (cx) => {
       try {
-        await this.pass();
+        await this.pass(gen);
       } catch (err) {
         this.logOnce(err);
       } finally {
-        this.running = false;
+        if (gen === this.passGen) this.running = false;
       }
     });
   }
@@ -75,7 +82,12 @@ export class TabNamer {
     console.log(`ranch-sidebar namer: ${msg}`);
   }
 
-  async pass() {
+  /** False once a newer pass has replaced the one numbered `gen`. */
+  current(gen) {
+    return gen == null || gen === this.passGen;
+  }
+
+  async pass(gen) {
     const settings = resolveSettings(shared(SETTINGS_KEY));
     if (shared("layout") !== "ranch") return;
     const agentsNow = agents();
@@ -92,6 +104,7 @@ export class TabNamer {
             ?? paneAgent(panesNow, tab.id);
           if (agent) {
             const store = await this.loadStore(agent.address, space.machine, agent.app);
+            if (!this.current(gen)) return;
             const act = store?.session?.activity;
             // Herdr sub-agents belong to their parent's tab, so any agent in the
             // tab may be the parent (the first one found could be a child).
@@ -101,12 +114,14 @@ export class TabNamer {
               || [...parents].some((p) => subagentsWorking({ terminals: terminalsNow, parent: p, now }));
             if (act || subs) activity[tab.id] = subs ? { ...(act ?? {}), subsWorking: true } : act;
           }
-          if (settings.naming.enabled) await this.handleTab(space, tab, agentsNow, panesNow, settings, terminalsNow);
+          if (settings.naming.enabled) await this.handleTab(space, tab, agentsNow, panesNow, settings, terminalsNow, gen);
+          if (!this.current(gen)) return;
         } catch (err) {
           this.logOnce(err);
         }
       }
     }
+    if (!this.current(gen)) return;
     if (JSON.stringify(activity) !== JSON.stringify(shared(ACTIVITY_KEY) ?? {})) setShared(ACTIVITY_KEY, activity);
     for (const id of this.prev.keys()) {
       if (!seen.has(id)) {
@@ -116,7 +131,7 @@ export class TabNamer {
     }
   }
 
-  async handleTab(space, tab, agentsAll, panesAll, settings, terminalsAll = []) {
+  async handleTab(space, tab, agentsAll, panesAll, settings, terminalsAll = [], gen = null) {
     const naming = settings.naming;
     // An agent whose status report was cleared (Herdr shows status null) is
     // still an agent session: fall back to a pane running a known agent app.
@@ -129,6 +144,7 @@ export class TabNamer {
     if (agent) {
       pane = panesAll.find((p) => p.pane === agent.pane) ?? null;
       store = await this.loadStore(agent.address, space.machine, agent.app);
+      if (!this.current(gen)) return; // replaced while reading: act on nothing stale
     }
     const state = store?.session?.state ?? null;
 
@@ -163,6 +179,7 @@ export class TabNamer {
     // Optional model summary (R-TN-6): once per session, one attempt at most.
     if (naming.model && candidate?.source === "prompt" && store?.session?.id && store.session.first_prompt) {
       candidate = await this.modelTitle(store.session, candidate);
+      if (!this.current(gen)) return;
     }
 
     // Resume: a known session id on an unnamed tab restores its last name.
