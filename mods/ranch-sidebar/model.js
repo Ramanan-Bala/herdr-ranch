@@ -205,18 +205,58 @@ export function keptKey(machine, folder) {
 }
 
 /**
- * The folder a live space is in: the live cwd of its first pane (its tabs in
- * order, the first one with a cwd), else where the space was made
- * (`SpaceInfo.folder`). Mirrors ranch-launch's place() so both mods agree.
+ * The folder of a live space's first terminal: the live cwd of its first pane
+ * (its tabs in order, the first one with a cwd), or null when no terminal of
+ * the space is alive any more. Mirrors ranch-launch's place() so both mods
+ * agree.
+ * @param {{tabs?: Array<{id: string}>}|null} space
+ * @param {Array<{tab: string, cwd: string|null}>} panes
+ * @returns {string|null}
+ */
+export function spaceCwd(space, panes = []) {
+  if (!space) return null;
+  const tabs = new Set((space.tabs ?? []).map((t) => t.id));
+  return (panes ?? []).find((p) => tabs.has(p.tab) && p.cwd)?.cwd ?? null;
+}
+
+/**
+ * The folder a live space is in: the live cwd of its first pane, else where the
+ * space was made (`SpaceInfo.folder`). Herdr's SpaceInfo.folder is where its
+ * new terminals start, not where the space is now (a space made in one folder
+ * and moved with `cd` keeps the old one), so callers that record a space should
+ * prefer `spaceCwd` and treat this fallback as a degraded reading.
  * @param {{tabs?: Array<{id: string}>, folder?: string|null}|null} space
  * @param {Array<{tab: string, cwd: string|null}>} panes
  * @returns {string|null}
  */
 export function spaceFolder(space, panes = []) {
   if (!space) return null;
-  const tabs = new Set((space.tabs ?? []).map((t) => t.id));
-  const cwd = (panes ?? []).find((p) => tabs.has(p.tab) && p.cwd)?.cwd ?? null;
-  return cwd || space.folder || null;
+  return spaceCwd(space, panes) || space.folder || null;
+}
+
+/**
+ * The folder a live space is read as this render, and whether that reading is
+ * degraded: the last terminal is gone (no pane cwd: Herdr then reports the
+ * folder it was made in, or the machine's home) or the pane's folder flipped
+ * back to home while the space had another one (a dying terminal falls back).
+ * A degraded reading must never be recorded or used to change a kept entry;
+ * the caller remembers one folder per space id and passes it as `remembered`.
+ * `created` is SpaceInfo.folder, used only when nothing better is known.
+ * @param {{cwd?: string|null, remembered?: string|null,
+ *   created?: string|null, home?: string|null}} [o]
+ * @returns {{folder: string|null, degraded: boolean}}
+ */
+export function liveSpaceFolder({ cwd = null, remembered = null, created = null, home = null } = {}) {
+  const rem = typeof remembered === "string" && remembered ? remembered : null;
+  const live = typeof cwd === "string" && cwd ? cwd : null;
+  if (live) {
+    if (rem && !samePath(rem, home) && samePath(live, home)) {
+      return { folder: rem, degraded: true };
+    }
+    return { folder: live, degraded: false };
+  }
+  const fallback = rem || (typeof created === "string" && created ? created : null);
+  return { folder: fallback, degraded: true };
 }
 
 /**
@@ -284,44 +324,47 @@ export function normalizeKept(parsed) {
 /**
  * Refreshes the kept list from this render's live spaces. Each live entry is
  * `{machine, folder, raw?, name, named, color}` where `folder` is the git
- * top-level when known and `raw` the space's own folder (the old key). An entry
- * is matched by machine+folder, or by its `raw` folder when the git top was
- * only discovered later, so a space does not get a second dormant row after
- * its top resolves. Existing entries keep their order; new ones append; live
- * entries update name/named/color in place.
+ * top-level when known and `raw` the space's own folder. Entries are matched by
+ * machine+folder, so a space does not get a second dormant row after its top
+ * resolves; an entry recorded before its top was known (its folder is still its
+ * raw) may be re-keyed, but only while the live space's top is a proper ancestor
+ * of that raw. Anything else appends a new entry.
  *
- * `exclude` lists live linked git worktrees (`{machine, folder, raw?}`, folder
- * = its top): a linked worktree is never kept on its own, so an entry left
- * over from a render that ran before its link was known is pruned here. Like a
- * live entry, an excluded folder only affects its own machine.
+ * The kept list is lossless: an entry leaves it only through an explicit
+ * Forget (`forgetKept`), an exact duplicate of another entry's machine+folder,
+ * or a linked worktree (`exclude`) recorded from that very checkout. A live
+ * space is never used to drop or re-key an entry onto a different folder: two
+ * live spaces in one repo still share one entry, but two kept folders never
+ * merge into one.
+ *
+ * A live entry flagged `degraded` (no live terminal, or a folder that fell back
+ * to home) or explicitly `resolved: false` is ignored here: it says nothing
+ * about the space's folder. `exclude` lists live linked git worktrees
+ * (`{machine, folder, raw?}`, folder = its top): a linked worktree is never
+ * kept on its own, so an entry recorded from it is pruned here. Pruning matches
+ * the worktree top exactly and only on its own machine.
  *
  * @param {Array<object>} kept
  * @param {Array<{machine: string|null, folder: string, raw?: string|null,
- *   name?: string, named?: boolean, color?: string|null}>} live
+ *   name?: string, named?: boolean, color?: string|null, degraded?: boolean,
+ *   resolved?: boolean}>} live
  * @param {Array<{machine: string|null, folder?: string|null,
  *   raw?: string|null}>} [exclude]
  * @returns {{list: Array<object>, changed: boolean}}
  */
 export function refreshKept(kept, live, exclude = []) {
-  const excluded = folderSets(exclude);
+  const worktrees = worktreeTops(exclude);
   const list = [];
   const seen = new Set();
-  const byKey = new Map(); // resolved machine|folder -> index in list
+  const byKey = new Map(); // machine|folder -> index in list
   const byRaw = new Map(); // machine|raw -> index in list
   let changed = false;
-  // Forget every map entry that points at a dropped index: a later live space
-  // must not be matched to an entry that has already been folded away.
-  const drop = (i) => {
-    for (const [k, v] of byKey) if (v === i) byKey.delete(k);
-    for (const [k, v] of byRaw) if (v === i) byRaw.delete(k);
-  };
   for (const e of kept ?? []) {
     if (!e || typeof e.folder !== "string" || !e.folder) continue;
     const key = keptKey(e.machine, e.folder);
     if (seen.has(key)) continue;
     seen.add(key);
-    const set = excluded.get(e.machine ?? "");
-    if (set && (set.has(e.folder) || (e.raw && set.has(e.raw)))) {
+    if (recordedFromWorktree(e, worktrees)) {
       changed = true;
       continue;
     }
@@ -331,21 +374,19 @@ export function refreshKept(kept, live, exclude = []) {
     list.push(entry);
   }
 
-  const removed = new Set(); // indices of entries folded into another one
   for (const l of live ?? []) {
     if (!l || typeof l.folder !== "string" || !l.folder) continue;
+    if (l.degraded || l.resolved === false) continue;
     const machine = l.machine == null ? null : String(l.machine);
     const key = keptKey(machine, l.folder);
     let i = byKey.get(key);
-    if (i === undefined && l.raw) i = byRaw.get(keptKey(machine, l.raw));
-    // The live space now resolves to `folder`, but an earlier entry recorded
-    // its unresolved `raw`: fold that stale duplicate into the resolved entry.
-    if (i !== undefined && l.raw) {
+    // The same space, recorded before its git top was known: its raw is the
+    // entry's folder. Only a proper ancestor top re-keys it; an unrelated
+    // folder is a different space and gets its own entry.
+    if (i === undefined && l.raw) {
       const j = byRaw.get(keptKey(machine, l.raw));
-      if (j !== undefined && j !== i && !removed.has(j) && list[j].folder !== l.folder) {
-        removed.add(j);
-        drop(j);
-        changed = true;
+      if (j !== undefined && list[j].folder === list[j].raw && pathInside(l.raw, l.folder)) {
+        i = j;
       }
     }
     if (i === undefined) {
@@ -389,23 +430,26 @@ export function refreshKept(kept, live, exclude = []) {
     byKey.set(key, i);
     if (next.raw) byRaw.set(keptKey(next.machine, next.raw), i);
   }
-  const out = removed.size ? list.filter((_e, idx) => !removed.has(idx)) : list;
-  return { list: out, changed };
+  return { list, changed };
 }
 
 /**
  * The kept entries that have no live space and should draw as dormant rows. A
  * kept entry belongs to a live space when, on the same machine, its `folder`
  * or `raw` equals the live `folder` or the live `raw`, or when the live raw
- * folder sits inside the kept folder. That last case covers a space opened in
- * a subfolder while its git top is still unresolved (its live folder is the
- * raw path): it must not draw a duplicate dormant row beside the live space.
+ * folder sits inside the kept folder *and* that live space's git top is not
+ * resolved yet (a space opened in a subfolder: its live folder is still the raw
+ * path, so it must not draw a duplicate dormant row beside the live space).
+ * That last rule never applies to the machine's home (`home`), which contains
+ * every folder.
  *
  * @param {Array<object>} kept
- * @param {Array<{machine: string|null, folder: string, raw?: string|null}>} live
+ * @param {Array<{machine: string|null, folder: string, raw?: string|null,
+ *   resolved?: boolean}>} live
+ * @param {{home?: string|null}} [options] this computer's home folder
  * @returns {Array<object>} the kept entries with no live space, in kept order
  */
-export function dormantFolders(kept, live) {
+export function dormantFolders(kept, live, { home = null } = {}) {
   const lives = (live ?? []).filter((l) => l && typeof l.folder === "string" && l.folder);
   return (kept ?? []).filter((e) => {
     if (!e || typeof e.folder !== "string" || !e.folder) return false;
@@ -413,28 +457,51 @@ export function dormantFolders(kept, live) {
       if ((l.machine ?? "") !== (e.machine ?? "")) return false;
       if (l.folder === e.folder || l.raw === e.folder) return true;
       if (e.raw && (l.folder === e.raw || l.raw === e.raw)) return true;
+      if (l.resolved) return false;
+      if ((e.machine ?? null) === null && samePath(e.folder, home)) return false;
       return pathInside(l.raw, e.folder);
     });
   });
 }
 
 /**
- * machine -> set of folders from an exclude list (both `folder` and `raw`
- * count as the same worktree's paths).
- * @param {Array<{machine: string|null, folder?: string|null, raw?: string|null}>} exclude
+ * machine -> set of folders from an exclude list (a linked worktree's top; its
+ * raw path is not a top and never prunes anything).
+ * @param {Array<{machine: string|null, folder?: string|null}>} exclude
  * @returns {Map<string, Set<string>>}
  */
-function folderSets(exclude) {
+function worktreeTops(exclude) {
   const out = new Map();
   for (const x of exclude ?? []) {
-    if (!x) continue;
-    const folders = [x.folder, x.raw].filter((f) => typeof f === "string" && f);
-    if (!folders.length) continue;
+    if (!x || typeof x.folder !== "string" || !x.folder) continue;
     const key = x.machine == null ? "" : String(x.machine);
     if (!out.has(key)) out.set(key, new Set());
-    for (const f of folders) out.get(key).add(f);
+    out.get(key).add(x.folder);
   }
   return out;
+}
+
+/**
+ * True when `entry` was itself recorded from a live linked worktree in `tops`:
+ * its folder is exactly that top and its raw folder (where its terminal was)
+ * is that top or inside it. An entry that merely shares a path is kept.
+ * @param {object} entry
+ * @param {Map<string, Set<string>>} tops
+ * @returns {boolean}
+ */
+function recordedFromWorktree(entry, tops) {
+  const set = tops.get(entry.machine ?? "");
+  if (!set || !set.has(entry.folder)) return false;
+  return !entry.raw || entry.raw === entry.folder || pathInside(entry.raw, entry.folder);
+}
+
+/** Two folders naming the same path (a root's lone separator is kept). */
+function samePath(a, b) {
+  const x = barePath(a);
+  const y = barePath(b);
+  if (!x || !y) return false;
+  const win = /^[a-zA-Z]:[\\/]/.test(x) || /^[a-zA-Z]:[\\/]/.test(y);
+  return win ? x.toLowerCase() === y.toLowerCase() : x === y;
 }
 
 /** A folder without trailing separators (a lone root stays), or null. */

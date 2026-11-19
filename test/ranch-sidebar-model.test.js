@@ -11,7 +11,7 @@ execFileSync("sh", [join(root, "scripts/sync-lib.sh")]);
 
 const {
   buildTree, nestWorktrees, BADGE_COLORS, initials, badgeColorIndex, diffSquares, worktreeName, branchLine,
-  keptKey, spaceFolder, spaceGitState, normalizeKept, refreshKept, forgetKept, dormantFolders, applyKeptFolders,
+  keptKey, spaceCwd, spaceFolder, spaceGitState, liveSpaceFolder, normalizeKept, refreshKept, forgetKept, dormantFolders, applyKeptFolders,
 } = await import(pathToFileURL(join(root, "mods/ranch-sidebar/model.js")).href);
 
 const NOW = Date.parse("2026-11-11T10:00:00Z");
@@ -410,6 +410,47 @@ test("spaceFolder: first tab's live cwd wins, then SpaceInfo.folder", () => {
   assert.equal(spaceFolder(sp, [{ tab: "other", cwd: "/nope" }]), "/fallback");
 });
 
+test("spaceCwd: only a live pane folder, never the space's creation folder", () => {
+  const sp = { tabs: [{ id: "t1" }, { id: "t2" }], folder: "/made-in" };
+  assert.equal(spaceCwd(sp, [{ tab: "t1", cwd: null }, { tab: "t2", cwd: "/live" }]), "/live");
+  // The last terminal ended: the space still names the folder it was made in,
+  // which is not where the space was (herdr.d.ts: SpaceInfo.folder).
+  assert.equal(spaceCwd(sp, []), null);
+  assert.equal(spaceCwd({ tabs: [], folder: "/only" }, []), null);
+  assert.equal(spaceCwd(null, []), null);
+});
+
+test("liveSpaceFolder: a live pane folder wins and is not degraded", () => {
+  const r = liveSpaceFolder({ cwd: "/repo", remembered: "/old", created: "/made-in", home: "/home/u" });
+  assert.deepEqual(r, { folder: "/repo", degraded: false });
+  // A space with nothing remembered yet is read from its pane.
+  assert.deepEqual(liveSpaceFolder({ cwd: "/repo" }), { folder: "/repo", degraded: false });
+});
+
+test("liveSpaceFolder: no live terminal falls back to memory, then the creation folder", () => {
+  const seen = { cwd: null, remembered: "/repo", created: "/made-in", home: "/home/u" };
+  assert.deepEqual(liveSpaceFolder(seen), { folder: "/repo", degraded: true });
+  assert.deepEqual(liveSpaceFolder({ ...seen, remembered: null }),
+    { folder: "/made-in", degraded: true });
+  assert.deepEqual(liveSpaceFolder({ cwd: "", created: "" }), { folder: null, degraded: true });
+  assert.deepEqual(liveSpaceFolder(), { folder: null, degraded: true });
+});
+
+test("liveSpaceFolder: a pane folder flipping to home keeps the space's folder", () => {
+  // The terminal's process ends and Herdr falls back to the machine's home;
+  // that is not the space moving there.
+  assert.deepEqual(liveSpaceFolder({ cwd: "/home/u/", remembered: "/repo", home: "/home/u" }),
+    { folder: "/repo", degraded: true });
+  // A home space stays a home space, and a real move elsewhere is taken.
+  assert.deepEqual(liveSpaceFolder({ cwd: "/home/u", remembered: "/home/u", home: "/home/u" }),
+    { folder: "/home/u", degraded: false });
+  assert.deepEqual(liveSpaceFolder({ cwd: "/other", remembered: "/home/u", home: "/home/u" }),
+    { folder: "/other", degraded: false });
+  // Windows comparisons ignore case.
+  assert.deepEqual(liveSpaceFolder({ cwd: "C:\\Users\\U", remembered: "C:\\Users\\u\\p", home: "C:\\Users\\u" }),
+    { folder: "C:\\Users\\u\\p", degraded: true });
+});
+
 test("keptKey: machine-local and remote keys differ", () => {
   assert.equal(keptKey(null, "/repo"), "|/repo");
   assert.equal(keptKey("box", "/repo"), "box|/repo");
@@ -472,7 +513,10 @@ test("refreshKept: two spaces in one repo collapse to one entry", () => {
   assert.equal(list.length, 1);
 });
 
-test("refreshKept: a resolved live space folds a stale unresolved duplicate", () => {
+test("refreshKept: a live entry sharing only a raw with another entry drops neither", () => {
+  // The live space's folder names one entry and its raw another (a terminal
+  // that moved, or a degraded render falling back to another folder). The old
+  // fold-away dropped the entry under `raw`; the kept list is lossless now.
   const kept = [
     { machine: null, folder: "/repo", raw: "/repo/other", name: "repo", named: false, color: null },
     { machine: null, folder: "/repo/sub2", raw: "/repo/sub2", name: "sub2", named: false, color: null },
@@ -481,9 +525,30 @@ test("refreshKept: a resolved live space folds a stale unresolved duplicate", ()
     { machine: null, folder: "/repo", raw: "/repo/sub2", name: "repo", named: false, color: null },
   ]);
   assert.equal(changed, true);
-  assert.equal(list.length, 1);
-  assert.equal(list[0].folder, "/repo");
+  assert.deepEqual(list.map((e) => e.folder), ["/repo", "/repo/sub2"]);
   assert.equal(list[0].raw, "/repo/sub2");
+  assert.equal(list[1].raw, "/repo/sub2");
+});
+
+test("refreshKept: a degraded reading (no live terminal) never re-keys or drops an entry", () => {
+  // Herdr's SpaceInfo.folder is where the space was made, and a render between
+  // the last terminal ending and the space closing reads that instead of the
+  // live folder. Such a reading must not touch the list: foo keeps its entry.
+  const kept = [
+    { machine: null, folder: "/home/u", raw: "/home/u", name: "Root", named: true, color: null },
+    { machine: null, folder: "/foo", raw: "/foo", name: "foo", named: false, color: null },
+  ];
+  const { list, changed } = refreshKept(kept, [
+    { machine: null, folder: "/home/u", raw: "/foo", name: "foo", named: false, color: null, degraded: true },
+  ]);
+  assert.equal(changed, false);
+  assert.deepEqual(list, kept);
+  // The same reading flagged unresolved (the caller's filter) is ignored too.
+  const unresolved = refreshKept(kept, [
+    { machine: null, folder: "/home/u", raw: "/foo", name: "foo", named: false, color: null, resolved: false },
+  ]);
+  assert.deepEqual(unresolved.list, kept);
+  assert.equal(unresolved.changed, false);
 });
 
 test("refreshKept: a second pass over an upgraded entry adds nothing", () => {
@@ -540,9 +605,12 @@ const keptEntry = (folder, over = {}) => ({
   machine: over.machine ?? null, folder, raw: over.raw ?? folder,
   name: over.name ?? folder, named: over.named ?? false, color: over.color ?? null,
 });
+// A live space's own folder can differ from the folder's git top (same space
+// with one entry per side); `resolved` says its git lookup answered.
 const liveEntry = (folder, over = {}) => ({
   machine: over.machine ?? null, folder, raw: over.raw ?? folder,
   name: over.name ?? folder, named: over.named ?? false, color: over.color ?? null,
+  resolved: over.resolved ?? false, linked: over.linked ?? false,
 });
 
 const gitSpace = (id, cards, checkout = null) => ({ space: id, cards, settled: [], checkout });
@@ -593,17 +661,28 @@ test("refreshKept: a live linked worktree prunes its stale entry", () => {
   assert.deepEqual(list.map((e) => e.folder), ["/repo"]);
 });
 
-test("refreshKept: exclude matches the raw too, and only on its own machine", () => {
+test("refreshKept: exclude prunes only the worktree's own entry (exact top, its machine)", () => {
+  // A linked worktree is never kept on its own. Pruning only matches an entry
+  // whose folder IS that worktree top: a folder that merely shares a raw path
+  // with it, or another machine's entry, is never dropped.
   const kept = [
     keptEntry("/repo", { raw: "/repo/worktree" }),
     keptEntry("/wt", { machine: "box" }),
+    keptEntry("/wt"),
   ];
   const { list, changed } = refreshKept(kept, [], [
     { machine: null, folder: "/elsewhere", raw: "/repo/worktree" },
     { machine: null, folder: "/wt", raw: "/wt" },
   ]);
   assert.equal(changed, true);
-  assert.deepEqual(list.map((e) => `${e.machine}|${e.folder}`), ["box|/wt"]);
+  assert.deepEqual(list.map((e) => `${e.machine ?? ""}|${e.folder}`), ["|/repo", "box|/wt"]);
+});
+
+test("refreshKept: exclude never prunes by raw alone", () => {
+  const kept = [keptEntry("/repo", { raw: "/wt" })];
+  const { list, changed } = refreshKept(kept, [], [{ machine: null, folder: "/wt", raw: "/wt" }]);
+  assert.equal(changed, false);
+  assert.deepEqual(list, kept);
 });
 
 test("refreshKept: no exclude leaves the list alone", () => {
@@ -638,15 +717,26 @@ test("kept pipeline: an unresolved worktree is not recorded, then its stale entr
   assert.deepEqual(known.dormant, []);
 });
 
-test("refreshKept: a folded-away entry's keys do not capture a later live space", () => {
-  // The second entry recorded /repo/sub before resolving to /repo/sub2; one
-  // live space folds it into /repo, the next one must still get its own entry.
+test("refreshKept: entries sharing a raw do not capture a later live space", () => {
+  // Two entries recorded /repo/sub before resolving; each live space updates
+  // its own entry (by folder) and neither entry is dropped.
   const kept = [keptEntry("/repo", { raw: "/repo/sub" }), keptEntry("/repo/sub2", { raw: "/repo/sub" })];
   const { list } = refreshKept(kept, [
-    liveEntry("/repo", { raw: "/repo/sub" }),
-    liveEntry("/repo/sub2", { raw: "/repo/sub2" }),
+    liveEntry("/repo", { raw: "/repo/sub", resolved: true }),
+    liveEntry("/repo/sub2", { raw: "/repo/sub2", resolved: true }),
   ]);
   assert.deepEqual(list.map((e) => e.folder), ["/repo", "/repo/sub2"]);
+});
+
+test("refreshKept: raw is upgraded to a git top only when it is a proper ancestor", () => {
+  // The same space, now resolved: /repo/sub was recorded unresolved.
+  const kept = [keptEntry("/repo/sub")];
+  const { list } = refreshKept(kept, [liveEntry("/repo", { raw: "/repo/sub", resolved: true })]);
+  assert.deepEqual(list.map((e) => [e.folder, e.raw]), [["/repo", "/repo/sub"]]);
+  // An unrelated folder is never folded onto an existing entry.
+  const other = refreshKept([keptEntry("/foo")],
+    [liveEntry("/bar", { raw: "/foo", resolved: true })]);
+  assert.deepEqual(other.list.map((e) => e.folder), ["/foo", "/bar"]);
 });
 
 test("dormantFolders: live folder or raw matches keep the entry quiet", () => {
@@ -663,6 +753,18 @@ test("dormantFolders: a live raw folder inside the kept folder counts as live", 
   assert.deepEqual(dormantFolders(kept, [liveEntry("/repo/sub/deep")]), []);
   assert.deepEqual(dormantFolders(kept, [liveEntry("C:\\repo\\sub")]), [kept[0]]);
   assert.deepEqual(dormantFolders([keptEntry("C:\\repo")], [liveEntry("C:\\repo\\sub")]), []);
+});
+
+test("dormantFolders: an inside rule needs an unresolved space, never home", () => {
+  const kept = [keptEntry("/repo")];
+  // Resolved to its own top: another folder inside /repo is a different space.
+  assert.deepEqual(dormantFolders(kept, [liveEntry("/repo/sub", { resolved: true })]), kept);
+  // Home contains everything, so it is never the "folder a live space is in".
+  const home = [keptEntry("/home/u")];
+  const live = [liveEntry("/home/u/Projects/x")];
+  assert.deepEqual(dormantFolders(home, live, { home: "/home/u" }), home);
+  // ... while another kept folder still folds away under an unresolved space.
+  assert.deepEqual(dormantFolders(kept, [liveEntry("/repo/sub")], { home: "/home/u" }), []);
 });
 
 test("dormantFolders: matching wants a path separator, not a name prefix", () => {

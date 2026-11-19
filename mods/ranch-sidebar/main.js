@@ -11,7 +11,7 @@ import {
 import {
   buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials,
   normalizeCollapsed, topOfFresh, cardRows, moveIndex, worktreeName, branchLine,
-  keptKey, spaceFolder, spaceGitState, normalizeKept, refreshKept, forgetKept,
+  keptKey, spaceCwd, spaceGitState, liveSpaceFolder, normalizeKept, refreshKept, forgetKept,
   dormantFolders, applyKeptFolders,
 } from "./model.js";
 import { isViewerTab } from "./lib/file-viewer.js";
@@ -81,6 +81,11 @@ export default class RanchSidebar extends View {
     // raw, name, named, color}], rendered as dimmed rows when no live space
     // matches. Rebuilt from live spaces on every render, persisted on change.
     this.kept = this.loadKept();
+    // Last good folder per space id. Herdr's SpaceInfo.folder is where the space
+    // was made, not where it is, and it is all a render sees once the last
+    // terminal ended; remembering the space's own folder keeps its identity
+    // across those degraded renders (model.js liveSpaceFolder).
+    this.spaceFolderById = new Map();
 
     // Git: repos `${machine}|${top}` -> {summary, at}; topOf `${machine}|${cwd}`
     // -> { top: string|null, at } (top null = no repository found at `at`).
@@ -162,12 +167,23 @@ export default class RanchSidebar extends View {
    * top when the space's checkout is known, else its own folder. `git` is
    * model.js spaceGitState, so a space whose git lookup is still unresolved is
    * marked (it is matched against kept entries but not recorded yet), and a
-   * linked worktree is marked too (it is never kept on its own). */
-  liveKept(listed, panes, git = new Map()) {
+   * linked worktree is marked too (it is never kept on its own). A space with
+   * no live terminal is `degraded`: its folder is where it was made (or home),
+   * so it only suppresses a kept row and never changes the list; its identity
+   * comes from the folder this view last saw it in. */
+  liveKept(listed, panes, git = new Map(), homeDir = home()) {
     const out = [];
+    const seen = new Set();
     for (const sp of listed) {
-      const raw = spaceFolder(sp, panes);
+      seen.add(sp.id);
+      const { folder: raw, degraded } = liveSpaceFolder({
+        cwd: spaceCwd(sp, panes),
+        remembered: this.spaceFolderById.get(sp.id) ?? null,
+        created: sp.folder ?? null,
+        home: homeDir,
+      });
       if (!raw) continue;
+      if (!degraded) this.spaceFolderById.set(sp.id, raw);
       const state = git.get(sp.id) ?? null;
       out.push({
         machine: sp.machine ?? null,
@@ -178,7 +194,11 @@ export default class RanchSidebar extends View {
         color: shared("space.colors")?.[sp.id] ?? null,
         resolved: !!state?.resolved,
         linked: !!state?.linked,
+        degraded,
       });
+    }
+    for (const id of this.spaceFolderById.keys()) {
+      if (!seen.has(id)) this.spaceFolderById.delete(id);
     }
     return out;
   }
@@ -1387,11 +1407,12 @@ export default class RanchSidebar extends View {
       this.prCache = createTtlCache(s.refresh.prSec * 1000, { max: 500 });
     }
     const filter = shared(FILTER_KEY) ?? null;
+    const currentHome = home();
     // The file viewer tab lives only in the top bar (lib/file-viewer.js), not in this tree.
     const paneList = panes();
     const listed = spaces().map((sp) => ({ ...sp, tabs: (sp.tabs ?? []).filter((tb) => !isViewerTab(tb, paneList)) }));
     const tree = buildTree({
-      home: home(),
+      home: currentHome,
       machines: machines(), spaces: listed, agents: agents(), panes: paneList,
       filter, now: Date.now(),
     });
@@ -1402,19 +1423,22 @@ export default class RanchSidebar extends View {
 
     // Remember the folders of the live spaces, then draw the ones with no live
     // space as dormant rows. A space is recorded only once its git state is
-    // settled (model.js spaceGitState): an unresolved one would be keyed by its
-    // raw folder and later, when the git top or a worktree link resolves, draw
-    // as a stale duplicate. Linked worktrees are never kept; a kept entry left
-    // from before its link was known is pruned. Written to localStorage only
-    // when it changed.
-    const live = this.liveKept(listed, paneList, spaceGitState(tree));
+    // settled (model.js spaceGitState) and its own folder is known (not a
+    // degraded render between its last terminal ending and Herdr closing the
+    // space): an unresolved or degraded one would be keyed by a folder that a
+    // later render replaces with the git top (or, for a linked worktree, drop
+    // entirely). refreshKept is lossless: only Forget and a linked worktree's
+    // own entry ever leave the list. Written to localStorage only on change.
+    const live = this.liveKept(listed, paneList, spaceGitState(tree), currentHome);
     const refreshed = refreshKept(this.kept,
-      live.filter((l) => l.resolved && !l.linked), live.filter((l) => l.linked));
+      live.filter((l) => l.resolved && !l.linked && !l.degraded),
+      live.filter((l) => l.linked));
     this.kept = refreshed.list;
     if (refreshed.changed) this.saveKept();
     // A linked worktree is not "live" for its main checkout's kept entry: the
-    // main space may be closed and still deserves its dormant row.
-    const dormant = filter ? [] : dormantFolders(this.kept, live.filter((l) => !l.linked));
+    // main space may be closed and still deserves its dormant row. Home is
+    // never the folder a live raw path is merely inside of.
+    const dormant = filter ? [] : dormantFolders(this.kept, live.filter((l) => !l.linked), { home: currentHome });
     const view = applyKeptFolders(tree, dormant);
 
     if (setAgentOrder) {
