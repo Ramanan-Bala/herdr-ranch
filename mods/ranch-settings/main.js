@@ -1,9 +1,11 @@
 import { View, div, image, svg } from "gpui-kit";
 import { Popover, v_flex, h_flex } from "gpui-base";
-import { theme, shared, setShared, run, exec, home, knownAgents, nextCommand, window as appWindow } from "herdr";
+import { theme, shared, setShared, run, exec, home, knownAgents, nextCommand, spaces, readTextFile, window as appWindow } from "herdr";
 import { runGh } from "./lib/git.js";
 import { SETTINGS_KEY, MAX_AGENTS, resolveSettings, withSetting } from "./lib/settings.js";
-import { tasksCommand } from "./lib/tasks-command.js";
+import { tasksCommand, looksWindows } from "./lib/tasks-command.js";
+import { homeCache } from "./lib/home.js";
+import { pushBridge, bridgeMissing } from "./lib/remote-bridge.js";
 import { EdgeGrip } from "./lib/edge-grip.js";
 
 // Ranch settings panel: one flat list. Every row sits on the same grid
@@ -11,8 +13,12 @@ import { EdgeGrip } from "./lib/edge-grip.js";
 // never boxed. System status stays quiet unless something needs the person.
 
 // Windows can't exec the POSIX sh launcher; it calls node on the .js entry.
+// Locally that is the app's platform; on a remote machine its home path says.
 const isWin = () => appWindow()?.platform === "windows";
-const tasksCmd = (args) => tasksCommand(home(), args, isWin());
+const tasksCmd = (dir, args, machine) => tasksCommand(dir, args, machine ? looksWindows(dir) : isWin());
+const UPDATE_KEY = "ranch.update.byMachine"; // { [machine or ""]: { upd, checkedAt } }
+const UPDATE_EVERY = 30 * 60_000;
+const IDLE_UPD = { state: "checking", installed: null, latest: null, message: "", bridgeOnly: false };
 const TASK_KEYS = ["claude", "codex", "opencode", "pi"];
 const HERDR_MIN = [0, 1, 15];
 const ROW_H = 28;
@@ -35,11 +41,15 @@ export default class RanchSettings extends View {
     // knownAgents() result: [{key, name, icon, tint, run, installed}]. It can take
     // ~30 s (it asks the login shell), so start from the last cached answer.
     this.known = shared("ranch.knownAgents") ?? null;
-    this.tasks = null; // null = checking; {agents: {claude, codex, opencode, pi}} | {error: true}
-    this.setup = null; // output of the last "Set up" run
+    // Task reporting and updates follow the machine of the shown space: its
+    // agents run there, so that is where the bridge must be installed.
+    this.homeFor = homeCache(exec, home);
+    this.tasksBy = new Map(); // machine key -> null (checking) | {agents} | {error} | {missing}
+    this.setupBy = new Map(); // machine key -> output of the last "Set up" run
+    this.updBy = new Map(); // machine key -> update state
+    this.machineKey = this.machineNow() ?? "";
     this.health = { git: "checking", herdr: "checking" };
     this.healthBusy = false;
-    this.upd = { state: "checking", installed: null, latest: null, message: "" };
     cx.spawn(async (cx) => {
       try {
         this.known = await knownAgents();
@@ -51,6 +61,15 @@ export default class RanchSettings extends View {
     });
     this.loadTasks(cx);
     cx.timer.every(60_000, (cx) => this.loadTasks(cx));
+    // Follow the shown space's machine: check it as soon as it changes.
+    cx.timer.every(1000, (cx) => {
+      const key = this.machineNow() ?? "";
+      if (key === this.machineKey) return;
+      this.machineKey = key;
+      if (!this.tasksBy.has(key)) this.loadTasks(cx);
+      this.checkUpdate(cx, false);
+      cx.notify();
+    });
     this.loadHealth(cx);
     // Version checks spawn processes: every 5 min is plenty.
     cx.timer.every(5 * 60_000, (cx) => this.loadHealth(cx));
@@ -74,104 +93,174 @@ export default class RanchSettings extends View {
     setShared(SETTINGS_KEY, withSetting(shared(SETTINGS_KEY), path, value));
   }
 
-  loadTasks(cx) {
+  /** The shown space's machine (null: this computer). */
+  machineNow() {
+    return spaces().find((sp) => sp.active)?.machine ?? null;
+  }
+
+  /** The machine the System rows describe, as remembered by the 1 s follower. */
+  machine() {
+    return this.machineKey || null;
+  }
+
+  get tasks() {
+    return this.tasksBy.get(this.machineKey) ?? null;
+  }
+
+  get setup() {
+    return this.setupBy.get(this.machineKey) ?? null;
+  }
+
+  get upd() {
+    return this.updBy.get(this.machineKey) ?? shared(UPDATE_KEY)?.[this.machineKey]?.upd ?? IDLE_UPD;
+  }
+
+  /** Runs ranch-tasks on `machine`; null when its home can't be found. */
+  async tasksExec(machine, args, opts = {}) {
+    const dir = await this.homeFor(machine);
+    if (!dir) return null;
+    return exec(...tasksCmd(dir, args, machine), { ...opts, on: machine });
+  }
+
+  loadTasks(cx, machine = this.machine()) {
+    const key = machine ?? "";
     cx.spawn(async (cx) => {
+      let tasks;
+      let r = null;
       try {
-        const r = await exec(...tasksCmd(["status", "--json"]));
-        let data = null;
-        try { data = JSON.parse(r.stdout || ""); } catch {}
-        if (data?.agents) {
-          const agents = {};
-          for (const key of TASK_KEYS) {
-            const v = data.agents[key];
-            agents[key] = ["installed", "outdated", "broken", "needs approval"].includes(v) ? v : "missing";
-          }
-          this.tasks = { agents };
-        } else {
-          this.tasks = { error: true };
+        r = await this.tasksExec(machine, ["status", "--json"]);
+      } catch {}
+      let data = null;
+      try { data = JSON.parse(r?.stdout || ""); } catch {}
+      if (data?.agents) {
+        const agents = {};
+        for (const k of TASK_KEYS) {
+          const v = data.agents[k];
+          agents[k] = ["installed", "outdated", "broken", "needs approval"].includes(v) ? v : "missing";
         }
-      } catch {
-        this.tasks = { error: true };
+        tasks = { agents };
+      } else if (machine && (await this.homeFor(machine)) && bridgeMissing(r)) {
+        tasks = { missing: true }; // reachable, never set up: Set up copies the bridge
+      } else {
+        tasks = { error: true, unreachable: !!machine && !(await this.homeFor(machine)) };
       }
+      this.tasksBy.set(key, tasks);
       cx.notify();
     });
   }
 
   runSetup(cx) {
-    this.setup = "Setting up…";
+    const machine = this.machine();
+    const key = machine ?? "";
+    this.setupBy.set(key, "Setting up…");
     cx.notify();
     cx.spawn(async (cx) => {
-      try {
-        const r = await exec(...tasksCmd(["install", "--yes"]));
-        const out = `${r.stdout || ""}${r.stderr || ""}`.trim();
-        this.setup = out || (r.code === 0 ? "Done." : `Exit code ${r.code}.`);
-        if (r.code === 0) this.loadTasks(cx);
-      } catch {
-        this.setup = "Could not run ranch-tasks.";
+      let text;
+      let ok = false;
+      if (machine && this.tasksBy.get(key)?.missing) {
+        const pushed = await pushBridge({
+          exec, machine, localHome: home(), readLocal: (p) => readTextFile(p),
+          localWindows: isWin(), remoteHome: await this.homeFor(machine),
+        });
+        ({ text, ok } = pushed);
+      } else {
+        try {
+          const r = await this.tasksExec(machine, ["install", "--yes"]);
+          const out = `${r?.stdout || ""}${r?.stderr || ""}`.trim();
+          ok = r?.code === 0;
+          text = !r ? `Can't reach ${machine}.` : out || (ok ? "Done." : `Exit code ${r.code}.`);
+        } catch {
+          text = "Could not run ranch-tasks.";
+        }
+      }
+      this.setupBy.set(key, text);
+      if (ok) {
+        this.loadTasks(cx, machine);
+        this.checkUpdate(cx, true, machine);
       }
       cx.notify();
     });
   }
 
-  checkUpdate(cx, force) {
-    const checkedAt = shared("ranch.update.checkedAt");
-    if (!force && Number.isFinite(checkedAt) && Date.now() - checkedAt < 30 * 60_000) {
-      const last = shared("ranch.update.last");
-      if (last) this.upd = last;
+  /** Remembers one machine's update state, in memory and across panel copies. */
+  saveUpd(key, upd, checked = true) {
+    this.updBy.set(key, upd);
+    const all = shared(UPDATE_KEY) ?? {};
+    const prev = all[key];
+    setShared(UPDATE_KEY, { ...all, [key]: { upd, checkedAt: checked ? Date.now() : prev?.checkedAt ?? 0 } });
+  }
+
+  checkUpdate(cx, force, machine = this.machine()) {
+    const key = machine ?? "";
+    const last = shared(UPDATE_KEY)?.[key];
+    if (!force && last && Number.isFinite(last.checkedAt) && Date.now() - last.checkedAt < UPDATE_EVERY) {
+      if (last.upd) this.updBy.set(key, last.upd);
       return;
     }
-    this.upd = { ...this.upd, state: "checking", message: "" };
+    const prev = this.updBy.get(key) ?? last?.upd ?? IDLE_UPD;
+    this.updBy.set(key, { ...prev, state: "checking", message: "" });
     cx.notify();
     cx.spawn(async (cx) => {
+      let upd;
       try {
-        const r = await exec(...tasksCmd(["update", "check", "--json"]), { timeout: 20000 });
+        const r = await this.tasksExec(machine, ["update", "check", "--json"], { timeout: 20000 });
         let data = null;
-        try { data = JSON.parse(r.stdout || ""); } catch {}
-        if (!data || typeof data !== "object") {
-          this.upd = { ...this.upd, state: "unsupported", message: "" };
+        try { data = JSON.parse(r?.stdout || ""); } catch {}
+        if (!r) {
+          upd = { ...prev, state: "error", message: `Can't reach ${machine}.` };
+        } else if (!data || typeof data !== "object") {
+          upd = { ...prev, state: bridgeMissing(r) ? "missing" : "unsupported", message: "" };
         } else {
           const state = data.dev ? "dev" : data.error ? "error" : data.available ? "available" : "current";
-          this.upd = {
+          upd = {
             state,
             installed: data.installed ?? null,
             latest: data.latest ?? null,
             message: data.error || "",
+            bridgeOnly: !!data.bridgeOnly,
           };
         }
       } catch {
-        this.upd = { ...this.upd, state: "unsupported", message: "" };
+        upd = { ...prev, state: machine ? "missing" : "unsupported", message: "" };
       }
-      setShared("ranch.update.last", this.upd);
-      setShared("ranch.update.checkedAt", Date.now());
+      this.saveUpd(key, upd);
       cx.notify();
     });
   }
 
   runUpdate(cx) {
-    this.upd = { ...this.upd, state: "updating", message: "" };
+    const machine = this.machine();
+    const key = machine ?? "";
+    const prev = this.upd;
+    this.updBy.set(key, { ...prev, state: "updating", message: "" });
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const r = await exec(...tasksCmd(["update", "--yes", "--json"]), { timeout: 300000 });
+        const r = await this.tasksExec(machine, ["update", "--yes", "--json"], { timeout: 300000 });
         let data = null;
-        try { data = JSON.parse(r.stdout || ""); } catch {}
+        try { data = JSON.parse(r?.stdout || ""); } catch {}
         if (data?.ok) {
           let message = `Updated to ${String(data.to ?? "").slice(0, 7)}`;
+          if (data.bridgeOnly) message += machine ? ` on ${machine} (task reporting)` : " (task reporting)";
           if (data.backedUp?.length) message += `, backed up ${data.backedUp.length} edited file(s) to ${data.backupDir}`;
           if (data.tasks === "failed") message += " Task reporting reinstall failed.";
-          this.upd = { state: "updated", installed: data.to ?? null, latest: data.to ?? null, message };
-          setShared("ranch.update.last", { ...this.upd, state: "current" });
-          setShared("ranch.update.checkedAt", Date.now());
+          const upd = { state: "updated", installed: data.to ?? null, latest: data.to ?? null, message, bridgeOnly: !!data.bridgeOnly };
+          this.saveUpd(key, { ...upd, state: "current", message: "" });
+          this.updBy.set(key, upd);
           cx.notify();
-          run("layout.switch", { name: "main" });
-          run("layout.switch", { name: "ranch" });
+          // Mods and the layout changed only when this computer updated them.
+          if (!machine && !data.bridgeOnly) {
+            run("layout.switch", { name: "main" });
+            run("layout.switch", { name: "ranch" });
+          }
+          if (data.bridgeOnly) this.loadTasks(cx, machine);
         } else if (data) {
-          this.upd = { ...this.upd, state: data.dev ? "dev" : "error", message: data.error || "Update failed." };
+          this.updBy.set(key, { ...prev, state: data.dev ? "dev" : "error", message: data.error || "Update failed." });
         } else {
-          this.upd = { ...this.upd, state: "unsupported", message: "" };
+          this.updBy.set(key, { ...prev, state: r ? "unsupported" : "error", message: r ? "" : `Can't reach ${machine}.` });
         }
       } catch {
-        this.upd = { ...this.upd, state: "error", message: "Could not run ranch-tasks." };
+        this.updBy.set(key, { ...prev, state: "error", message: "Could not run ranch-tasks." });
       }
       cx.notify();
     });
@@ -413,19 +502,30 @@ export default class RanchSettings extends View {
   // when something needs the person.
   sectionSystem(t) {
     const rows = [];
+    const machine = this.machine();
+    const on = machine ? ` · ${machine}` : "";
 
-    // Task reporting
+    // Task reporting (on the shown space's machine)
     const tasks = this.tasks;
     const pending = tasks?.agents ? TASK_KEYS.filter((k) => !["installed", "needs approval"].includes(tasks.agents[k])) : [];
     const broken = pending.some((k) => tasks.agents[k] === "broken");
+    const setUp = (label) => this.button("tasks-setup", label, (_e, cx) => this.runSetup(cx),
+      { primary: true, disabled: this.setup === "Setting up…" });
     const taskStatus = !tasks ? this.status("checking…", t.dim)
-      : tasks.error ? this.status("not installed", t.blocked)
+      : tasks.missing ? h_flex().flex_none().items_center().gap(8)
+          .child(this.status("not installed", t.blocked))
+          .child(setUp("Set up"))
+      : tasks.error ? this.status(tasks.unreachable ? "unreachable" : "not installed", t.blocked)
       : pending.length ? h_flex().flex_none().items_center().gap(8)
           .child(this.status(`${pending.length} to set up`, t.working))
-          .child(this.button("tasks-setup", broken ? "Repair" : "Set up", (_e, cx) => this.runSetup(cx), { primary: true }))
+          .child(setUp(broken ? "Repair" : "Set up"))
       : this.status("on", t.done);
-    rows.push(this.row("sys-tasks", "Task reporting", taskStatus));
-    if (tasks?.error) rows.push(this.note("Run `node bin/ranch-tasks install` from the Ranch repo."));
+    rows.push(this.row("sys-tasks", `Task reporting${on}`, taskStatus));
+    if (tasks?.missing) rows.push(this.note(`Agents on ${machine} report nothing yet. Set up copies this computer's task reporting there and installs it.`));
+    else if (tasks?.error && tasks.unreachable) rows.push(this.note(`Can't reach ${machine}.`));
+    else if (tasks?.error) rows.push(this.note(machine
+      ? `Run \`node bin/ranch-tasks install\` from the Ranch repo on ${machine}.`
+      : "Run `node bin/ranch-tasks install` from the Ranch repo."));
     if (pending.length) rows.push(this.note(pending.map((k) => `${displayName(k, this.known ?? [])} ${tasks.agents[k]}`).join(" · ")));
     if (tasks?.agents?.codex === "needs approval") rows.push(this.note("Codex: approve the Ranch hooks once with /hooks.", t.working));
     if (this.setup) rows.push(this.note(this.setup.split("\n").slice(0, 3).join("\n")));
@@ -441,17 +541,21 @@ export default class RanchSettings extends View {
       error: ["check failed", t.blocked],
       dev: ["dev install", t.dim],
       unsupported: ["unavailable", t.dim],
+      missing: ["not installed", t.dim],
     }[u.state] ?? ["checking…", t.dim];
     const busy = u.state === "checking" || u.state === "updating";
     const updControl = h_flex().flex_none().items_center().gap(8)
       .child(this.status(word, color))
-      .child(u.state === "available" || u.state === "updating"
+      .when(u.state !== "missing", (e) => e.child(u.state === "available" || u.state === "updating"
         ? this.button("updates-update", "Update", (_e, cx) => this.runUpdate(cx), { primary: true, disabled: u.state === "updating" })
-        : this.button("updates-check", "Check", (_e, cx) => this.checkUpdate(cx, true), { disabled: busy }));
-    rows.push(this.row("sys-ranch", "Ranch", updControl));
+        : this.button("updates-check", "Check", (_e, cx) => this.checkUpdate(cx, true), { disabled: busy })));
+    rows.push(this.row("sys-ranch", `Ranch${on}`, updControl));
     const updNote = u.message
       || (u.state === "dev" ? "Symlinked dev install: git pull in the repo."
-        : u.state === "unsupported" ? "This install predates updates. Reinstall Ranch once to enable them." : "");
+        : u.state === "unsupported" ? "This install predates updates. Reinstall Ranch once to enable them."
+        : u.state === "missing" ? `Set up task reporting on ${machine} first.`
+        : u.bridgeOnly && u.state === "available" ? `Updates task reporting on ${machine ?? "this computer"}; the layout updates from the computer running the app.`
+        : "");
     if (updNote) rows.push(this.note(updNote, u.state === "error" ? t.blocked : null));
 
     // Tool health: a row only for what's wrong.

@@ -74,7 +74,18 @@ function git(args, cwd, timeout = GIT_TIMEOUT) {
   }).trim();
 }
 
-/** { installed, latest, available, dev, error? }; never throws. */
+/**
+ * True on a machine that only carries the task-reporting bridge (a remote
+ * Herdr machine: agents run there, the Ranch layout and mods live in the app
+ * on another computer). There an update refreshes ~/.herdr/ranch only.
+ */
+export function isBridgeOnly(paths, manifest) {
+  if (manifest) return manifest.bridgeOnly === true;
+  // Never updated: task reporting installed, but no Herdr app home at all.
+  return existsSync(join(dirname(paths.manifest), "install.json")) && !existsSync(paths.herdrHome);
+}
+
+/** { installed, latest, available, dev, bridgeOnly, error? }; never throws. */
 export function checkUpdate() {
   const paths = updatePaths();
   const manifest = readManifest(paths.manifest);
@@ -93,6 +104,7 @@ export function checkUpdate() {
     latest,
     available: !!latest && latest !== installed,
     dev: isDevInstall(paths.herdrHome),
+    bridgeOnly: isBridgeOnly(paths, manifest),
     ...(error ? { error } : {}),
   };
 }
@@ -206,6 +218,31 @@ function removeFile(herdrHome, rel) {
   }
 }
 
+/** Bridge-only update: fetch, reinstall task reporting from it, record the commit. */
+function updateBridge({ paths, from, yes, now }) {
+  try {
+    const commit = fetchSource(paths);
+    const plan = { copy: [], unchanged: [], backup: [], remove: [] };
+    if (!yes) return { ok: true, dryRun: true, bridgeOnly: true, from, to: commit, plan };
+    let tasks = "reinstalled";
+    try {
+      execFileSync(process.execPath, [join(paths.src, "bin", "ranch-tasks"), "install", "--yes"], {
+        env: process.env, timeout: GIT_TIMEOUT, stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch {
+      tasks = "failed";
+    }
+    if (tasks === "failed") return { ok: false, bridgeOnly: true, from, error: "task reporting reinstall failed" };
+    mkdirSync(dirname(paths.manifest), { recursive: true });
+    writeFileSync(paths.manifest, JSON.stringify({
+      version: 1, repo: paths.repo, branch: paths.branch, commit, updatedAt: now.toISOString(), bridgeOnly: true, files: {},
+    }, null, 2) + "\n");
+    return { ok: true, bridgeOnly: true, from, to: commit, copied: 0, removed: 0, backedUp: [], backupDir: null, tasks };
+  } catch (err) {
+    return { ok: false, bridgeOnly: true, error: shortError(err) };
+  }
+}
+
 /**
  * Applies (or, without yes, describes) an update from the configured repo.
  * Never throws: failures come back as { ok: false, error }.
@@ -217,6 +254,7 @@ export function applyUpdate({ yes = false, now = new Date() } = {}) {
   }
   const manifest = readManifest(paths.manifest);
   const from = manifest?.commit ?? null;
+  if (isBridgeOnly(paths, manifest)) return updateBridge({ paths, from, yes, now });
   try {
     const commit = fetchSource(paths);
     const plan = planUpdate({ srcRoot: paths.src, herdrHome: paths.herdrHome, manifest });

@@ -170,3 +170,35 @@ test("checkUpdate never throws when git ls-remote fails", (t) => {
   assert.equal(result.latest, null);
   assert.equal(result.available, false);
 });
+
+test("a bridge-only machine (manifest says so) updates task reporting, never the Herdr home", (t) => {
+  const f = fixture(t);
+  // The source has a runnable bin/ranch-tasks so the reinstall step succeeds.
+  write(f.repo, "bin/ranch-tasks", "process.exit(0);\n");
+  git(f.repo, "add", "-A");
+  git(f.repo, "commit", "-m", "bin");
+  const head = git(f.repo, "rev-parse", "HEAD");
+  write(f.home, ".herdr/ranch/update.json", JSON.stringify({ version: 1, commit: null, bridgeOnly: true, files: {} }));
+  const check = checkUpdate();
+  assert.equal(check.bridgeOnly, true);
+  assert.equal(check.available, true);
+  const result = applyUpdate({ yes: true });
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.bridgeOnly, true);
+  assert.equal(result.to, head);
+  assert.equal(result.tasks, "reinstalled");
+  assert.equal(existsSync(f.herdr), false);
+  const manifest = JSON.parse(readFileSync(updatePaths().manifest, "utf8"));
+  assert.equal(manifest.commit, head);
+  assert.equal(manifest.bridgeOnly, true);
+  assert.equal(checkUpdate().available, false);
+});
+
+test("no manifest: bridge-only only when task reporting is installed and there is no Herdr app home", (t) => {
+  const f = fixture(t);
+  assert.equal(checkUpdate().bridgeOnly, false);
+  write(f.home, ".herdr/ranch/install.json", "{}\n");
+  assert.equal(checkUpdate().bridgeOnly, true);
+  mkdirSync(f.herdr, { recursive: true });
+  assert.equal(checkUpdate().bridgeOnly, false);
+});

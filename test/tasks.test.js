@@ -8,6 +8,7 @@ import {
   orderTasks,
   progress,
   storeFileName,
+  storeAddress,
   emptyStore,
   withActivity,
   normalizeActivity,
@@ -169,6 +170,14 @@ test("orderTasks and progress", () => {
   ];
   assert.deepEqual(orderTasks(t).map((x) => x.id), ["3", "2", "4", "1"]);
   assert.deepEqual(progress(t), { done: 1, total: 4 });
+});
+
+test("storeAddress drops the machine prefix of a remote terminal only", () => {
+  assert.equal(storeAddress("asus-book/t12", "asus-book"), "t12");
+  assert.equal(storeAddress("t12", "asus-book"), "t12");
+  assert.equal(storeAddress("t7n", null), "t7n");
+  assert.equal(storeAddress("other/t3", "asus-book"), "other/t3");
+  assert.equal(storeFileName(storeAddress("asus-book/t12", "asus-book")), "t12.json");
 });
 
 test("storeFileName and emptyStore", () => {
