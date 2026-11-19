@@ -253,6 +253,17 @@ export function capTasks(tasks, max = MAX_TASKS) {
 }
 
 /** Store file name for a terminal address ("t6" -> "t6.json"); strips anything unsafe. */
+/**
+ * The terminal id an agent on `machine` writes its store under. Herdr's app
+ * addresses a remote terminal as "<machine>/t12", but inside that machine the
+ * agent only sees HC_TERMINAL_ID "t12", so its store is terminals/t12.json.
+ */
+export function storeAddress(address, machine = null) {
+  const a = String(address ?? "");
+  if (machine && a.startsWith(`${machine}/`)) return a.slice(machine.length + 1);
+  return a;
+}
+
 export function storeFileName(address) {
   const safe = String(address ?? "").replace(/[^A-Za-z0-9_.-]/g, "_");
   return safe ? `${safe}.json` : null;

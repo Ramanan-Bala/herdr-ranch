@@ -8,7 +8,7 @@ import {
 import {
   decide, exitAction, rememberSession, recallSession, ownership, cleanTitle, sessionChanged, withRecordSession, SOURCE_RANK,
 } from "./lib/naming.js";
-import { listVisible, parseStore, storeCandidates, withPointerIdentity } from "./lib/tasks.js";
+import { listVisible, parseStore, storeAddress, storeCandidates, withPointerIdentity } from "./lib/tasks.js";
 import {
   SETTINGS_KEY, AUTONAMES_KEY, SESSIONS_KEY, TASKS_DIR, resolveSettings,
 } from "./lib/settings.js";
@@ -300,7 +300,9 @@ export class TabNamer {
   }
 
   async loadStore(address, machine, app) {
-    const [terminal, legacy] = storeCandidates(address);
+    // A remote agent's store is named by its machine-local terminal id.
+    const local = storeAddress(address, machine);
+    const [terminal, legacy] = storeCandidates(local);
     if (!terminal) return null;
     const cached = this.stores.get(address);
     if (cached && Date.now() - cached.at < STORE_TTL) return cached.store;
@@ -309,7 +311,7 @@ export class TabNamer {
       const dir = await this.homeFor(machine);
       if (dir) {
         const terminalText = await readTextFile(`${dir}/${TASKS_DIR}/${terminal}`, { on: machine });
-        const [session] = terminalText == null ? [] : storeCandidates(address, terminalText);
+        const [session] = terminalText == null ? [] : storeCandidates(local, terminalText);
         const file = session ?? (terminalText == null ? legacy : terminal);
         const text = terminalText == null || session
           ? await readTextFile(`${dir}/${TASKS_DIR}/${file}`, { on: machine })

@@ -229,7 +229,9 @@ function humanUpdate(result) {
   }
   const lines = [
     `Ranch updated: ${shortCommit(result.from)} -> ${shortCommit(result.to)}`,
-    `  copied ${result.copied}, removed ${result.removed}`,
+    result.bridgeOnly
+      ? "  task reporting only (the Ranch layout lives in the app on another computer)"
+      : `  copied ${result.copied}, removed ${result.removed}`,
   ];
   if (result.backupDir) {
     lines.push(`  backups: ${result.backupDir}`);

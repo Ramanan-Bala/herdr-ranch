@@ -47,9 +47,11 @@ import {
   orderTasks,
   progress,
   storeCandidates,
+  storeAddress,
   withPointerIdentity,
 } from "./lib/tasks.js";
 import { tasksCommand, looksWindows } from "./lib/tasks-command.js";
+import { pushBridge, bridgeMissing } from "./lib/remote-bridge.js";
 import {
   pickAgent,
   checksSummary,
@@ -263,7 +265,9 @@ export default class RanchSession extends View {
     return r;
   }
 
-  async readStoreTextRaw(machine, homeDir, address, liveTitle = null) {
+  async readStoreTextRaw(machine, homeDir, appAddress, liveTitle = null) {
+    // A remote agent's store is named by its machine-local terminal id.
+    const address = storeAddress(appAddress, machine);
     const [terminal, legacy] = storeCandidates(address);
     if (!homeDir || !terminal) return { parsed: { ok: false, reason: "missing" }, text: null };
     try {
@@ -379,7 +383,9 @@ export default class RanchSession extends View {
       let state = info.state;
       let startedAt = info.startedAt;
       try {
-        const r = await exec("hc", ["get", "--json", addr], { on: machine, timeout: 5000 });
+        // Ask this computer's hc: it knows remote terminals by their full
+        // "<machine>/t12" address, and the remote may have no hc on PATH.
+        const r = await exec("hc", ["get", "--json", addr], { timeout: 5000 });
         if (r.code === 0) {
           const raw = JSON.parse(r.stdout);
           state = typeof raw?.state === "string" ? raw.state : state;
@@ -617,14 +623,24 @@ export default class RanchSession extends View {
     const homeDir = await this.homeFor(s.machine);
     let result = "missing";
     if (homeDir) {
+      let r = null;
       try {
-        const r = await exec(...tasksCmd(homeDir, ["install", "--yes"], s.machine), { on: s.machine });
-        if (r.code === 127) result = "missing";
-        else {
-          const out = `${r.stdout.trim()}\n${r.stderr.trim()}`.trim();
-          result = out || (r.code === 0 ? "Done." : "Failed.");
-        }
+        r = await exec(...tasksCmd(homeDir, ["install", "--yes"], s.machine), { on: s.machine });
       } catch {}
+      if (!bridgeMissing(r)) {
+        const out = `${r.stdout.trim()}\n${r.stderr.trim()}`.trim();
+        result = out || (r.code === 0 ? "Done." : "Failed.");
+      }
+    }
+    // A remote machine that never had task reporting: copy this computer's
+    // bridge there and install it (lib/remote-bridge.js).
+    if (result === "missing" && s.machine) {
+      const pushed = await pushBridge({
+        exec, machine: s.machine, localHome: home(), readLocal: (p) => readTextFile(p),
+        localWindows: isWin(), remoteHome: homeDir,
+      });
+      result = pushed.text;
+      this.adapterStatus?.delete(s.machine);
     }
     this.settingUp = false;
     this.setupResult = result;
