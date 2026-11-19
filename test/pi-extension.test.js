@@ -305,6 +305,26 @@ test("generateSessionTitle asks the small model and cleans the reply", async () 
   assert.equal(await generateSessionTitle(ctx, "make pi session names automatic"), "Pi Session Auto Names");
   assert.equal(calls[0].model.id, "claude-haiku-4-5");
   assert.match(calls[0].context.messages[0].content[0].text, /make pi session names automatic/);
+  assert.equal(calls[0].options.thinkingEnabled, false); // complete() fallback disables thinking
+
+  // streamSimple (preferred): no `reasoning` option, so thinking stays off
+  const simple = [];
+  const viaStream = {
+    ...ctx,
+    modelRegistry: {
+      ...ctx.modelRegistry,
+      streamSimple: (model, context, options) => {
+        simple.push(options);
+        return { result: async () => ({ stopReason: "stop", content: [{ type: "text", text: "Streamed Title" }] }) };
+      },
+    },
+  };
+  assert.equal(await generateSessionTitle(viaStream, "make pi session names automatic"), "Streamed Title");
+  assert.equal(simple[0].reasoning, undefined);
+  assert.equal(simple[0].maxTokens, 200);
+  // a reply cut short while thinking has no text: no title
+  viaStream.modelRegistry.streamSimple = () => ({ result: async () => ({ stopReason: "length", content: [{ type: "thinking", thinking: "hmm" }] }) });
+  assert.equal(await generateSessionTitle(viaStream, "x"), null);
 
   ctx.modelRegistry.complete = async () => ({ stopReason: "error", content: [] });
   assert.equal(await generateSessionTitle(ctx, "x"), null);

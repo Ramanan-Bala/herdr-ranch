@@ -152,13 +152,21 @@ export function titlePrompt(prompt) {
 export async function generateSessionTitle(ctx, prompt, signal) {
   const registry = ctx?.modelRegistry;
   const model = pickTitleModel(registry, ctx?.model);
-  if (!model || typeof registry?.complete !== "function") return null;
+  if (!model || !registry) return null;
   if (typeof registry.hasConfiguredAuth === "function" && !registry.hasConfiguredAuth(model)) return null;
-  const response = await registry.complete(
-    model,
-    { messages: [{ role: "user", content: [{ type: "text", text: titlePrompt(prompt) }], timestamp: Date.now() }] },
-    { maxTokens: 40, cacheRetention: "none", signal },
-  );
+  const context = { messages: [{ role: "user", content: [{ type: "text", text: titlePrompt(prompt) }], timestamp: Date.now() }] };
+  // Thinking off: a reasoning model would otherwise spend the small budget
+  // thinking and stop ("length") before any text. streamSimple without
+  // `reasoning` disables it provider-neutrally; complete() needs the flag.
+  const options = { maxTokens: 200, cacheRetention: "none", signal };
+  let response;
+  if (typeof registry.streamSimple === "function") {
+    response = await registry.streamSimple(model, context, options).result();
+  } else if (typeof registry.complete === "function") {
+    response = await registry.complete(model, context, { ...options, thinkingEnabled: false });
+  } else {
+    return null;
+  }
   if (!response || response.stopReason === "error" || response.stopReason === "aborted") return null;
   return cleanSessionTitle(messageText(response.content));
 }
