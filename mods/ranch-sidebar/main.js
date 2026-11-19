@@ -33,6 +33,19 @@ const COLLAPSE_KEY = "collapsed";
 const ghLimit = createLimiter(3);
 const GIT_META_TTL_MS = 600000;
 
+// The New-space dialog (mods/ranch-newspace), prefilled from the active space:
+// machine, folder, worktree and branch in one place. The three New space
+// buttons below all open it.
+function openNewSpace() {
+  const active = spaces().find((s) => s.active);
+  openOverlay({
+    mod: "ranch-newspace",
+    kind: "dialog",
+    width: 560,
+    props: { machine: active?.machine ?? null, folder: active?.folder ?? null },
+  });
+}
+
 export default class RanchSidebar extends View {
   init(_props, cx) {
     this.handle = cx.focus_handle();
@@ -748,7 +761,7 @@ export default class RanchSidebar extends View {
       .child(div().id("new-space").flex_none().size(22).rounded(5).flex().items_center().justify_center()
         .text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("New space")
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-        .on_click(() => run("space.new", {}))
+        .on_click(() => openNewSpace())
         .child(svg(ICON("folder-plus")).size(13)));
   }
 
@@ -1092,7 +1105,7 @@ export default class RanchSidebar extends View {
       .border(1).border_dashed().border_color(t.border).text_color(t.dim)
       .hover((s) => s.border_color(t.muted).text_color(t.foreground))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click(() => run("space.new", {}))
+      .on_click(() => openNewSpace())
       .child(svg(ICON("plus")).size(14));
     return v_flex().id("rail").w_full().items_center()
       .child(top)
@@ -1117,7 +1130,7 @@ export default class RanchSidebar extends View {
       .child(div().text_size(12).text_color(t.dim).child("No spaces yet"))
       .child(div().id("new-space-empty").px(10).py(4).rounded(7).text_size(12).font_medium()
         .bg(t.solid).text_color(t.solid_foreground).cursor_pointer()
-        .on_click(() => run("space.new", {}))
+        .on_click(() => openNewSpace())
         .child("New space"));
   }
 
