@@ -134,7 +134,8 @@ export function titlePrompt(prompt) {
   return [
     "Name this coding-agent session from the user's first request.",
     "Reply with ONLY a 2-5 word title in Title Case: no quotes, no punctuation at the end.",
-    "If the request has no clear task (a greeting, a test message), reply SKIP.",
+    "Asking to check, test, verify, explain or explore something IS a task: name it.",
+    "Reply SKIP only for a bare greeting or small talk with nothing to do (\"hi\", \"hello, how are you\").",
     "",
     "<request>",
     String(prompt).slice(0, 2000),
