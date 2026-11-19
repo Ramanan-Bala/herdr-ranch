@@ -144,6 +144,275 @@ export function branchSuggestions(branches, query, limit = 6) {
   return matched.slice(0, limit);
 }
 
+// ------------------------------------------------------ reading a machine
+
+/**
+ * The machines a dialog can target, this computer first:
+ * `[{ name, label, local, disabled, hint }]`. `name` is null for this computer;
+ * `hint` is the connection state to show beside the name ("offline" for a
+ * machine that is unavailable, "connecting…" while its layout loads).
+ * `current` is kept even when the machine list does not know it (a core that
+ * is not connected yet), so the dialog never silently moves the target.
+ */
+export function machineChoices({ machines: list = [], current = null } = {}) {
+  const seen = new Set();
+  const out = [];
+  const add = (name, layout) => {
+    const key = name ?? null;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      name: key,
+      label: key ?? "This computer",
+      local: key === null,
+      disabled: layout === "unavailable",
+      hint: layout === "unavailable" ? "offline" : layout === "loading" ? "connecting…" : "",
+    });
+  };
+  for (const m of list ?? []) add(m?.name ?? null, m?.layout);
+  if (!seen.has(null)) out.unshift({ name: null, label: "This computer", local: true, disabled: false, hint: "" });
+  if (current && !seen.has(current)) out.unshift({ name: current, label: current, local: false, disabled: false, hint: "" });
+  return out;
+}
+
+/**
+ * The folder a machine should start at: the folder of its most recent space
+ * (spaces are in creation order, so the last one on that machine), else the
+ * machine's home. A space with no folder of its own lives at the machine's
+ * home, so it counts as a home answer too. Null when nothing is known.
+ */
+export function folderForMachine({ spaces: list = [], machine = null, home = null } = {}) {
+  const mine = (list ?? []).filter((s) => (s?.machine ?? null) === (machine ?? null));
+  for (let i = mine.length - 1; i >= 0; i -= 1) {
+    const dir = String(mine[i]?.folder ?? "").trim();
+    if (dir) return dir;
+  }
+  return String(home ?? "").trim() || null;
+}
+
+/**
+ * The folders of the existing spaces on `machine`, newest first, without
+ * `current`, capped at `limit` — one-click reuse under the folder field.
+ */
+export function recentFolders({ spaces: list = [], machine = null, current = "", limit = 4 } = {}) {
+  const skip = String(current ?? "").trim();
+  const seen = new Set();
+  const out = [];
+  const mine = (list ?? []).filter((s) => (s?.machine ?? null) === (machine ?? null));
+  for (let i = mine.length - 1; i >= 0; i -= 1) {
+    const dir = String(mine[i]?.folder ?? "").trim();
+    if (!dir || dir === skip || seen.has(dir)) continue;
+    seen.add(dir);
+    out.push(dir);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+// ---------------------------------------------------- reading a folder
+
+/** How many folders one listing reports before it says there are more. */
+export const LIST_LIMIT = 500;
+
+/**
+ * The POSIX listing script, run as `sh -c LIST_DIRS_SCRIPT sh <folder> <limit>`:
+ * the folder is a positional argument ($1), never part of the script text, so
+ * a path with spaces, quotes or `;` cannot become shell code. Output is one
+ * line per folder — `1<TAB>name` for a git repo, `0<TAB>name` otherwise — and
+ * a final `!<TAB>` line when the folder holds more than `limit`. Hidden
+ * folders are skipped (the glob only matches visible ones), and a folder that
+ * cannot be read reports why on stderr (the `ls` line carries the system's
+ * own reason).
+ */
+export const LIST_DIRS_SCRIPT = `p=$1
+limit=$2
+if [ ! -d "$p" ]; then
+  printf '%s: no such folder\\n' "$p" >&2
+  exit 2
+fi
+if ! ls -a "$p" >/dev/null 2>&1; then
+  ls -a "$p" >/dev/null
+  exit 3
+fi
+cd "$p" || exit 4
+n=0
+for d in */; do
+  [ -d "$d" ] || continue
+  d=\${d%/}
+  if [ -e "$d/.git" ]; then
+    printf '1\\t%s\\n' "$d"
+  else
+    printf '0\\t%s\\n' "$d"
+  fi
+  n=$((n + 1))
+  if [ "$n" -ge "$limit" ]; then
+    printf '!\\t\\n'
+    break
+  fi
+done
+exit 0`;
+
+/** The `sh` argv that lists `folder` on any machine (see LIST_DIRS_SCRIPT). */
+export function listDirsArgs(folder, limit = LIST_LIMIT) {
+  return ["-c", LIST_DIRS_SCRIPT, "sh", String(folder ?? ""), String(limit)];
+}
+
+/**
+ * The `cmd.exe` argv that lists `folder` with `dir /b /ad` — the fallback for
+ * a Windows machine without `sh`. Null when the path holds a character cmd
+ * would read as syntax (`& | < > ^ " %`): cmd re-parses its command line, so
+ * such a path is reported as unreadable rather than risked.
+ */
+export function windowsDirArgs(folder) {
+  const p = String(folder ?? "").trim();
+  if (!p || /[&|<>^"%]/.test(p)) return null;
+  return ["/c", "dir", "/b", "/ad", p];
+}
+
+/**
+ * Parse a folder listing — LIST_DIRS_SCRIPT's output, or plain names from
+ * `dir /b /ad` — into `{ dirs: [{ name, git }], truncated }`, sorted by name.
+ * Hidden names are dropped, `!<TAB>` marks a capped listing, and a line with
+ * no tab is a plain folder (the Windows form). Each name is the last path
+ * segment only, so a caller joins it onto the folder it listed.
+ */
+export function parseFolderListing(text) {
+  const dirs = [];
+  let truncated = false;
+  const seen = new Set();
+  for (const raw of String(text ?? "").split("\n")) {
+    // Only the line end is trimmed: a tab is data here (`!<TAB>` has no name).
+    const line = raw.replace(/\r$/, "");
+    if (!line.trim()) continue;
+    const tab = line.indexOf("\t");
+    const flag = tab === -1 ? "0" : line.slice(0, tab);
+    const name = tab === -1 ? line : line.slice(tab + 1);
+    if (flag === "!") {
+      truncated = true;
+      continue;
+    }
+    if (!name || name === "." || name === ".." || name.startsWith(".")) continue;
+    // A Windows `dir` can name the folder itself; only keep bare names.
+    if (/[\\/]/.test(name)) continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    dirs.push({ name, git: flag === "1" });
+  }
+  // Case-insensitive, so `alpha` and `Zeta` interleave the way a file list should.
+  dirs.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()) || a.name.localeCompare(b.name));
+  return { dirs, truncated };
+}
+
+/** Keep the folders whose name contains `query` (case-insensitive). */
+export function filterFolders(dirs, query) {
+  const q = String(query ?? "").trim().toLowerCase();
+  if (!q) return dirs ?? [];
+  return (dirs ?? []).filter((d) => String(d?.name ?? "").toLowerCase().includes(q));
+}
+
+/**
+ * What a typed folder field asks the browser to show: a folder to list and a
+ * name filter. A trailing `/` means "show what is inside" (`~/code/`), so the
+ * folder itself is listed; anything else lists its parent and filters by the
+ * last segment, which is what makes typing narrow the list as you go. A
+ * relative fragment keeps listing `current`. `home` resolves a leading `~`.
+ */
+export function browseTarget(value, home = null, current = null) {
+  const typed = String(value ?? "").trim();
+  if (!typed) return { path: String(current ?? expandHome("~", home) ?? ""), filter: "" };
+  const expanded = expandHome(typed, home);
+  const slashed = expanded.replace(/\\/g, "/");
+  if (/\/$/.test(slashed)) return { path: slashed.replace(/\/+$/, "") || "/", filter: "" };
+  const cut = slashed.lastIndexOf("/");
+  if (cut === -1) return { path: String(current ?? ""), filter: slashed };
+  const parent = slashed.slice(0, cut) || "/";
+  return { path: parent, filter: slashed.slice(cut + 1) };
+}
+
+/** The folder above `path`; `/` and a drive root stay put. */
+export function parentFolder(path) {
+  const p = String(path ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!p || p === "/") return "/";
+  if (/^[A-Za-z]:$/.test(p)) return `${p}/`;
+  const cut = p.lastIndexOf("/");
+  if (cut === 0) return "/";
+  if (cut === -1) return p;
+  const parent = p.slice(0, cut);
+  return /^[A-Za-z]:$/.test(parent) ? `${parent}/` : parent;
+}
+
+/** `folder` and `name` joined with one `/` (a drive root keeps its slash). */
+export function childFolder(path, name) {
+  const p = String(path ?? "").replace(/\\/g, "/");
+  const n = String(name ?? "").trim();
+  if (!n || n === "." || n === ".." || /[\\/]/.test(n)) return p;
+  if (!p) return n;
+  if (p === "/") return `/${n}`;
+  return p.endsWith("/") ? p + n : `${p}/${n}`;
+}
+
+/** A folder without its trailing slash, but never "" — `/` and `C:/` stay. */
+export function trimFolder(path) {
+  const p = String(path ?? "").trim();
+  if (!p) return "";
+  const trimmed = p.replace(/\/+$/, "");
+  if (!trimmed) return "/";
+  return /^[A-Za-z]:$/.test(trimmed) ? `${trimmed}/` : trimmed;
+}
+
+/**
+ * Why a shell command failed, from its stderr and exit code:
+ * "missing" (no such folder), "denied" (not readable), "norepo" (git's own
+ * answer) or "other". "unreachable" is not here: an `exec` rejection means
+ * the machine or its shell could not be started at all, and the caller says so.
+ */
+export function classifyFailure({ stage = "list", stderr = "", code = 0 } = {}) {
+  const s = String(stderr ?? "");
+  if (/permission denied|not permitted|access is denied|not authorized/i.test(s)) return "denied";
+  if (/not a git repository/i.test(s)) return "norepo";
+  if (/no such file|does not exist|cannot access|not found|cannot find|can't cd|no such folder/i.test(s)) return "missing";
+  if (code === 2) return "missing";
+  return stage === "repo" && code === 128 ? "norepo" : "other";
+}
+
+/**
+ * Why an `exec` call could not start at all (its rejection, not an exit code):
+ * a folder that vanished under it, a permission, or a machine/shell that is
+ * not there. Read from the rejection's text.
+ */
+export function classifyExecFailure(text) {
+  const s = String(text ?? "");
+  if (/permission denied|not permitted|access is denied|not authorized/i.test(s)) return "denied";
+  if (/no such file|does not exist|cannot start folder|not found/i.test(s)) return "missing";
+  return "unreachable";
+}
+
+/**
+ * A sentence for a failed folder read, naming the machine and the system's
+ * own reason: `Can't read /root on asus-book: Permission denied`. `machine`
+ * null reads as this computer.
+ */
+export function failureMessage(kind, { path = "", machine = null, reason = "" } = {}) {
+  const where = machine || "this computer";
+  // The shell and git both lead with their own name for the folder we already
+  // printed; keep the system's reason and drop the echo.
+  const line = firstLine(reason)
+    .replace(/^fatal:\s*/i, "")
+    .replace(/^cannot start [^:]+:\s*/i, "")
+    .replace(/^cannot change to '[^']*':\s*/, "")
+    .replace(/\.$/, "");
+  switch (kind) {
+    case "missing": return `Folder ${path} doesn't exist on ${where}.`;
+    case "denied": return `Can't read ${path} on ${where}: ${line || "permission denied"}.`;
+    case "unreachable": return machine ? `Can't reach ${machine}.` : "Couldn't run a shell on this computer.";
+    case "norepo": return "Not a git repository.";
+    default:
+      return line
+        ? `Can't read ${path} on ${where}: ${line}.`
+        : `Can't read ${path} on ${where}.`;
+  }
+}
+
 /**
  * What pressing Enter should do, from the dialog's inputs:
  *  - "wait"            the repo probe is still running
@@ -166,9 +435,12 @@ export function newSpacePlan({
   localBranches = [],
   defaultBranch = null,
   home = "~",
+  error = "",
 } = {}) {
   if (probe === "pending") return { action: "wait" };
-  if (probe === "error") return { action: "error", error: "Couldn't check the folder for a git repository." };
+  if (probe === "error") {
+    return { action: "error", error: String(error ?? "").trim() || "Couldn't check the folder for a git repository." };
+  }
   if (probe !== "repo" || !repoTop) {
     const dir = String(folder ?? "").trim();
     return dir
