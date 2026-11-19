@@ -5,6 +5,7 @@
 // Pi already reports working/idle/blocked to Herdr itself (OSC 7501), so this
 // extension never writes terminal escape codes.
 import { spawn } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -100,6 +101,19 @@ export function sessionSnapshot(sessionManager) {
 // ------------------------------------------------------------ auto session name
 
 const TITLE_TIMEOUT_MS = 20000;
+const TITLE_MAX_TRIES = 3;
+
+/** RANCH_PI_DEBUG=1 appends auto-name steps to ~/.herdr/ranch/pi-debug.log. */
+function debugLog(...parts) {
+  if (!process.env.RANCH_PI_DEBUG) return;
+  try {
+    const home = process.env.RANCH_HOME || homedir();
+    const line = parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ");
+    appendFileSync(join(home, ".herdr", "ranch", "pi-debug.log"), `${new Date().toISOString()} ${line}\n`);
+  } catch {
+    // debug only
+  }
+}
 
 /** True unless RANCH_PI_AUTONAME turns automatic session names off. */
 export function autoNameEnabled(env = process.env) {
@@ -128,7 +142,12 @@ export function titlePrompt(prompt) {
   ].join("\n");
 }
 
-/** Asks the session's current model for a title for `prompt`; resolves to the title or null. */
+/**
+ * Asks the session's current model for a title for `prompt`. Resolves to the
+ * title, or null when the model answered without one (SKIP) or no model is
+ * set up; rejects when the call failed (provider error, abort) so it can be
+ * retried.
+ */
 export async function generateSessionTitle(ctx, prompt, signal) {
   const registry = ctx?.modelRegistry;
   const model = ctx?.model; // the model the person is already using: always present and authorized
@@ -147,7 +166,10 @@ export async function generateSessionTitle(ctx, prompt, signal) {
   } else {
     return null;
   }
-  if (!response || response.stopReason === "error" || response.stopReason === "aborted") return null;
+  debugLog("title reply", { model: model.id, stop: response?.stopReason, error: response?.errorMessage, content: response?.content });
+  if (!response || response.stopReason === "error" || response.stopReason === "aborted") {
+    throw new Error(response?.errorMessage || `title call ${response?.stopReason ?? "returned nothing"}`);
+  }
   return cleanSessionTitle(messageText(response.content));
 }
 
@@ -232,26 +254,44 @@ export default function ranchTasks(pi) {
   };
   const cwdOf = (ctx) => ctx?.cwd ?? process.cwd();
 
-  // Automatic session names: one attempt per session, cancelled on shutdown.
-  const titled = new Set();
+  // Automatic session names, cancelled on shutdown. A model answer (a title
+  // or SKIP) settles the session; a failed or timed-out call is retried on
+  // the next prompt, up to TITLE_MAX_TRIES calls per session.
+  const settled = new Set();
+  const tries = new Map();
+  const inFlight = new Set();
   let titleAbort = new AbortController();
   const autoName = (ctx, prompt) => {
     if (!autoNameEnabled()) return;
     const sid = sessionIdOf(ctx);
-    if (!sid || titled.has(sid)) return;
-    titled.add(sid);
-    if (pi.getSessionName?.()) return; // already named (/name, --name)
+    debugLog("autoName", { sid, settled: settled.has(sid), tries: tries.get(sid) ?? 0, name: pi.getSessionName?.() ?? null, model: ctx?.model?.id });
+    if (!sid || settled.has(sid) || inFlight.has(sid)) return;
+    if (pi.getSessionName?.()) { settled.add(sid); return; } // already named (/name, --name)
     const first = sessionSnapshot(ctx?.sessionManager).first_prompt || String(prompt ?? "");
-    if (first.trim().length < 12 || first.trim().startsWith("/")) return;
+    if (first.trim().length < 12 || first.trim().startsWith("/")) { settled.add(sid); return; }
+    const n = (tries.get(sid) ?? 0) + 1;
+    tries.set(sid, n);
+    if (n >= TITLE_MAX_TRIES) settled.add(sid);
+    inFlight.add(sid);
     const { signal } = titleAbort;
-    const timeout = new Promise((resolve) => setTimeout(() => resolve(null), TITLE_TIMEOUT_MS).unref?.());
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("title call timed out")), TITLE_TIMEOUT_MS);
+      timer.unref?.();
+    });
     Promise.race([generateSessionTitle(ctx, first, signal), timeout])
       .then((title) => {
+        settled.add(sid);
+        debugLog("title", { title, aborted: signal.aborted, sidNow: sessionIdOf(ctx), name: pi.getSessionName?.() ?? null });
         if (!title || signal.aborted) return;
         if (sessionIdOf(ctx) !== sid || pi.getSessionName?.()) return; // switched or named meanwhile
         pi.setSessionName(title);
       })
-      .catch(() => {});
+      .catch((err) => debugLog("title error", { try: n, error: String(err?.message ?? err) }))
+      .finally(() => {
+        clearTimeout(timer);
+        inFlight.delete(sid);
+      });
   };
 
   let pendingReminder = "";

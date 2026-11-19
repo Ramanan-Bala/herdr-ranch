@@ -310,8 +310,8 @@ test("generateSessionTitle asks the current model and cleans the reply", async (
   viaStream.modelRegistry.streamSimple = () => ({ result: async () => ({ stopReason: "length", content: [{ type: "thinking", thinking: "hmm" }] }) });
   assert.equal(await generateSessionTitle(viaStream, "x"), null);
 
-  ctx.modelRegistry.complete = async () => ({ stopReason: "error", content: [] });
-  assert.equal(await generateSessionTitle(ctx, "x"), null);
+  ctx.modelRegistry.complete = async () => ({ stopReason: "error", errorMessage: "overloaded", content: [] });
+  await assert.rejects(generateSessionTitle(ctx, "x"), /overloaded/); // failures reject so they can be retried
   ctx.modelRegistry.hasConfiguredAuth = () => false;
   assert.equal(await generateSessionTitle(ctx, "x"), null);
   assert.equal(await generateSessionTitle({}, "x"), null);
@@ -361,4 +361,49 @@ test("the extension leaves named sessions, short prompts and opted-out users alo
   assert.deepEqual(await run("/model something long enough"), []);
   process.env.RANCH_PI_AUTONAME = "0";
   assert.deepEqual(await run("fix the login redirect loop"), []);
+});
+
+test("a failed title call is retried on the next prompt, at most 3 calls", async (t) => {
+  withEnv(t, { HC_TERMINAL_ID: undefined, RANCH_PI_AUTONAME: undefined });
+  const { pi, handlers } = fakePi();
+  let name;
+  pi.getSessionName = () => name;
+  pi.setSessionName = (n) => { name = n; };
+  const replies = [
+    { stopReason: "error", errorMessage: "overloaded", content: [] },
+    { stopReason: "error", errorMessage: "overloaded", content: [] },
+    { stopReason: "stop", content: [{ type: "text", text: "Third Time Lucky" }] },
+  ];
+  let calls = 0;
+  const ctx = {
+    sessionManager: { getSessionId: () => "s1", getBranch: () => [] },
+    model: { provider: "p", id: "m" },
+    modelRegistry: { complete: async () => replies[calls++] },
+  };
+  ranchTasks(pi);
+  const prompt = async () => {
+    await handlers.before_agent_start[0]({ prompt: "fix the login redirect loop", systemPrompt: "" }, ctx);
+    await new Promise((r) => setTimeout(r, 20));
+  };
+  await prompt();
+  assert.equal(name, undefined);
+  await prompt();
+  assert.equal(name, undefined);
+  await prompt();
+  assert.equal(name, "Third Time Lucky");
+  await prompt();
+  assert.equal(calls, 3);
+
+  // a SKIP answer settles the session: no retry
+  const second = fakePi();
+  let skipCalls = 0;
+  second.pi.getSessionName = () => undefined;
+  second.pi.setSessionName = () => assert.fail("must not name");
+  ranchTasks(second.pi);
+  const skipCtx = { ...ctx, modelRegistry: { complete: async () => { skipCalls++; return { stopReason: "stop", content: [{ type: "text", text: "SKIP" }] }; } } };
+  for (let i = 0; i < 3; i++) {
+    await second.handlers.before_agent_start[0]({ prompt: "just testing this thing", systemPrompt: "" }, skipCtx);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal(skipCalls, 1);
 });
