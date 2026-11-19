@@ -50,6 +50,53 @@ export function todoSummary(todos) {
   return `Task list updated (${done}/${todos.length} done):\n${lines.join("\n")}`;
 }
 
+/** Plain text of a message's content (a string or text blocks). */
+function messageText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part) => part && part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n");
+}
+
+/**
+ * What Ranch shows for the current session, read from Pi's session manager:
+ * its name, the active branch's latest todo_write list and its first prompt.
+ * A field is left out when it can't be read, so the store keeps what it has.
+ */
+export function sessionSnapshot(sessionManager) {
+  const snapshot = {};
+  try {
+    if (typeof sessionManager?.getSessionName !== "function") throw new Error("no name API");
+    const name = sessionManager.getSessionName();
+    snapshot.session_name = typeof name === "string" && name.trim() ? name.trim() : null;
+  } catch {
+    // name unknown: leave it out
+  }
+  try {
+    const branch = sessionManager?.getBranch?.();
+    if (Array.isArray(branch)) {
+      let todos = [];
+      let first = "";
+      for (const entry of branch) {
+        const message = entry?.type === "message" ? entry.message : null;
+        if (!message) continue;
+        if (!first && message.role === "user") first = messageText(message.content).trim();
+        if (message.role === "toolResult" && message.toolName === "todo_write" && !message.isError &&
+          Array.isArray(message.details?.todos)) {
+          todos = message.details.todos;
+        }
+      }
+      snapshot.todos = normalizeTodos(todos);
+      if (first) snapshot.first_prompt = first.slice(0, 500);
+    }
+  } catch {
+    // branch unreadable: leave tasks as they are
+  }
+  return snapshot;
+}
+
 /** The todo_write tool definition (execute is added by the default export). */
 export const TODO_TOOL = {
   name: "todo_write",
@@ -160,8 +207,28 @@ export default function ranchTasks(pi) {
         session_id: sessionIdOf(ctx),
         source: event?.reason,
         cwd: cwdOf(ctx),
+        ...sessionSnapshot(ctx?.sessionManager),
       });
       pendingReminder = await sessionStart;
+    } catch {
+      // never disturb the agent
+    }
+  });
+
+  // /name, --name or pi.setSessionName(): the tab follows the session name.
+  pi.on("session_info_changed", (event, ctx) => {
+    try {
+      const name = typeof event?.name === "string" && event.name.trim() ? event.name.trim() : null;
+      send({ hook_event_name: "SessionSync", session_id: sessionIdOf(ctx), session_name: name });
+    } catch {
+      // never disturb the agent
+    }
+  });
+
+  // /tree moved to another branch: its own todo list applies.
+  pi.on("session_tree", (event, ctx) => {
+    try {
+      send({ hook_event_name: "SessionSync", session_id: sessionIdOf(ctx), ...sessionSnapshot(ctx?.sessionManager) });
     } catch {
       // never disturb the agent
     }

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import ranchTasks, { TODO_TOOL, normalizeTodos, ranchCommand, todoSummary, toolResponse } from "../adapters/pi-extension.js";
+import ranchTasks, { TODO_TOOL, normalizeTodos, ranchCommand, sessionSnapshot, todoSummary, toolResponse } from "../adapters/pi-extension.js";
 
 function withEnv(t, vars) {
   const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
@@ -188,4 +188,63 @@ test("without HC_TERMINAL_ID the tool is registered and nothing is spawned", { s
   handlers.session_shutdown[0]({ reason: "quit" }, ctx);
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(existsSync(log), false);
+});
+
+// ------------------------------------------------------------ sessionSnapshot
+
+const msg = (message) => ({ type: "message", message });
+const todoResult = (todos, isError = false) => msg({ role: "toolResult", toolName: "todo_write", details: { todos }, isError });
+
+test("sessionSnapshot reads the name, the branch's latest todo list and first prompt", () => {
+  const snap = sessionSnapshot({
+    getSessionName: () => " Auth refactor ",
+    getBranch: () => [
+      { type: "session_info", name: "x" },
+      msg({ role: "user", content: [{ type: "text", text: "fix the login loop" }] }),
+      todoResult([{ content: "old", status: "pending" }]),
+      msg({ role: "user", content: "later prompt" }),
+      todoResult([{ content: "a", status: "completed" }, { content: "b", status: "in_progress", activeForm: "Doing b" }]),
+      todoResult([{ content: "ignored", status: "pending" }], true),
+      msg({ role: "toolResult", toolName: "bash", details: { todos: [{ content: "no", status: "pending" }] } }),
+    ],
+  });
+  assert.deepEqual(snap, {
+    session_name: "Auth refactor",
+    todos: [{ content: "a", status: "completed" }, { content: "b", status: "in_progress", activeForm: "Doing b" }],
+    first_prompt: "fix the login loop",
+  });
+});
+
+test("sessionSnapshot: no name is null, no todo_write is an empty list, unreadable parts are left out", () => {
+  assert.deepEqual(sessionSnapshot({ getSessionName: () => undefined, getBranch: () => [] }), { session_name: null, todos: [] });
+  assert.deepEqual(sessionSnapshot({
+    getSessionName: () => { throw new Error("x"); },
+    getBranch: () => { throw new Error("x"); },
+  }), {});
+  assert.deepEqual(sessionSnapshot(undefined), {});
+});
+
+test("the extension sends the snapshot on start and SessionSync on rename and /tree", { skip: process.platform === "win32" ? "POSIX fake executable" : false }, async (t) => {
+  const { log } = fakeCliHome(t, "");
+  const { pi, handlers } = fakePi();
+  ranchTasks(pi);
+  let branch = [todoResult([{ content: "a", status: "pending" }])];
+  const ctx = {
+    sessionManager: { getSessionId: () => "ses-pi", getSessionName: () => "Named", getBranch: () => branch },
+    cwd: "/tmp/project",
+  };
+  await handlers.session_start[0]({ reason: "resume" }, ctx);
+  handlers.session_info_changed[0]({ name: " Renamed " }, ctx);
+  handlers.session_info_changed[0]({}, ctx);
+  branch = [];
+  handlers.session_tree[0]({ newLeafId: "x" }, ctx);
+
+  const payloads = (await waitForLines(log, 4)).map((line) => JSON.parse(line));
+  assert.deepEqual(payloads[0], {
+    hook_event_name: "SessionStart", session_id: "ses-pi", source: "resume", cwd: "/tmp/project",
+    session_name: "Named", todos: [{ content: "a", status: "pending" }],
+  });
+  assert.deepEqual(payloads[1], { hook_event_name: "SessionSync", session_id: "ses-pi", session_name: "Renamed" });
+  assert.deepEqual(payloads[2], { hook_event_name: "SessionSync", session_id: "ses-pi", session_name: null });
+  assert.deepEqual(payloads[3], { hook_event_name: "SessionSync", session_id: "ses-pi", session_name: "Named", todos: [] });
 });

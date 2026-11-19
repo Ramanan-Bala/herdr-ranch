@@ -1,11 +1,53 @@
 // Pi adapter: pure reducer over the normalized payloads the Ranch Pi extension (adapters/pi-extension.js) sends.
-// Pi exposes no session title here, so session.title stays null.
+// session.title is Pi's session name (/name, --name, pi.setSessionName()). The
+// extension sends a session snapshot (name, the branch's latest todo list, its
+// first prompt) on SessionStart and SessionSync (rename, /tree), so a resumed,
+// forked or re-branched session shows its own name and tasks.
 
 import { tasksFingerprint } from "../lib/tasks.js";
 import { detectCreatedPr } from "../lib/prs.js";
 
 const TASK_STATUS = new Set(["pending", "in_progress", "completed", "cancelled"]);
-const KNOWN_EVENTS = new Set(["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"]);
+const KNOWN_EVENTS = new Set(["SessionStart", "SessionSync", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"]);
+
+/** Store tasks from Pi todo_write todos (ids are list positions). */
+function tasksFromTodos(todos) {
+  return todos.flatMap((todo, i) => {
+    const title = typeof todo?.content === "string" ? todo.content.trim() : "";
+    if (!title) return [];
+    const activeForm = typeof todo.activeForm === "string" ? todo.activeForm.trim() : "";
+    return [{
+      id: String(i + 1),
+      title,
+      status: TASK_STATUS.has(todo.status) ? todo.status : "pending",
+      active_form: activeForm || null,
+    }];
+  });
+}
+
+/**
+ * Applies the extension's session snapshot. Each field is optional so older
+ * extensions (which send none) keep the previous behaviour:
+ * - session_name: string sets the title (a Pi name is user-chosen); null clears it.
+ * - todos: the branch's latest todo list; replaces the tasks (an empty array clears them).
+ * - first_prompt: the branch's first user message, used when none is recorded.
+ */
+function applySnapshot(next, payload) {
+  const session = ensureSession(next);
+  if (Object.prototype.hasOwnProperty.call(payload, "session_name")) {
+    const name = typeof payload.session_name === "string" ? payload.session_name.trim() : "";
+    session.title = name || null;
+    session.title_source = name ? "user" : null;
+  }
+  if (Array.isArray(payload.todos)) {
+    const before = tasksFingerprint(next.tasks);
+    next.tasks = tasksFromTodos(payload.todos);
+    if (tasksFingerprint(next.tasks) !== before) next.missed_turns = 0;
+  }
+  if (!session.first_prompt && typeof payload.first_prompt === "string" && payload.first_prompt.trim()) {
+    session.first_prompt = payload.first_prompt.slice(0, 500);
+  }
+}
 
 function ensureSession(store) {
   const base = store.session && typeof store.session === "object" ? store.session : {};
@@ -85,6 +127,12 @@ function applyPiCore(store, payload) {
       next.tasks = [];
       next.subagents = [];
     }
+    applySnapshot(next, payload);
+    return next;
+  }
+
+  if (event === "SessionSync") {
+    applySnapshot(next, payload);
     return next;
   }
 
@@ -104,17 +152,7 @@ function applyPiCore(store, payload) {
     const todos = payload.tool_name === "todo_write" ? payload.tool_input?.todos : null;
     if (Array.isArray(todos)) {
       // Replace tasks entirely from the todo list.
-      next.tasks = todos.flatMap((todo, i) => {
-        const title = typeof todo?.content === "string" ? todo.content.trim() : "";
-        if (!title) return [];
-        const activeForm = typeof todo.activeForm === "string" ? todo.activeForm.trim() : "";
-        return [{
-          id: String(i + 1),
-          title,
-          status: TASK_STATUS.has(todo.status) ? todo.status : "pending",
-          active_form: activeForm || null,
-        }];
-      });
+      next.tasks = tasksFromTodos(todos);
     }
     // A todo list that changed clears the missed-turn nudge (fixes 3.7);
     // any other tool means the turn did real work.

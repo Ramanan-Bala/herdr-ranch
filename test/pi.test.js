@@ -165,11 +165,62 @@ test("pi session id change without SessionStart starts fresh (I10)", () => {
   assert.deepEqual(store.subagents, []);
 });
 
+// ------------------------------------------------- session name & switches
+
+test("pi SessionStart takes the session name and the branch's todo list", () => {
+  const started = applyPi(emptyStore("t1", "pi"), {
+    hook_event_name: "SessionStart", session_id: "s1", source: "startup",
+    session_name: "Auth refactor", first_prompt: "fix login",
+    todos: [{ content: "A", status: "completed" }, { content: "B", status: "in_progress", activeForm: "Doing B" }],
+  });
+  assert.equal(started.session.title, "Auth refactor");
+  assert.equal(started.session.title_source, "user");
+  assert.equal(started.session.first_prompt, "fix login");
+  assert.deepEqual(started.tasks, [
+    { id: "1", title: "A", status: "completed", active_form: null },
+    { id: "2", title: "B", status: "in_progress", active_form: "Doing B" },
+  ]);
+});
+
+test("pi SessionStart resume of another session loads its name and tasks, not the old ones", () => {
+  const resumed = applyPi(base(), {
+    hook_event_name: "SessionStart", session_id: "other", source: "resume",
+    session_name: null, todos: [{ content: "Theirs", status: "pending" }],
+  });
+  assert.equal(resumed.session.id, "other");
+  assert.equal(resumed.session.title, null);
+  assert.equal(resumed.session.title_source, null);
+  assert.deepEqual(resumed.tasks.map((t) => t.title), ["Theirs"]);
+});
+
+test("pi SessionStart new with an empty snapshot is a clean slate", () => {
+  const fresh = applyPi(base(), { hook_event_name: "SessionStart", session_id: "n", source: "new", session_name: null, todos: [] });
+  assert.equal(fresh.session.title, null);
+  assert.deepEqual(fresh.tasks, []);
+});
+
+test("pi SessionSync renames, clears the name and re-loads tasks on /tree", () => {
+  let store = applyPi(base(), { hook_event_name: "SessionSync", session_id: "old", session_name: "New name" });
+  assert.equal(store.session.title, "New name");
+  assert.equal(store.session.title_source, "user");
+  assert.deepEqual(store.tasks, base().tasks); // a rename leaves tasks alone
+  assert.equal(store.session.activity, undefined); // no activity change
+
+  store = applyPi(store, { hook_event_name: "SessionSync", session_id: "old", session_name: null });
+  assert.equal(store.session.title, null);
+  assert.equal(store.session.title_source, null);
+
+  store = applyPi(store, { hook_event_name: "SessionSync", session_id: "old", todos: [{ content: "Branch B", status: "pending" }] });
+  assert.deepEqual(store.tasks.map((t) => t.title), ["Branch B"]);
+  assert.equal(store.missed_turns, 0);
+});
+
 test("piActivity maps the event names", () => {
   assert.equal(piActivity({ hook_event_name: "SessionStart" }), "idle");
   assert.equal(piActivity({ hook_event_name: "UserPromptSubmit" }), "working");
   assert.equal(piActivity({ hook_event_name: "PostToolUse" }), "working");
   assert.equal(piActivity({ hook_event_name: "Stop" }), "done");
   assert.equal(piActivity({ hook_event_name: "SessionEnd" }), "idle");
+  assert.equal(piActivity({ hook_event_name: "SessionSync" }), null);
   assert.equal(piActivity({ hook_event_name: "Other" }), null);
 });
