@@ -11,7 +11,8 @@ import {
 import {
   buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials,
   normalizeCollapsed, topOfFresh, cardRows, moveIndex, worktreeName, branchLine,
-  keptKey, spaceFolder, normalizeKept, refreshKept, forgetKept, applyKeptFolders,
+  keptKey, spaceFolder, spaceGitState, normalizeKept, refreshKept, forgetKept,
+  dormantFolders, applyKeptFolders,
 } from "./model.js";
 import { isViewerTab } from "./lib/file-viewer.js";
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent, closeNeedsConfirm, closeConfirmProps } from "./lib/format.js";
@@ -144,23 +145,26 @@ export default class RanchSidebar extends View {
     } catch {}
   }
 
-  /** Folders of this render's live spaces, for refreshKept: git top when the
-   * space's checkout is known, else its own folder. Linked worktrees are
-   * skipped (they are not kept on their own; only a main checkout is). */
-  liveKept(listed, panes) {
+  /** Folders of this render's live spaces, for refreshKept/dormantFolders: git
+   * top when the space's checkout is known, else its own folder. `git` is
+   * model.js spaceGitState, so a space whose git lookup is still unresolved is
+   * marked (it is matched against kept entries but not recorded yet), and a
+   * linked worktree is marked too (it is never kept on its own). */
+  liveKept(listed, panes, git = new Map()) {
     const out = [];
     for (const sp of listed) {
       const raw = spaceFolder(sp, panes);
       if (!raw) continue;
-      const co = this.checkoutBySpace.get(sp.id);
-      if (co?.linked) continue;
+      const state = git.get(sp.id) ?? null;
       out.push({
         machine: sp.machine ?? null,
-        folder: co?.top || raw,
+        folder: state?.top || raw,
         raw,
         name: sp.name || raw,
         named: !!sp.named,
         color: shared("space.colors")?.[sp.id] ?? null,
+        resolved: !!state?.resolved,
+        linked: !!state?.linked,
       });
     }
     return out;
@@ -736,6 +740,9 @@ export default class RanchSidebar extends View {
       .when(hovered, (el) => el
         .child(iconBtn("plus", "plus", "New terminal here", () => this.reopenDormant(e)))
         .child(iconBtn("spark", "sparkle", "Start agent here", () => {
+          // No props.space: space.new takes focus right after run returns
+          // (herdr.d.ts), so the dialog's fallback to the active space picks
+          // the one this just opened.
           this.reopenDormant(e);
           openOverlay({ mod: "ranch-launch", kind: "dialog", width: 520, height: 256 });
         })))
@@ -1381,13 +1388,20 @@ export default class RanchSidebar extends View {
     this.prQueue = jobs;
 
     // Remember the folders of the live spaces, then draw the ones with no live
-    // space as dormant rows. Written to localStorage only when it changed.
-    const keptLive = this.liveKept(listed, paneList);
-    const refreshed = refreshKept(this.kept, keptLive);
+    // space as dormant rows. A space is recorded only once its git state is
+    // settled (model.js spaceGitState): an unresolved one would be keyed by its
+    // raw folder and later, when the git top or a worktree link resolves, draw
+    // as a stale duplicate. Linked worktrees are never kept; a kept entry left
+    // from before its link was known is pruned. Written to localStorage only
+    // when it changed.
+    const live = this.liveKept(listed, paneList, spaceGitState(tree));
+    const refreshed = refreshKept(this.kept,
+      live.filter((l) => l.resolved && !l.linked), live.filter((l) => l.linked));
     this.kept = refreshed.list;
     if (refreshed.changed) this.saveKept();
-    const liveKeys = new Set(keptLive.map((e) => keptKey(e.machine, e.folder)));
-    const dormant = filter ? [] : this.kept.filter((e) => !liveKeys.has(keptKey(e.machine, e.folder)));
+    // A linked worktree is not "live" for its main checkout's kept entry: the
+    // main space may be closed and still deserves its dormant row.
+    const dormant = filter ? [] : dormantFolders(this.kept, live.filter((l) => !l.linked));
     const view = applyKeptFolders(tree, dormant);
 
     if (setAgentOrder) {

@@ -11,7 +11,7 @@ execFileSync("sh", [join(root, "scripts/sync-lib.sh")]);
 
 const {
   buildTree, nestWorktrees, BADGE_COLORS, initials, badgeColorIndex, diffSquares, worktreeName, branchLine,
-  keptKey, spaceFolder, normalizeKept, refreshKept, forgetKept, applyKeptFolders,
+  keptKey, spaceFolder, spaceGitState, normalizeKept, refreshKept, forgetKept, dormantFolders, applyKeptFolders,
 } = await import(pathToFileURL(join(root, "mods/ranch-sidebar/model.js")).href);
 
 const NOW = Date.parse("2026-11-11T10:00:00Z");
@@ -531,4 +531,157 @@ test("applyKeptFolders: no dormant entries keeps groups with empty kept arrays",
   const out = applyKeptFolders(tree, []);
   assert.deepEqual(out.groups[0].kept, []);
   assert.equal(out.showMachines, false);
+});
+
+// ---------------------------------------------------------------------------
+// Kept folders: git resolution, linked-worktree pruning and dormant matching
+
+const keptEntry = (folder, over = {}) => ({
+  machine: over.machine ?? null, folder, raw: over.raw ?? folder,
+  name: over.name ?? folder, named: over.named ?? false, color: over.color ?? null,
+});
+const liveEntry = (folder, over = {}) => ({
+  machine: over.machine ?? null, folder, raw: over.raw ?? folder,
+  name: over.name ?? folder, named: over.named ?? false, color: over.color ?? null,
+});
+
+const gitSpace = (id, cards, checkout = null) => ({ space: id, cards, settled: [], checkout });
+const gitCard = (cwd, top) => ({ tabId: `${cwd}/${top}`, cwd, top });
+
+/** A tree whose spaces carry `cwd`/`top` cards and a `checkout` summary. */
+const decorated = (spaces) => ({ groups: [{ machine: null, spaces }] });
+
+test("spaceGitState: unknown, non-repo and repo cards resolve differently", () => {
+  const git = spaceGitState(decorated([
+    gitSpace("repo", [gitCard("/repo", "/repo")], { top: "/repo", linked: false }),
+    gitSpace("pending", [gitCard("/repo", undefined)]),
+    gitSpace("plain", [gitCard("/plain", null)]),
+    gitSpace("linked", [gitCard("/wt", "/wt")], { top: "/wt", linked: true }),
+  ]));
+  assert.deepEqual(git.get("repo"), { resolved: true, linked: false, top: "/repo" });
+  assert.deepEqual(git.get("pending"), { resolved: false, linked: false, top: null });
+  assert.deepEqual(git.get("plain"), { resolved: true, linked: false, top: null });
+  assert.deepEqual(git.get("linked"), { resolved: true, linked: true, top: "/wt" });
+});
+
+test("spaceGitState: every folder card must be answered, settled ones included", () => {
+  const git = spaceGitState(decorated([
+    gitSpace("mixed", [gitCard("/repo", "/repo"), gitCard("/repo/sub", undefined)]),
+    { space: "settled", cards: [], settled: [gitCard("/repo", undefined)] },
+    { space: "settled-ok", cards: [gitCard("/repo", "/repo")], settled: [gitCard("/repo/sub", "/repo")] },
+    // No folder card (e.g. a viewer-only space): nothing to resolve it with.
+    gitSpace("empty", []),
+    gitSpace("no-cwd", [{ tabId: "t", cwd: null, top: undefined }]),
+  ]));
+  assert.equal(git.get("mixed").resolved, false);
+  assert.equal(git.get("settled").resolved, false);
+  assert.equal(git.get("settled-ok").resolved, true);
+  assert.equal(git.get("empty").resolved, false);
+  assert.equal(git.get("no-cwd").resolved, false);
+});
+
+test("spaceGitState: junk trees answer with no spaces", () => {
+  assert.equal(spaceGitState(null).size, 0);
+  assert.equal(spaceGitState({}).size, 0);
+  assert.equal(spaceGitState({ groups: [{}, { spaces: [{}] }] }).size, 1);
+});
+
+test("refreshKept: a live linked worktree prunes its stale entry", () => {
+  const kept = [keptEntry("/repo"), keptEntry("/wt")];
+  const { list, changed } = refreshKept(kept, [], [{ machine: null, folder: "/wt", raw: "/wt" }]);
+  assert.equal(changed, true);
+  assert.deepEqual(list.map((e) => e.folder), ["/repo"]);
+});
+
+test("refreshKept: exclude matches the raw too, and only on its own machine", () => {
+  const kept = [
+    keptEntry("/repo", { raw: "/repo/worktree" }),
+    keptEntry("/wt", { machine: "box" }),
+  ];
+  const { list, changed } = refreshKept(kept, [], [
+    { machine: null, folder: "/elsewhere", raw: "/repo/worktree" },
+    { machine: null, folder: "/wt", raw: "/wt" },
+  ]);
+  assert.equal(changed, true);
+  assert.deepEqual(list.map((e) => `${e.machine}|${e.folder}`), ["box|/wt"]);
+});
+
+test("refreshKept: no exclude leaves the list alone", () => {
+  const kept = [keptEntry("/repo")];
+  const { list, changed } = refreshKept(kept, []);
+  assert.equal(changed, false);
+  assert.deepEqual(list, [keptEntry("/repo")]);
+});
+
+test("kept pipeline: an unresolved worktree is not recorded, then its stale entry is pruned", () => {
+  const stale = [keptEntry("/wt")];
+  const run = (tree, kept) => {
+    const git = spaceGitState(tree);
+    const live = ["wt"].map((id) => {
+      const state = git.get(id);
+      return { machine: null, folder: state.top || "/wt", raw: "/wt", resolved: state.resolved, linked: state.linked };
+    });
+    const { list, changed } = refreshKept(kept,
+      live.filter((l) => l.resolved && !l.linked), live.filter((l) => l.linked));
+    return { list, changed, dormant: dormantFolders(list, live.filter((l) => !l.linked)) };
+  };
+  // First renders: the git lookup has not answered. The stale entry is live
+  // (same raw folder) and nothing new is recorded under the raw path.
+  const pending = run(decorated([gitSpace("wt", [gitCard("/wt", undefined)])]), stale);
+  assert.deepEqual(pending.list, stale);
+  assert.equal(pending.changed, false);
+  assert.deepEqual(pending.dormant, []);
+  // Once the link is known, the worktree is skipped and its entry pruned.
+  const known = run(decorated([gitSpace("wt", [gitCard("/wt", "/wt")], { top: "/wt", linked: true })]), stale);
+  assert.deepEqual(known.list, []);
+  assert.equal(known.changed, true);
+  assert.deepEqual(known.dormant, []);
+});
+
+test("refreshKept: a folded-away entry's keys do not capture a later live space", () => {
+  // The second entry recorded /repo/sub before resolving to /repo/sub2; one
+  // live space folds it into /repo, the next one must still get its own entry.
+  const kept = [keptEntry("/repo", { raw: "/repo/sub" }), keptEntry("/repo/sub2", { raw: "/repo/sub" })];
+  const { list } = refreshKept(kept, [
+    liveEntry("/repo", { raw: "/repo/sub" }),
+    liveEntry("/repo/sub2", { raw: "/repo/sub2" }),
+  ]);
+  assert.deepEqual(list.map((e) => e.folder), ["/repo", "/repo/sub2"]);
+});
+
+test("dormantFolders: live folder or raw matches keep the entry quiet", () => {
+  const kept = [keptEntry("/repo", { raw: "/repo/sub" })];
+  assert.deepEqual(dormantFolders(kept, [liveEntry("/repo", { raw: "/repo/sub" })]), []);
+  // The live space is unresolved: its folder is still the raw path.
+  assert.deepEqual(dormantFolders(kept, [liveEntry("/repo/sub")]), []);
+  // A live space resolved to the old raw folder is the same space too.
+  assert.deepEqual(dormantFolders(kept, [liveEntry("/repo/sub", { raw: "/other" })]), []);
+});
+
+test("dormantFolders: a live raw folder inside the kept folder counts as live", () => {
+  const kept = [keptEntry("/repo")];
+  assert.deepEqual(dormantFolders(kept, [liveEntry("/repo/sub/deep")]), []);
+  assert.deepEqual(dormantFolders(kept, [liveEntry("C:\\repo\\sub")]), [kept[0]]);
+  assert.deepEqual(dormantFolders([keptEntry("C:\\repo")], [liveEntry("C:\\repo\\sub")]), []);
+});
+
+test("dormantFolders: matching wants a path separator, not a name prefix", () => {
+  const kept = [keptEntry("/repo")];
+  assert.equal(dormantFolders(kept, [liveEntry("/repository")]).length, 1);
+  // Trailing separators do not change the folder.
+  assert.deepEqual(dormantFolders([keptEntry("/repo/")], [liveEntry("/repo/sub")]), []);
+});
+
+test("dormantFolders: entries only match live spaces on their own machine", () => {
+  const kept = [keptEntry("/repo", { machine: null }), keptEntry("/repo", { machine: "box" })];
+  const dormant = dormantFolders(kept, [liveEntry("/repo", { machine: "box" })]);
+  assert.deepEqual(dormant.map((e) => e.machine), [null]);
+});
+
+test("dormantFolders: unrelated and junk entries", () => {
+  const kept = [keptEntry("/a"), keptEntry("/b"), null, { folder: "" }, { folder: "/c" }];
+  const dormant = dormantFolders(kept, [liveEntry("/a")]);
+  assert.deepEqual(dormant.map((e) => e.folder), ["/b", "/c"]);
+  assert.deepEqual(dormantFolders([], [liveEntry("/a")]), []);
+  assert.deepEqual(dormantFolders(null, null), []);
 });
