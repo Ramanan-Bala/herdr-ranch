@@ -276,6 +276,7 @@ test("titlePrompt embeds the request", () => {
 test("generateSessionTitle asks the current model and cleans the reply", async () => {
   const calls = [];
   const ctx = {
+    sessionManager: { getSessionId: () => "ses-1" },
     model: { provider: "anthropic", id: "claude-opus-5-5" },
     modelRegistry: {
       getAvailable: () => [{ provider: "anthropic", id: "claude-haiku-4-5" }], // never picked
@@ -290,6 +291,7 @@ test("generateSessionTitle asks the current model and cleans the reply", async (
   assert.equal(calls[0].model.id, "claude-opus-5-5");
   assert.match(calls[0].context.messages[0].content[0].text, /make pi session names automatic/);
   assert.equal(calls[0].options.thinkingEnabled, false); // complete() fallback disables thinking
+  assert.equal(calls[0].options.sessionId, "ses-1"); // providers like opencode-go require it
 
   // streamSimple (preferred): no `reasoning` option, so thinking stays off
   const simple = [];
@@ -305,7 +307,7 @@ test("generateSessionTitle asks the current model and cleans the reply", async (
   };
   assert.equal(await generateSessionTitle(viaStream, "make pi session names automatic"), "Streamed Title");
   assert.equal(simple[0].reasoning, undefined);
-  assert.equal(simple[0].maxTokens, 200);
+  assert.equal(simple[0].maxTokens, 512);
   // a reply cut short while thinking has no text: no title
   viaStream.modelRegistry.streamSimple = () => ({ result: async () => ({ stopReason: "length", content: [{ type: "thinking", thinking: "hmm" }] }) });
   assert.equal(await generateSessionTitle(viaStream, "x"), null);

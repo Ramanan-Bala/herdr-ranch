@@ -5,7 +5,7 @@
 // Pi already reports working/idle/blocked to Herdr itself (OSC 7501), so this
 // extension never writes terminal escape codes.
 import { spawn } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -103,13 +103,13 @@ export function sessionSnapshot(sessionManager) {
 const TITLE_TIMEOUT_MS = 20000;
 const TITLE_MAX_TRIES = 3;
 
-/** RANCH_PI_DEBUG=1 appends auto-name steps to ~/.herdr/ranch/pi-debug.log. */
+/** Auto-name steps go to ~/.herdr/ranch/pi-debug.log when RANCH_PI_DEBUG=1 or the file exists. */
 function debugLog(...parts) {
-  if (!process.env.RANCH_PI_DEBUG) return;
   try {
-    const home = process.env.RANCH_HOME || homedir();
+    const file = join(process.env.RANCH_HOME || homedir(), ".herdr", "ranch", "pi-debug.log");
+    if (!process.env.RANCH_PI_DEBUG && !existsSync(file)) return;
     const line = parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ");
-    appendFileSync(join(home, ".herdr", "ranch", "pi-debug.log"), `${new Date().toISOString()} ${line}\n`);
+    appendFileSync(file, `${new Date().toISOString()} ${line}\n`);
   } catch {
     // debug only
   }
@@ -157,7 +157,16 @@ export async function generateSessionTitle(ctx, prompt, signal) {
   // Thinking off: a reasoning model would otherwise spend the small budget
   // thinking and stop ("length") before any text. streamSimple without
   // `reasoning` disables it provider-neutrally; complete() needs the flag.
-  const options = { maxTokens: 200, cacheRetention: "none", signal };
+  const options = { maxTokens: 512, cacheRetention: "none", signal }; // room for forced thinking
+  // Some providers route by session and reject calls without one (opencode-go:
+  // 400 MissingSessionID), so send the Pi session's id like Pi's own requests.
+  let sessionId = null;
+  try {
+    sessionId = ctx?.sessionManager?.getSessionId?.() ?? null;
+  } catch {
+    sessionId = null;
+  }
+  if (sessionId) options.sessionId = sessionId;
   let response;
   if (typeof registry.streamSimple === "function") {
     response = await registry.streamSimple(model, context, options).result();
@@ -317,6 +326,7 @@ export default function ranchTasks(pi) {
   });
 
   pi.on("session_start", async (event, ctx) => {
+    debugLog("session_start", { reason: event?.reason, sid: sessionIdOf(ctx), model: ctx?.model?.id });
     try {
       sessionStart = send({
         hook_event_name: "SessionStart",
