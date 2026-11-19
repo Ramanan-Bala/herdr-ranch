@@ -309,3 +309,46 @@ export function cardRows({ line3, pr, hasDiff, hasPr }) {
   const showPr = !!pr && !!hasPr;
   return { stats, pr: showPr, row: stats || showPr };
 }
+
+/** The last segment of a checkout top path ("a/b\\c" -> "c"), or null. */
+function topSegment(top) {
+  if (!top) return null;
+  const parts = String(top).split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : null;
+}
+
+/**
+ * The name a worktree header shows. The main checkout (`primary`) is named by
+ * its branch, or `detached @<head>` when its HEAD is detached; a linked
+ * worktree by the last segment of its checkout top (the folder name). Both
+ * fall back to `entry.name`, as does a missing checkout.
+ * @param {{name: string, checkout: object|null}} entry
+ * @param {boolean} primary
+ * @returns {string|null}
+ */
+export function worktreeName(entry, primary) {
+  const co = entry?.checkout ?? null;
+  if (!co) return entry?.name ?? null;
+  if (primary) {
+    if (co.detached) return `detached @${co.head ?? ""}`;
+    return co.branch ?? entry?.name ?? null;
+  }
+  return topSegment(co.top) ?? entry?.name ?? null;
+}
+
+/**
+ * The branch label a worktree header's second line shows, or null when there
+ * is nothing to add: no checkout, no branch, or the label would just repeat
+ * the header's own name (`worktreeName`).
+ * @param {string|null} name the header name (from `worktreeName`)
+ * @param {{branch?: string|null, detached?: boolean, head?: string|null}|null} checkout
+ * @returns {string|null}
+ */
+export function branchLine(name, checkout) {
+  if (!checkout) return null;
+  const label = checkout.detached
+    ? `detached @${checkout.head ?? ""}`
+    : checkout.branch ?? null;
+  if (!label || label === name) return null;
+  return label;
+}

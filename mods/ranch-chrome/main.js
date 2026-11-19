@@ -1,9 +1,9 @@
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { theme, run, props, window, shared, setShared, updates, layout, agents, spaces, panes, exec } from "herdr";
+import { theme, run, props, window, shared, setShared, updates, layout, agents, spaces, panes, machines, checking, exec } from "herdr";
 import { FILTER_KEY, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
-import { repoLabels } from "./lib/git.js";
 import { effectiveStatus } from "./lib/format.js";
+import { parsePs, sessionPids, sumUsage, parseLsofListen, sessionPorts, formatMemory } from "./lib/sysstats.js";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -53,54 +53,48 @@ function blockedTarget() {
   return null;
 }
 
-// The pane the active tab shows: its agent's pane, else the focused/first pane.
-function activePane() {
-  const space = spaces().find((s) => s.active);
-  const tab = space?.tabs.find((c) => c.active);
-  const tabPanes = tab ? panes().filter((p) => p.tab === tab.id) : [];
-  const pane = tabPanes.find((p) => p.program?.agent) ?? tabPanes.find((p) => p.focused) ?? tabPanes[0];
-  return { space, pane };
-}
-
-// How long a repo/worktree/branch lookup for one folder stays fresh.
-const REPO_TTL_MS = 15_000;
-
 export default class RanchChrome extends View {
-  init(p, cx) {
-    if (!p?.status) return;
-    // Status bar only: repo, worktree and branch of the active pane's folder,
-    // keyed by "machine|cwd". Render can't spawn, so a 1 s tick does the lookups.
-    this.repoInfo = new Map();
-    this.repoBusy = false;
-    cx.timer.every(1000, (cx) => this.pollRepo(cx));
+  init(_props, cx) {
+    // Herdr hands init() no props here; the block's props come from props().
+    if (!props()?.status) return;
+    // Status bar only: the processes inside Herdr sessions and what they use.
+    // Render can't spawn, so a 5 s tick does the ps/lsof lookups.
+    this.stats = null;
+    this.statsBusy = false;
+    if (!checking() && window()?.platform !== "windows") {
+      this.pollStats(cx);
+      cx.timer.every(5000, (cx) => this.pollStats(cx));
+    }
   }
 
-  pollRepo(cx) {
-    if (this.repoBusy) return;
-    const { space, pane } = activePane();
-    if (!pane?.cwd) return;
-    const machine = space?.machine ?? null;
-    const key = `${machine ?? ""}|${pane.cwd}`;
-    const hit = this.repoInfo.get(key);
-    if (hit && Date.now() - hit.at < REPO_TTL_MS) return;
-    this.repoBusy = true;
+  pollStats(cx) {
+    if (this.statsBusy) return;
+    this.statsBusy = true;
     cx.spawn(async (cx) => {
-      let info = { repo: null, worktree: null, branch: null };
       try {
-        const r = await exec("git", ["rev-parse", "--show-toplevel", "--path-format=absolute", "--git-common-dir", "--abbrev-ref", "HEAD"],
-          { cwd: pane.cwd, on: machine, timeout: 10_000 });
-        if (r.code === 0) {
-          const [top, common, head] = (r.stdout || "").split("\n").map((l) => l.trim());
-          if (top) info = { ...repoLabels(top, common || null), branch: head && head !== "HEAD" ? head : null };
+        let ps = null;
+        try {
+          ps = await exec("ps", ["-axo", "pid=,ppid=,rss=,pcpu=,comm="], { timeout: 5000 });
+        } catch {
+          ps = null;
         }
-      } catch {
-        // Unreachable machine or no git: show nothing for this folder until the TTL passes.
+        let lsof = null;
+        try {
+          lsof = await exec("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"], { timeout: 5000 });
+        } catch {
+          lsof = null;
+        }
+        // Without ps there is nothing to attribute; leave the last stats (or null).
+        if (!ps || ps.code !== 0) return;
+        const procs = parsePs(ps.stdout);
+        const pids = sessionPids(procs);
+        const usage = sumUsage(procs, pids);
+        const ports = lsof && lsof.code === 0 ? sessionPorts(parseLsofListen(lsof.stdout), pids) : null;
+        this.stats = { rssKB: usage.rssKB, cpu: usage.cpu, procs: usage.count, ports };
+        cx.notify();
       } finally {
-        this.repoBusy = false;
+        this.statsBusy = false;
       }
-      if (this.repoInfo.size > 64) this.repoInfo.clear();
-      this.repoInfo.set(key, { ...info, at: Date.now() });
-      cx.notify();
     });
   }
 
@@ -112,24 +106,46 @@ export default class RanchChrome extends View {
   render() {
     const t = theme();
     const collapsed = narrow();
-    // Bottom status bar, left end: repo, worktree, branch, machine of the active
-    // tab (each one optional in Ranch settings, statusbar.*).
+    // Bottom status bar, right end: the resource strip for the processes running
+    // inside Herdr sessions (each one optional in Ranch settings, statusbar.*).
     if (props()?.status) {
       const show = resolveSettings(shared(SETTINGS_KEY)).statusbar;
-      const { space, pane } = activePane();
-      const info = pane?.cwd ? this.repoInfo?.get(`${space?.machine ?? ""}|${pane.cwd}`) : null;
-      const branch = pane?.branch || info?.branch;
+      const stats = this.stats;
       const item = (id, icon, text, tip) => h_flex().id(id).gap(5).items_center().min_w(0).flex_shrink(1)
         .when(Boolean(tip), (el) => el.tooltip(tip))
         .child(svg(`mods/ranch-chrome/${icon}.svg`).size(12).flex_none().text_color(t.dim))
         .child(div().truncate().child(text));
-      const items = [
-        show.repo && info?.repo ? item("sb-repo", "folder", info.repo, "Repository") : null,
-        show.worktree && info?.worktree ? item("sb-worktree", "layers", info.worktree, "Worktree") : null,
-        show.branch && branch ? item("sb-branch", "git-branch", branch, "Branch") : null,
-        show.machine ? item("sb-machine", space?.machine ? "server" : "laptop", space?.machine ?? "This computer", "Machine") : null,
-      ].filter(Boolean);
-      return h_flex().size_full().min_w(0).px(12).gap(14).items_center().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8).text_color(t.muted)
+      const items = [];
+      if (show.memory && stats) {
+        items.push(item("sb-memory", "memory-stick", formatMemory(stats.rssKB), `Memory used by ${stats.procs} processes in Herdr sessions`));
+      }
+      if (show.cpu && stats) {
+        items.push(item("sb-cpu", "cpu", `${Math.round(stats.cpu)}%`, "CPU used by Herdr sessions (100% = one core)"));
+      }
+      if (show.terminals) {
+        const n = panes().filter((p) => p.terminal).length;
+        items.push(item("sb-terminals", "square-terminal", String(n), `${n} terminals · ${agents().length} agents`));
+      }
+      if (show.ports && stats?.ports) {
+        const ports = stats.ports;
+        const tip = ports.length
+          ? ports.slice(0, 8).map((p) => `:${p.port}  ${p.command}`).join("\n")
+            + (ports.length > 8 ? `\n…and ${ports.length - 8} more` : "")
+          : "No listening ports in Herdr sessions";
+        items.push(item("sb-ports", "plug", String(ports.length), tip));
+      }
+      if (show.hosts) {
+        const ms = machines();
+        const n = Math.max(ms.length, 1);
+        const bad = ms.some((m) => m.layout === "unavailable");
+        const tip = ms.map((m) => `${m.name ?? "This computer"} · ${m.layout === "ready" ? "online" : m.layout === "loading" ? "connecting" : "offline"}`).join("\n");
+        items.push(h_flex().id("sb-hosts").gap(5).items_center().min_w(0).flex_shrink(1)
+          .when(Boolean(tip), (el) => el.tooltip(tip))
+          .when(bad, (el) => el.child(div().size(5).flex_none().rounded_full().bg(t.dim)))
+          .child(svg("mods/ranch-chrome/server.svg").size(12).flex_none().text_color(t.dim))
+          .child(div().truncate().child(`${n} host${n === 1 ? "" : "s"}`)));
+      }
+      return h_flex().size_full().min_w(0).px(12).gap(14).items_center().justify_end().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8).text_color(t.muted)
         .children(items);
     }
     if (props()?.footer) {

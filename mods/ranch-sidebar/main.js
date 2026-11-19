@@ -9,8 +9,8 @@ import {
   openOverlay, theme, shared, setShared, nextCommand, window, home, readTextFile,
 } from "herdr";
 import {
-  buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials, diffSquares,
-  normalizeCollapsed, topOfFresh, cardRows, moveIndex,
+  buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials,
+  normalizeCollapsed, topOfFresh, cardRows, moveIndex, worktreeName, branchLine,
 } from "./model.js";
 import { isViewerTab } from "./lib/file-viewer.js";
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent, closeNeedsConfirm, closeConfirmProps } from "./lib/format.js";
@@ -498,19 +498,6 @@ export default class RanchSidebar extends View {
     return div().flex_none().size(inner).rounded(inner / 2).bg(t.dim);
   }
 
-  statusChip(c, settled) {
-    const t = theme();
-    if (!c.status) return null;
-    const time = this.settings.card.time && c.since !== null && c.since !== undefined
-      ? ` · ${formatDuration(c.since)}`
-      : "";
-    const word = STATUS_LABEL[c.status] ?? c.status;
-    return h_flex().id(`chip-${c.tabId}`).flex_none().items_center().gap(5).tooltip(word)
-      .child(this.ring(c.status, 10))
-      .when(Boolean(time), (e) => e.child(div().flex_none().text_size(10.5).text_color(settled ? t.dim : t.muted)
-        .child(time.replace(" · ", ""))));
-  }
-
   badge(count) {
     const t = theme();
     return h_flex().flex_none().items_center().gap(3)
@@ -522,18 +509,23 @@ export default class RanchSidebar extends View {
     const t = theme();
     const key = g.machine ?? "";
     const open = !this.collapsed.m[key];
+    const sessions = g.spaces.reduce((n, sp) => n + sp.cards.length + sp.settled.length, 0);
     // Machine icon in the space-badge column; chevron in the space-row chevron
     // column so every fold control lines up.
-    return h_flex().id(`machine-${key || "local"}`).h(30).flex_none().pl(10).pr(8).gap(8).items_center()
-      .when(first, (e) => e.mt(4))
-      .when(!first, (e) => e.mt(10).border_t(1).border_color(t.border).pt(1))
+    return h_flex().id(`machine-${key || "local"}`).h(30).mx(8).flex_none().pl(10).pr(8).gap(8).items_center()
+      .rounded(7).border(1).border_color(t.border)
+      .when(first, (e) => e.mt(6))
+      .when(!first, (e) => e.mt(14))
       .cursor_pointer().hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => this.toggleFold("m", key, cx))
       .child(div().flex_none().size(17).flex().items_center().justify_center()
         .child(svg(ICON(g.machine ? "server" : "laptop")).size(13).flex_none().text_color(t.muted)))
-      .child(div().flex_1().min_w(0).truncate().text_size(10.5).font_semibold().text_color(t.dim)
-        .child(g.label.toUpperCase()))
+      .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold().text_color(t.foreground)
+        .child(g.label))
+      .when(sessions > 0, (e) => e.child(div().flex_none().h(16).px(6).rounded_full()
+        .border(1).border_color(t.border).flex().items_center().justify_center()
+        .text_size(10).text_color(t.dim).child(String(sessions))))
       .when(g.state !== "ready", (e) => e.child(
         div().flex_none().text_size(10.5).text_color(t.dim)
           .child(g.state === "loading" ? "connecting…" : "offline")))
@@ -547,8 +539,6 @@ export default class RanchSidebar extends View {
             cx.write_to_clipboard(`hc machine login ${g.machine}`);
           })
           .child("Copy")))
-      .when(!open, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
-        .child(String(g.spaces.length))))
       .child(div().flex_none().size(16).flex().items_center().justify_center()
         .child(svg(ICON(open ? "chevron-down" : "chevron-right")).size(10).flex_none().text_color(t.dim)));
   }
@@ -582,22 +572,14 @@ export default class RanchSidebar extends View {
       .child(svg(ICON("sparkle")).size(11));
   }
 
-  /** The tinted initials badge a space row and its rail popover share. */
-  spaceBadge(sp) {
-    const { tint, fill } = this.spaceTint(sp);
-    return div().flex_none().size(17).rounded(4).flex().items_center().justify_center()
-      .bg(fill).text_size(8.5).font_bold().text_color(tint)
-      .child(initials(sp.name) || "·");
-  }
-
-  spaceRow(sp) {
+  spaceRow(sp, first = false) {
     const t = theme();
     const folded = !!this.collapsed.s[sp.space];
+    const hovered = this.hoveredSpace === sp.space;
     // Clicking the row folds it (like the machine header); the chevron is an
     // indicator only, aligned with the machine chevrons at the far right.
     const fold = div().flex_none().size(16).flex().items_center().justify_center()
       .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
-    const badge = this.spaceBadge(sp);
     const sessions = sp.cards.length;
     const tooltip = [
       sp.name,
@@ -613,10 +595,10 @@ export default class RanchSidebar extends View {
     const count = withWts
       ? withWts.reduce((n, x) => n + x.cards.length + x.settled.length, 0)
       : sp.cards.length + sp.settled.length;
-    return h_flex().id(`space-${sp.space}`).relative().h(28).mt(6).flex_none().pl(10).pr(8).gap(8).items_center()
+    return h_flex().id(`space-${sp.space}`).relative().h(28).flex_none().pl(12).pr(8).gap(8).items_center()
+      .when(first, (e) => e.mt(6))
+      .when(!first, (e) => e.mt(12))
       .cursor_pointer().hover((s) => s.bg(t.hover)).tooltip(tooltip)
-      .when(sp.active, (e) => e.child(
-        div().absolute().left(0).top(6).bottom(6).w(2).rounded(1).bg(t.accent)))
       .when(this.drag?.active && this.drag.id === sp.space, (e) => e.opacity(0.5))
       .when(Boolean(line), (e) => e.child(line))
       .on_hover((isIn, cx) => {
@@ -640,26 +622,30 @@ export default class RanchSidebar extends View {
         cx.stop_propagation();
         openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: sp.space } } });
       })
-      .child(badge)
-      .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_semibold()
-        .text_color(sp.active ? t.foreground : t.muted).child(sp.name))
-      // The checkout facts (branch, diff, PR) moved down to the main
-      // checkout's worktree row, first in the list of worktree rows.
-      .when(this.hoveredSpace === sp.space, (e) => e.child(this.plusBtn(sp.space)).child(this.sparkBtn(sp.space)))
+      .child(svg(ICON("folder")).size(14).flex_none().text_color(this.spaceTint(sp).tint))
+      .child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold()
+        .text_color(t.foreground).child(sp.name))
+      // The checkout facts (branch, diff, PR) live on the worktree blocks.
+      .when(hovered, (e) => e.child(this.plusBtn(sp.space)).child(this.sparkBtn(sp.space)))
       .when(Boolean(status), (e) => e.child(this.ring(status, 9)))
       .when(folded, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
         .child(String(count))))
-      .child(fold);
+      .when(hovered || folded, (e) => e.child(fold))
+      .when(!hovered && !folded, (e) => e.child(div().flex_none().size(16)));
   }
 
   /**
-   * A compact 24px row for one worktree. The main checkout's space entry is
-   * drawn through this too: pass `primary: true`, a `foldKey` distinct from
-   * any space id (ids and hover keys are keyed by foldKey) and the tree glyph.
+   * One checkout block: a compact header (status ring · name · "primary" pill
+   * and a branch line with diff stats + PR badges) followed by its session
+   * rows. The main checkout's space entry is drawn through this too: pass
+   * `primary: true` and a `foldKey` distinct from any space id (ids and hover
+   * keys are keyed by foldKey).
    */
-  worktreeRow(wt, { primary = false, foldKey = wt.space, tree = wt.tree } = {}) {
+  worktreeBlock(entry, { primary = false, foldKey = entry.space } = {}) {
     const t = theme();
     const folded = !!this.collapsed.w[foldKey];
+    const hovered = this.hoveredSpace === foldKey;
+    const name = worktreeName(entry, primary);
     const fold = div().id(`fold-${foldKey}`).flex_none().size(16).flex().items_center().justify_center()
       .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .tooltip(folded ? "Expand" : "Collapse")
@@ -669,19 +655,26 @@ export default class RanchSidebar extends View {
         this.toggleFold("w", foldKey, cx);
       })
       .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
-    const label = wt.checkout
-      ? (wt.checkout.detached ? `detached @${wt.checkout.head ?? ""}` : wt.checkout.branch ?? wt.name)
-      : wt.name;
-    const stat = wt.checkout?.stat ?? null;
+    const co = entry.checkout ?? null;
+    const branch = branchLine(name, co);
+    const stat = co?.stat ?? null;
     // Stats follow card.line3, PR badges card.pr alone (finding 19).
     const rows = cardRows({
       line3: this.settings.card.line3,
       pr: this.settings.card.pr,
       hasDiff: (stat?.files ?? 0) > 0,
-      hasPr: Boolean(wt.pr || wt.recorded?.length),
+      hasPr: Boolean(entry.pr || entry.recorded?.length),
     });
-    return h_flex().id(`worktree-${foldKey}`).h(24).mt(2).flex_none().pl(10).pr(8).gap(8).items_center()
-      .cursor_pointer().hover((s) => s.bg(t.hover))
+    const right = [];
+    if (rows.stats) {
+      right.push(div().flex_none().text_size(10.5).text_color(t.ansi2).child(`+${stat.add}`));
+      if (stat.del > 0) right.push(div().flex_none().text_size(10.5).text_color(t.ansi1).child(`\u2212${stat.del}`));
+    }
+    if (rows.pr && entry.pr) right.push(this.prBadge(`pr-wt-${foldKey}`, entry.pr));
+    if (rows.pr && entry.recorded?.length) right.push(
+      h_flex().flex_none().gap(3).children(this.recordedBadges(`rec-wt-${foldKey}`, entry.recorded)));
+    const head = h_flex().id(`worktree-head-${foldKey}`).flex_none().h(22).pl(10).pr(8).gap(8).items_center()
+      .cursor_pointer()
       .on_hover((isIn, cx) => {
         const next = isIn ? foldKey : null;
         if (this.hoveredSpace !== next) {
@@ -690,29 +683,50 @@ export default class RanchSidebar extends View {
         }
       })
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click(() => run("space.select", { id: wt.space }))
+      .on_click(() => run("space.select", { id: entry.space }))
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
-        openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: wt.space } } });
+        openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: entry.space } } });
       })
-      .tooltip([wt.name, wt.checkout?.top ?? null].filter(Boolean).join("\n"))
-      .child(div().flex_none().text_size(11).text_color(t.dim).child(tree))
-      .child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim))
-      .child(div().flex_1().min_w(0).truncate().text_size(11).font_semibold()
-        .text_color(wt.active ? t.foreground : t.muted).child(truncateMiddle(label, 28)))
-      .when(primary, (e) => e.child(div().flex_none().text_size(10).text_color(t.dim).child("primary")))
-      .when(rows.stats, (e) => e
-        .child(div().flex_none().text_size(10).text_color(t.ansi2).child(`+${stat.add}`))
-        .when(stat.del > 0, (el) => el.child(div().flex_none().text_size(10).text_color(t.ansi1).child(`\u2212${stat.del}`))))
-      .when(Boolean(rows.pr && wt.pr), (e) => e.child(this.prBadge(`pr-wt-${foldKey}`, wt.pr)))
-      .when(Boolean(rows.pr && wt.recorded?.length), (e) => e.child(
-        h_flex().flex_none().gap(3).children(this.recordedBadges(`rec-wt-${foldKey}`, wt.recorded))))
-      .when(this.hoveredSpace === foldKey, (e) => e.child(this.plusBtn(wt.space, foldKey)).child(this.sparkBtn(wt.space, foldKey)))
-      .when(folded && Boolean(wt.status), (e) => e.child(this.ring(wt.status, 9)))
-      .when(folded && wt.blocked > 0, (e) => e.child(div().flex_none().text_size(10).text_color(t.blocked).child("Needs you")))
-      .when(folded && !(wt.blocked > 0), (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
-        .child(String(wt.cards.length + wt.settled.length))))
-      .child(fold);
+      .tooltip([name, entry.checkout?.top ?? null].filter(Boolean).join("\n"))
+      .child(div().flex_none().w(14).flex().items_center().justify_center()
+        .when(Boolean(entry.status), (e) => e.child(this.ring(entry.status, 10))))
+      .child(div().min_w(0).truncate().text_size(12.5).font_medium()
+        .text_color(entry.active ? t.foreground : t.muted).child(truncateMiddle(name, 30)))
+      .when(primary, (e) => e.child(div().flex_none().h(16).px(5).rounded(4).flex().items_center()
+        .bg(t.selected).text_size(10).text_color(t.muted).child("primary")))
+      .child(div().flex_1())
+      // No branch line to carry them: diff stats and PR badges sit on line 1.
+      .when(!branch && right.length > 0, (e) => e.children(right))
+      .when(hovered, (e) => e.child(this.plusBtn(entry.space, foldKey)).child(this.sparkBtn(entry.space, foldKey)))
+      .when(folded && entry.blocked > 0, (e) => e.child(div().flex_none().text_size(10).text_color(t.blocked).child("Needs you")))
+      .when(folded && !(entry.blocked > 0), (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
+        .child(String(entry.cards.length + entry.settled.length))))
+      .when(hovered || folded, (e) => e.child(fold))
+      .when(!hovered && !folded, (e) => e.child(div().flex_none().size(16)));
+
+    const sub = branch
+      ? h_flex().flex_none().h(18).pl(32).pr(8).gap(6).items_center()
+        .when(Boolean(branch), (e) => e
+          .child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim))
+          .child(div().min_w(0).truncate().text_size(11).text_color(t.dim)
+            .child(truncateMiddle(branch, 30))))
+        .child(div().flex_1())
+        .children(right)
+      : null;
+
+    const body = [head, sub].filter(Boolean);
+    if (!folded) {
+      const grouped = (c) => Boolean(co) && c.top === co.top;
+      for (const c of entry.cards) {
+        body.push(this.sessionRow(c, { grouped: grouped(c) }));
+        this.order.push(c.tabId);
+      }
+    }
+    return v_flex().id(`worktree-${foldKey}`).flex_none().mx(6).mt(4).py(4).rounded(8).border(1)
+      .when(entry.active, (e) => e.bg(t.hover).border_color(t.border))
+      .when(!entry.active, (e) => e.border_color(t.chrome))
+      .children(body);
   }
 
   /** Tab name; an unnamed tab shows its agent's program name (like the top bar). */
@@ -790,116 +804,26 @@ export default class RanchSidebar extends View {
         .child(`#${pr.number}`));
   }
 
-  card(c, { settled = false, grouped = false, context = false } = {}) {
+  /**
+   * One 24px session row: status ring · agent logo · name · task progress and
+   * age (hover actions instead). Diff stats live on the worktree header now.
+   */
+  sessionRow(c, { settled = false, grouped = false, context = false } = {}) {
     const t = theme();
     const active = c.active && !settled;
     const hovered = this.hovered === c.tabId;
-    // Hover actions sit on line 1 (after the status chip); line 3 never swaps.
-    const acts = hovered ? this.cardActions(c) : [];
     const plain = !c.primaryAgent && !c.agentIcon?.agent;
-    const line1 = h_flex().flex_none().items_center().justify_between().gap(6)
-      .when(plain, (e) => e.child(svg(ICON("terminal")).size(12).flex_none().text_color(t.dim)))
-      .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold()
-        .text_color(settled ? t.dim : active ? t.foreground : t.muted)
-        .child(this.cardTitle(c)))
-      .when(c.status, (e) => e.child(this.statusChip(c, settled)))
-      .when(acts.length, (e) => e.child(
-        h_flex().flex_none().items_center().gap(2)
-          .children(acts.map((a) => this.actionBtn(c, a)))));
-
-    const branch = this.branchOf(c);
-    // Grouped under a checkout whose facts moved to the row above: line 2
-    // keeps the branch/folder segment only when it differs from the
-    // checkout's branch, and line 3 (diff stats + PR) is not drawn.
-    const co = this.checkoutBySpace.get(c.spaceId) ?? null;
-    const coBranch = co ? (co.detached ? `detached @${co.head ?? ""}` : co.branch ?? null) : null;
-    const showLoc = !grouped || branch !== coBranch;
     // Task progress from the primary agent's store (the namer's tick keeps it
-    // fresh): "done/total" on line 2, and the active task in the tooltip.
+    // fresh); the active task goes in the tooltip.
     const tasks = c.primaryAgent ? (this.namer.cachedStore(c.primaryAgent)?.tasks ?? []) : [];
     const prog = tasks.length ? progress(tasks) : null;
     const activeTask = tasks.find((task) => task.status === "in_progress") ?? null;
-    const parts2 = [];
-    // In the machine's Settled group the card names its space before the
-    // branch/folder, so you can tell where it lives.
-    const ctx = context && c.spaceName
-      ? div().flex_none().text_color(t.dim).child(`${truncateMiddle(c.spaceName, 14)} · `)
-      : null;
-    if (showLoc) {
-      if (branch) {
-        parts2.push(h_flex().flex_1().min_w(0).items_center().gap(4)
-          .child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim))
-          .when(Boolean(ctx), (e) => e.child(ctx))
-          .child(div().flex_1().min_w(0).truncate()
-            .text_color(settled ? t.dim : t.muted)
-            .child(truncateMiddle(branch, 28))));
-      } else if (c.cwd) {
-        parts2.push(h_flex().flex_1().min_w(0).items_center().gap(4)
-          .child(svg(ICON("folder")).size(10).flex_none().text_color(t.dim))
-          .when(Boolean(ctx), (e) => e.child(ctx))
-          .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(c.repo ?? c.cwd)));
-      }
-    }
-    const icon = c.agentIcon?.icon;
-    if (prog) {
-      // Task progress "done/total" sits just before the agent icon on line 2.
-      parts2.push(div().flex_none().text_size(10).text_color(t.dim)
-        .child(`${prog.done}/${prog.total}`));
-    }
-    if (icon) {
-      parts2.push(c.agentIcon.tint
-        ? svg(icon).size(14).flex_none().text_color(t.muted)
-        : image(icon).size(14).flex_none());
-    } else if (c.agentIcon?.agent) {
-      // Agents without an icon: two-letter badge, colour stable per agent id.
-      const color = t[BADGE_COLORS[badgeColorIndex(c.primaryAgent ?? c.agentIcon.name)]] ?? t.muted;
-      parts2.push(div().flex_none().size(14).rounded(7).flex().items_center().justify_center()
-        .bg(color).text_size(7).font_semibold().text_color(t.background)
-        .child(initials(c.agentIcon.name ?? c.primaryAgent) || "?"));
-    }
-    const line2 = parts2.length
-      ? h_flex().flex_none().items_center().justify_between().gap(6).children(parts2)
-      : null;
-
-    const parts3 = [];
-    // Diff statistics follow card.line3; PR badges follow card.pr alone, so
-    // they still show with line3 off (a compact badge-only row). Grouped and
-    // settled cards draw neither (layout, not a setting).
-    const line3Allowed = !settled && !grouped;
-    const rows3 = cardRows({
-      line3: this.settings.card.line3,
-      pr: this.settings.card.pr,
-      hasDiff: line3Allowed && (c.summary?.stat?.files ?? 0) > 0,
-      hasPr: line3Allowed && Boolean(c.pr || c.recorded?.length),
-    });
-    if (rows3.stats) {
-      const stat = c.summary?.stat ?? null;
-      if (stat && stat.files > 0) {
-        parts3.push(div().flex_none().text_size(10.5).text_color(t.muted)
-          .child(`${stat.files} ${stat.files === 1 ? "file" : "files"}`));
-        parts3.push(div().flex_none().text_size(10.5).text_color(t.ansi2).child(`+${stat.add}`));
-        if (stat.del) parts3.push(div().flex_none().text_size(10.5).text_color(t.ansi1).child(`\u2212${stat.del}`));
-        parts3.push(h_flex().flex_none().gap(2).children(
-          diffSquares(stat.add, stat.del).map((kind) =>
-            div().flex_none().size(6).rounded(2)
-              .bg(kind === "add" ? t.ansi2 : kind === "del" ? t.ansi1 : t.border))
-        ));
-      }
-    }
-    if (rows3.pr && c.pr) {
-      parts3.push(this.prBadge(`pr-${c.tabId}`, c.pr));
-    }
-    // Recorded PRs the agent opened (…), after the branch PR badge.
-    if (rows3.pr && c.recorded?.length) {
-      parts3.push(h_flex().flex_none().gap(3).children(this.recordedBadges(`rec-${c.tabId}`, c.recorded)));
-    }
-    // Line 3 renders only when there is something to show (diff stats, PR);
-    // the card's height follows, so there is no empty slot any more. Line 2
-    // likewise: a grouped card with nothing left on line 2 is 30px tall.
-    const line3 = parts3.length
-      ? h_flex().flex_none().h(16).items_center().gap(5).children([...parts3.slice(0, -1), div().flex_1(), parts3.at(-1)])
-      : null;
-
+    const branch = this.branchOf(c);
+    // Grouped under a checkout whose facts moved to the header above: the
+    // branch icon shows only when the session's branch differs from it.
+    const co = this.checkoutBySpace.get(c.spaceId) ?? null;
+    const coBranch = co ? (co.detached ? `detached @${co.head ?? ""}` : co.branch ?? null) : null;
+    const showLoc = Boolean(branch) && branch !== coBranch;
     const tip = [
       activeTask ? `Now: ${activeTask.active_form ?? activeTask.title}` : null,
       c.summary ? c.repo : c.cwd,
@@ -907,18 +831,31 @@ export default class RanchSidebar extends View {
       c.label,
     ].filter(Boolean).join("\n");
     const line = this.dropLine(c.tabId);
-
-    // Left bar = status: idle grey, working yellow, needs you red, done blue.
-    // An agent pane whose status report was cleared still counts as idle.
+    // Left slot = status: an agent whose status report was cleared reads idle.
     const agentKeys = (shared("ranch.knownAgents") ?? []).map((k) => k.key);
     const isAgent = c.agentIcon?.agent || agentKeys.includes(c.agentIcon?.key);
-    const barStatus = c.status ?? (isAgent ? "idle" : null);
-    const bar = { idle: t.muted, working: t.ansi3, blocked: t.ansi1, done: t.ansi4 }[barStatus] ?? null;
-    // my(3): a 6px gap between cards so each session reads as its own block.
-    return v_flex().id(`card-${c.tabId}`).relative().mx(6).my(3).h(parts3.length ? 58 : parts2.length ? 44 : 30).rounded(6).pl(10).pr(8).py(6).gap(3).justify_center().text_size(11)
+    const ring = c.status ? this.ring(c.status, 9) : isAgent ? this.ring("idle", 9) : null;
+    const icon = c.agentIcon?.icon;
+    const logo = plain
+      ? svg(ICON("terminal")).size(12).flex_none().text_color(t.dim)
+      : icon
+        ? c.agentIcon.tint
+          ? svg(icon).size(14).flex_none().text_color(t.muted)
+          : image(icon).size(14).flex_none()
+        : c.agentIcon?.agent
+          // Agents without an icon: two-letter badge, colour stable per agent id.
+          ? div().flex_none().size(14).rounded(7).flex().items_center().justify_center()
+            .bg(t[BADGE_COLORS[badgeColorIndex(c.primaryAgent ?? c.agentIcon.name)]] ?? t.muted)
+            .text_size(7).font_semibold().text_color(t.background)
+            .child(initials(c.agentIcon.name ?? c.primaryAgent) || "?")
+          : null;
+    const age = this.settings.card.time && c.since !== null && c.since !== undefined
+      ? formatDuration(c.since)
+      : "";
+    const acts = hovered ? this.cardActions(c) : [];
+    return h_flex().id(`card-${c.tabId}`).relative().h(24).mx(4).flex_none().pl(16).pr(8).gap(7).items_center()
+      .rounded(5).text_size(12)
       .when(active, (e) => e.bg(t.selected))
-      .when(Boolean(bar), (e) => e.child(
-        div().absolute().left(0).top(8).bottom(8).w(2).rounded(1).bg(bar)))
       .when(!active, (e) => e.hover((s) => s.bg(t.hover)))
       .when(this.highlight === c.tabId, (e) => e.border(1).border_color(t.accent))
       .cursor_pointer().tooltip(tip)
@@ -929,13 +866,13 @@ export default class RanchSidebar extends View {
           cx.notify();
         }
       })
-      // Only non-settled cards are drag sources/targets; settled cards keep
-      // their plain press behaviour.
+      // Only non-settled rows are drag sources/targets; settled rows keep their
+      // plain press behaviour.
+      .when(!settled && Boolean(line), (e) => e.child(line))
+      .when(!settled && this.drag?.active && this.drag.id === c.tabId, (e) => e.opacity(0.5))
       .when(!settled, (e) => e
-        .when(Boolean(line), (el) => el.child(line))
-        .when(this.drag?.active && this.drag.id === c.tabId, (el) => el.opacity(0.5))
         .on_mouse_down("left", (ev, ecx) => {
-          ecx.stop_propagation(); // as before the drag support: the press stays on this card
+          ecx.stop_propagation(); // as before the drag support: the press stays on this row
           this.dragStart("card", c.tabId, ev, { spaceId: c.spaceId });
         })
         .on_mouse_move((ev, ecx) => this.dragMove("card", c.tabId, c.spaceId === this.drag?.spaceId, ev, ecx))
@@ -949,7 +886,20 @@ export default class RanchSidebar extends View {
         cx.stop_propagation();
         openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: c.tabId, space: c.spaceId } } });
       })
-      .children([line1, line2, line3].filter(Boolean));
+      .child(div().flex_none().w(12).flex().items_center().justify_center()
+        .when(Boolean(ring), (e) => e.child(ring)))
+      .when(Boolean(logo), (e) => e.child(logo))
+      .when(context && c.spaceName, (e) => e.child(div().flex_none().text_color(t.dim)
+        .child(`${truncateMiddle(c.spaceName, 14)} · `)))
+      .child(div().flex_1().min_w(0).truncate()
+        .text_color(settled ? t.dim : active ? t.foreground : t.muted)
+        .child(this.cardTitle(c)))
+      .when(showLoc && Boolean(branch), (e) => e.child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim)))
+      .when(!hovered && Boolean(prog), (e) => e.child(div().flex_none().text_size(10.5).text_color(t.dim)
+        .child(`${prog.done}/${prog.total}`)))
+      .when(!hovered && Boolean(age), (e) => e.child(div().flex_none().text_size(10.5).text_color(t.dim).child(age)))
+      .when(hovered, (e) => e.child(h_flex().flex_none().items_center().gap(2)
+        .children(acts.map((a) => this.actionBtn(c, a)))));
   }
 
   /** One 18x18 icon button in a card's line-1 hover group. */
@@ -1245,7 +1195,7 @@ export default class RanchSidebar extends View {
         // the first card's git summary and the first matching PR.
         sp.checkout = all.find((c) => c.summary)?.summary ?? null;
         sp.pr = all.find((c) => c.pr && c.top === sp.checkout?.top)?.pr ?? null;
-        // The checkout row (worktreeRow) shows its recorded PRs too (…).
+        // The checkout block (worktreeBlock) shows its recorded PRs too (…).
         if (s.card.pr && sp.checkout?.top && sp.checkout.branch && !sp.checkout.detached) {
           const pk = `${g.machine ?? ""}|${sp.checkout.top}|${sp.checkout.branch}`;
           const branchPr = sp.pr ?? this.prCache.get(pk, now) ?? null;
@@ -1333,43 +1283,25 @@ export default class RanchSidebar extends View {
         // space, in display order (this space, its worktrees, next space…).
         const settledAll = [];
         for (const [si, e] of nestWorktrees(g.spaces, (sp) => sp.checkout).entries()) {
-          if (si > 0) {
-            rows.push(div().id(`space-sep-${e.space}`).flex_none().h(1).mx(10).mt(8).bg(t.border));
-          }
-          rows.push(this.spaceRow(e));
+          rows.push(this.spaceRow(e, si === 0));
           // Collected before any fold check: the Settled group lists them all,
           // even from folded spaces and worktrees.
           settledAll.push(...e.settled);
           for (const wt of e.worktrees) settledAll.push(...wt.settled);
           if (this.collapsed.s[e.space]) continue; // folded: hides its worktrees too
           if (!e.checkout) {
-            // Non-git space: its cards sit directly under the space row.
+            // Non-git space: its sessions sit directly under the space row.
             for (const c of e.cards) {
-              rows.push(this.card(c));
+              rows.push(this.sessionRow(c));
               this.order.push(c.tabId);
             }
             continue;
           }
-          // Git space: every checkout gets a worktree row — the main checkout
-          // first (tagged "primary"), then its linked worktrees.
-          const blocks = [{ entry: e, primary: true }, ...e.worktrees.map((entry) => ({ entry, primary: false }))];
-          blocks.forEach((b, i) => { b.tree = i === blocks.length - 1 ? "└─" : "├─"; });
-          for (const b of blocks) {
-            const foldKey = b.primary ? `main:${e.space}` : b.entry.space;
-            rows.push(this.worktreeRow(b.entry, { primary: b.primary, foldKey, tree: b.tree }));
-            if (this.collapsed.w[foldKey]) continue;
-            const checkout = b.entry.checkout;
-            const grouped = (c) => Boolean(checkout) && c.top === checkout.top;
-            const body = [];
-            for (const c of b.entry.cards) {
-              body.push(this.card(c, { grouped: grouped(c) }));
-              this.order.push(c.tabId);
-            }
-            // Cards indented under the tree glyph, with a 1px guide line.
-            if (body.length) {
-              rows.push(v_flex().id(`worktree-body-${foldKey}`).flex_none().ml(13)
-                .border_l(1).border_color(t.border).children(body));
-            }
+          // Git space: the main checkout's block first (tagged "primary"), then
+          // its linked worktrees, each with its own session rows.
+          rows.push(this.worktreeBlock(e, { primary: true, foldKey: `main:${e.space}` }));
+          for (const wt of e.worktrees) {
+            rows.push(this.worktreeBlock(wt, { primary: false, foldKey: wt.space }));
           }
         }
         if (settledAll.length) {
@@ -1378,7 +1310,7 @@ export default class RanchSidebar extends View {
             (cx) => this.toggleFold("settled", `m:${key}`, cx)));
           if (!folded) {
             for (const c of settledAll) {
-              rows.push(this.card(c, { settled: true, grouped: false, context: true }));
+              rows.push(this.sessionRow(c, { settled: true, context: true }));
               this.order.push(c.tabId);
             }
           }

@@ -374,10 +374,11 @@ export default class RanchSettings extends View {
 
   sectionStatus(t, s) {
     return this.section("statusbar", "Status bar", [
-      this.toggle("statusbar-repo", "Repository", s.statusbar.repo, "statusbar.repo"),
-      this.toggle("statusbar-worktree", "Worktree", s.statusbar.worktree, "statusbar.worktree"),
-      this.toggle("statusbar-branch", "Branch", s.statusbar.branch, "statusbar.branch"),
-      this.toggle("statusbar-machine", "Machine", s.statusbar.machine, "statusbar.machine"),
+      this.toggle("statusbar-memory", "Memory", s.statusbar.memory, "statusbar.memory"),
+      this.toggle("statusbar-cpu", "CPU", s.statusbar.cpu, "statusbar.cpu"),
+      this.toggle("statusbar-terminals", "Terminals", s.statusbar.terminals, "statusbar.terminals"),
+      this.toggle("statusbar-ports", "Listening ports", s.statusbar.ports, "statusbar.ports"),
+      this.toggle("statusbar-hosts", "Hosts", s.statusbar.hosts, "statusbar.hosts"),
       this.toggle("usage-show", "Agent usage", s.usage.show, "usage.show",
         (next) => run(next ? "layout.show" : "layout.hide", { id: "usage" })),
     ]);

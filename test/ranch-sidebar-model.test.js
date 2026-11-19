@@ -9,7 +9,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 // lib/ must be inside the mod folder before its imports resolve.
 execFileSync("sh", [join(root, "scripts/sync-lib.sh")]);
 
-const { buildTree, nestWorktrees, BADGE_COLORS, initials, badgeColorIndex, diffSquares } =
+const { buildTree, nestWorktrees, BADGE_COLORS, initials, badgeColorIndex, diffSquares, worktreeName, branchLine } =
   await import(pathToFileURL(join(root, "mods/ranch-sidebar/model.js")).href);
 
 const NOW = Date.parse("2026-11-11T10:00:00Z");
@@ -349,4 +349,48 @@ test("nestWorktrees: never mutates its inputs", () => {
   nestWorktrees(input, (sp) => (sp.space === "main" ? repo() : repo({ linked: true })));
   assert.equal(JSON.stringify(input), before);
   assert.equal(input[0].worktrees, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// worktreeName / branchLine
+
+const wt = (over = {}) => ({
+  name: over.name ?? "space-name",
+  checkout: over.checkout === undefined ? null : over.checkout,
+});
+
+test("worktreeName: primary uses the checkout branch", () => {
+  assert.equal(worktreeName(wt({ checkout: { branch: "feat/x" } }), true), "feat/x");
+});
+
+test("worktreeName: primary detached uses detached @head", () => {
+  assert.equal(worktreeName(wt({ checkout: { detached: true, head: "abc123" } }), true), "detached @abc123");
+});
+
+test("worktreeName: linked uses the last segment of checkout.top", () => {
+  assert.equal(worktreeName(wt({ checkout: { top: "/Users/me/Projects/ranch-wt-sidebar" } }), false), "ranch-wt-sidebar");
+  assert.equal(worktreeName(wt({ checkout: { top: "C:\\Users\\me\\ranch" } }), false), "ranch");
+});
+
+test("worktreeName: missing checkout falls back to entry.name", () => {
+  assert.equal(worktreeName(wt({ name: "solo" }), true), "solo");
+  assert.equal(worktreeName(wt({ name: "solo" }), false), "solo");
+  assert.equal(worktreeName({ name: "solo", checkout: undefined }, true), "solo");
+});
+
+test("branchLine: equal to the name is dropped", () => {
+  assert.equal(branchLine("feat", { branch: "feat" }), null);
+  assert.equal(branchLine("detached @abc", { detached: true, head: "abc" }), null);
+});
+
+test("branchLine: a different branch is the label", () => {
+  assert.equal(branchLine("ranch-wt-x", { branch: "feat/x" }), "feat/x");
+  assert.equal(branchLine("ranch-wt-x", { detached: true, head: "abc123" }), "detached @abc123");
+});
+
+test("branchLine: no checkout or no branch is null", () => {
+  assert.equal(branchLine("x", null), null);
+  assert.equal(branchLine("x", undefined), null);
+  assert.equal(branchLine("x", {}), null);
+  assert.equal(branchLine("x", { branch: null }), null);
 });

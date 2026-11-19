@@ -1,6 +1,6 @@
 {
   "id": "root",
-  "type": "row",
+  "type": "column",
   "titlebar": "none",
   "traffic_lights": [
     12,
@@ -11,180 +11,174 @@
     14,
     12
   ],
-  "divider": {
-    "width": 1,
-    "color": "border"
-  },
   "children": [
     {
-      "id": "sidebar",
-      "type": "column",
-      "size": {
-        "px": 268
-      },
-      "min": 44,
-      "max": 480,
-      "background": "chrome",
+      "id": "body",
+      "type": "row",
       "resizable": false,
+      "divider": {
+        "width": 1,
+        "color": "border"
+      },
       "children": [
         {
-          "id": "brand",
-          "type": "block",
+          "id": "sidebar",
+          "type": "column",
           "size": {
-            "px": 42
+            "px": 268
           },
-          "window_drag": true,
-          "content": {
-            "mod": "ranch-chrome"
-          }
-        },
-        {
-          "id": "tree",
-          "type": "block",
-          "content": {
-            "mod": "ranch-sidebar"
-          }
-        },
-        {
-          "id": "sidebar-footer",
-          "type": "block",
-          "size": {
-            "px": 28
-          },
-          "content": {
-            "mod": "ranch-chrome",
-            "props": {
-              "footer": true
+          "min": 44,
+          "max": 480,
+          "background": "chrome",
+          "resizable": false,
+          "children": [
+            {
+              "id": "brand",
+              "type": "block",
+              "size": {
+                "px": 42
+              },
+              "window_drag": true,
+              "content": {
+                "mod": "ranch-chrome"
+              }
+            },
+            {
+              "id": "tree",
+              "type": "block",
+              "content": {
+                "mod": "ranch-sidebar"
+              }
             }
-          }
+          ]
+        },
+        {
+          "id": "work",
+          "type": "column",
+          "resizable": false,
+          "children": [
+            {
+              "id": "tabs",
+              "type": "block",
+              "size": {
+                "px": 42
+              },
+              "window_drag": true,
+              "content": {
+                "mod": "ranch-topbar"
+              }
+            },
+            {
+              "id": "work-body",
+              "type": "row",
+              "gap": 0,
+              "children": [
+                {
+                  "id": "main",
+                  "type": "block",
+                  "content": {
+                    "tab": "active",
+                    "pane": {
+                      "gap": 1,
+                      "radius": 0,
+                      "background": "background",
+                      "lone": false
+                    }
+                  },
+                  "background": "border"
+                },
+                {
+                  "id": "panel",
+                  "type": "column",
+                  "hidden": true,
+                  "size": {
+                    "px": 360
+                  },
+                  "min": 280,
+                  "max": 640,
+                  "children": [
+                    {
+                      "id": "panel-body",
+                      "type": "stack",
+                      "active": "session",
+                      "children": [
+                        {
+                          "id": "session",
+                          "type": "block",
+                          "content": {
+                            "mod": "ranch-session"
+                          }
+                        },
+                        {
+                          "id": "files",
+                          "type": "block",
+                          "content": {
+                            "mod": "ranch-files"
+                          }
+                        },
+                        {
+                          "id": "changes",
+                          "type": "block",
+                          "content": {
+                            "mod": "ranch-changes"
+                          }
+                        },
+                        {
+                          "id": "settings",
+                          "type": "block",
+                          "content": {
+                            "mod": "ranch-settings"
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "divider": {
+                "width": 1,
+                "color": "border"
+              }
+            }
+          ]
         }
       ]
     },
     {
-      "id": "work",
-      "type": "column",
+      "id": "status-row",
+      "type": "row",
+      "size": {
+        "px": 28
+      },
       "resizable": false,
       "children": [
         {
-          "id": "tabs",
+          "id": "usage",
           "type": "block",
-          "size": {
-            "px": 42
-          },
-          "window_drag": true,
           "content": {
-            "mod": "ranch-topbar"
-          }
-        },
-        {
-          "id": "work-body",
-          "type": "row",
-          "gap": 0,
-          "children": [
-            {
-              "id": "main",
-              "type": "block",
-              "content": {
-                "tab": "active",
-                "pane": {
-                  "gap": 1,
-                  "radius": 0,
-                  "background": "background",
-                  "lone": false
-                }
-              },
-              "background": "border"
-            },
-            {
-              "id": "panel",
-              "type": "column",
-              "hidden": true,
-              "size": {
-                "px": 360
-              },
-              "min": 280,
-              "max": 640,
-              "children": [
-                {
-                  "id": "panel-body",
-                  "type": "stack",
-                  "active": "session",
-                  "children": [
-                    {
-                      "id": "session",
-                      "type": "block",
-                      "content": {
-                        "mod": "ranch-session"
-                      }
-                    },
-                    {
-                      "id": "files",
-                      "type": "block",
-                      "content": {
-                        "mod": "ranch-files"
-                      }
-                    },
-                    {
-                      "id": "changes",
-                      "type": "block",
-                      "content": {
-                        "mod": "ranch-changes"
-                      }
-                    },
-                    {
-                      "id": "settings",
-                      "type": "block",
-                      "content": {
-                        "mod": "ranch-settings"
-                      }
-                    }
-                  ]
-                }
-              ]
+            "mod": "ranch-usage",
+            "props": {
+              "align": "left",
+              "showRemaining": false
             }
-          ],
-          "divider": {
-            "width": 1,
-            "color": "border"
-          }
-        },
-        {
-          "id": "status-row",
-          "type": "row",
-          "size": {
-            "px": 28
           },
-          "resizable": false,
-          "children": [
-            {
-              "id": "status",
-              "type": "block",
-              "content": {
-                "mod": "ranch-chrome",
-                "props": {
-                  "status": true
-                }
-              },
-              "size": {
-                "weight": 1
-              }
-            },
-            {
-              "id": "usage",
-              "type": "block",
-              "content": {
-                "mod": "ranch-usage",
-                "props": {
-                  "align": "right",
-                  "showRemaining": false
-                }
-              },
-              "size": {
-                "weight": 1
-              },
-              "min": 130
+          "size": {
+            "weight": 1
+          },
+          "min": 130
+        },
+        {
+          "id": "status",
+          "type": "block",
+          "content": {
+            "mod": "ranch-chrome",
+            "props": {
+              "status": true
             }
-          ]
+          },
+          "size": {
+            "weight": 1
+          }
         }
       ]
     }
