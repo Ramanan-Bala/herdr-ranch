@@ -11,6 +11,8 @@ import {
 import {
   buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials,
   normalizeCollapsed, topOfFresh, cardRows, moveIndex, worktreeName, branchLine,
+  keptKey, spaceCwd, spaceGitState, liveSpaceFolder, normalizeKept, refreshKept, forgetKept,
+  dormantFolders, applyKeptFolders,
 } from "./model.js";
 import { isViewerTab } from "./lib/file-viewer.js";
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent, closeNeedsConfirm, closeConfirmProps } from "./lib/format.js";
@@ -27,11 +29,27 @@ import { TabNamer, ACTIVITY_KEY } from "./namer.js";
 
 const ICON = (name) => `mods/ranch-sidebar/${name}.svg`;
 const COLLAPSE_KEY = "collapsed";
+// Folders kept alive in the sidebar after their last session closes. Herdr
+// closes the space itself; this list is Ranch's own memory of it (model.js).
+const KEPT_KEY = "keptFolders";
 // The sidebar's share of the 4-gh budget (requirements §Performance: sidebar 3
 // + session 1); module-level so every copy of this view in the mod shares one
 // limit.
 const ghLimit = createLimiter(3);
 const GIT_META_TTL_MS = 600000;
+
+// The New-space dialog (mods/ranch-newspace), prefilled from the active space:
+// machine, folder, worktree and branch in one place. The three New space
+// buttons below all open it.
+function openNewSpace() {
+  const active = spaces().find((s) => s.active);
+  openOverlay({
+    mod: "ranch-newspace",
+    kind: "dialog",
+    width: 560,
+    props: { machine: active?.machine ?? null, folder: active?.folder ?? null },
+  });
+}
 
 export default class RanchSidebar extends View {
   init(_props, cx) {
@@ -59,6 +77,15 @@ export default class RanchSidebar extends View {
     // Folding: { m: {machineKey: bool}, s: {spaceId: bool}, w: {worktreeSpaceId: bool},
     // settled: {"m:<machineKey>": bool} } — old per-space settled keys may linger in storage; ignored.
     this.collapsed = this.loadCollapsed();
+    // Dormant folders (model.js refreshKept/normalizeKept): [{machine, folder,
+    // raw, name, named, color}], rendered as dimmed rows when no live space
+    // matches. Rebuilt from live spaces on every render, persisted on change.
+    this.kept = this.loadKept();
+    // Last good folder per space id. Herdr's SpaceInfo.folder is where the space
+    // was made, not where it is, and it is all a render sees once the last
+    // terminal ended; remembering the space's own folder keeps its identity
+    // across those degraded renders (model.js liveSpaceFolder).
+    this.spaceFolderById = new Map();
 
     // Git: repos `${machine}|${top}` -> {summary, at}; topOf `${machine}|${cwd}`
     // -> { top: string|null, at } (top null = no repository found at `at`).
@@ -120,6 +147,73 @@ export default class RanchSidebar extends View {
     } catch {
       return { m: {}, s: {}, w: {}, settled: {} };
     }
+  }
+
+  loadKept() {
+    try {
+      return normalizeKept(JSON.parse(localStorage.getItem(KEPT_KEY) ?? "[]"));
+    } catch {
+      return [];
+    }
+  }
+
+  saveKept() {
+    try {
+      localStorage.setItem(KEPT_KEY, JSON.stringify(this.kept));
+    } catch {}
+  }
+
+  /** Folders of this render's live spaces, for refreshKept/dormantFolders: git
+   * top when the space's checkout is known, else its own folder. `git` is
+   * model.js spaceGitState, so a space whose git lookup is still unresolved is
+   * marked (it is matched against kept entries but not recorded yet), and a
+   * linked worktree is marked too (it is never kept on its own). A space with
+   * no live terminal is `degraded`: its folder is where it was made (or home),
+   * so it only suppresses a kept row and never changes the list; its identity
+   * comes from the folder this view last saw it in. */
+  liveKept(listed, panes, git = new Map(), homeDir = home()) {
+    const out = [];
+    const seen = new Set();
+    for (const sp of listed) {
+      seen.add(sp.id);
+      const { folder: raw, degraded } = liveSpaceFolder({
+        cwd: spaceCwd(sp, panes),
+        remembered: this.spaceFolderById.get(sp.id) ?? null,
+        created: sp.folder ?? null,
+        home: homeDir,
+      });
+      if (!raw) continue;
+      if (!degraded) this.spaceFolderById.set(sp.id, raw);
+      const state = git.get(sp.id) ?? null;
+      out.push({
+        machine: sp.machine ?? null,
+        folder: state?.top || raw,
+        raw,
+        name: sp.name || raw,
+        named: !!sp.named,
+        color: shared("space.colors")?.[sp.id] ?? null,
+        resolved: !!state?.resolved,
+        linked: !!state?.linked,
+        degraded,
+      });
+    }
+    for (const id of this.spaceFolderById.keys()) {
+      if (!seen.has(id)) this.spaceFolderById.delete(id);
+    }
+    return out;
+  }
+
+  /** Reopen a dormant folder as a live space (row click, +, sparkle). */
+  reopenDormant(e) {
+    const args = { folder: e.folder, machine: e.machine ?? "", focus: true };
+    if (e.named && e.name) args.name = e.name;
+    run("space.new", args);
+  }
+
+  forgetDormant(e, cx) {
+    this.kept = forgetKept(this.kept, e.machine, e.folder);
+    this.saveKept();
+    cx.notify();
   }
 
   toggleFold(map, key, cx) {
@@ -635,6 +729,63 @@ export default class RanchSidebar extends View {
   }
 
   /**
+   * A dimmed row for a kept folder whose last session closed: the space row's
+   * shape and folder icon, but muted, no status ring, with a "No sessions"
+   * hint. Clicking it reopens the folder as a live space; on hover "+" opens a
+   * terminal there, sparkle opens the start-agent dialog, and "x" forgets it.
+   * No right-click: clicking is the only way back.
+   */
+  dormantRow(e, first = false) {
+    const t = theme();
+    const id = keptKey(e.machine, e.folder);
+    const hovered = this.hoveredSpace === id;
+    const { tint } = this.spaceTint({ space: id, color: e.color });
+    const iconBtn = (suffix, icon, tip, go) => div().id(`kept-${suffix}-${id}`)
+      .flex_none().size(16).flex().items_center().justify_center()
+      .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip(tip)
+      .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
+      .on_click((_ev, cx) => {
+        cx.stop_propagation();
+        go(cx);
+      })
+      .child(svg(ICON(icon)).size(11));
+    return h_flex().id(`kept-row-${id}`).h(28).flex_none().pl(12).pr(8).gap(8).items_center()
+      .when(first, (el) => el.mt(6))
+      .when(!first, (el) => el.mt(12))
+      .cursor_pointer().opacity(0.6).hover((s) => s.opacity(1).bg(t.hover))
+      .tooltip([e.name, e.folder, "No sessions"].filter(Boolean).join("\n"))
+      .on_hover((isIn, cx) => {
+        const next = isIn ? id : null;
+        if (this.hoveredSpace !== next) {
+          this.hoveredSpace = next;
+          cx.notify();
+        }
+      })
+      .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
+      .on_click((_ev, cx) => {
+        if (this.clickSuppressed()) return;
+        this.reopenDormant(e);
+      })
+      .child(svg(ICON("folder")).size(14).flex_none().text_color(tint))
+      .child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold()
+        .text_color(t.muted).child(e.name))
+      .when(hovered, (el) => el
+        .child(iconBtn("plus", "plus", "New terminal here", () => this.reopenDormant(e)))
+        .child(iconBtn("spark", "sparkle", "Start agent here", () => {
+          // No props.space: space.new takes focus right after run returns
+          // (herdr.d.ts), so the dialog's fallback to the active space picks
+          // the one this just opened.
+          this.reopenDormant(e);
+          openOverlay({ mod: "ranch-launch", kind: "dialog", width: 520, height: 256 });
+        })))
+      .when(!hovered, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim)
+        .child("No sessions")))
+      .when(hovered, (el) => el.child(iconBtn("forget", "x", "Forget this folder",
+        (cx) => this.forgetDormant(e, cx))));
+  }
+
+  /**
    * One checkout block: a compact header (status ring · name · "primary" pill
    * and a branch line with diff stats + PR badges) followed by its session
    * rows. The main checkout's space entry is drawn through this too: pass
@@ -748,7 +899,7 @@ export default class RanchSidebar extends View {
       .child(div().id("new-space").flex_none().size(22).rounded(5).flex().items_center().justify_center()
         .text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("New space")
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-        .on_click(() => run("space.new", {}))
+        .on_click(() => openNewSpace())
         .child(svg(ICON("folder-plus")).size(13)));
   }
 
@@ -1016,7 +1167,7 @@ export default class RanchSidebar extends View {
    * theme name) or its stable palette slot, plus a translucent fill of it. */
   spaceTint(sp) {
     const t = theme();
-    const custom = shared("space.colors")?.[sp.space];
+    const custom = sp.color ?? shared("space.colors")?.[sp.space];
     const resolved = typeof custom === "string" ? (custom.startsWith("#") ? custom : t[custom]) : null;
     const tint = resolved ?? t[BADGE_COLORS[badgeColorIndex(sp.space)]] ?? t.muted;
     const hex = /^#[0-9a-f]{6}$/i.test(tint);
@@ -1073,6 +1224,21 @@ export default class RanchSidebar extends View {
       .content(this.spacePopover(sp, machineLabel));
   }
 
+  /** A kept folder's dimmed tile in the rail: no status dot, no badge, muted;
+   * clicking it reopens the folder. */
+  railDormant(e) {
+    const id = keptKey(e.machine, e.folder);
+    const { tint, fill } = this.spaceTint({ space: id, color: e.color });
+    return h_flex().id(`rail-kept-${id}`).w_full().h(44).flex_none()
+      .items_center().justify_center().cursor_pointer().tooltip(`${e.name}\nNo sessions`)
+      .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
+      .on_click(() => this.reopenDormant(e))
+      .child(div().id(`rail-kept-tile-${id}`).size(34).flex_none().rounded(9)
+        .flex().items_center().justify_center().bg(fill).opacity(0.55)
+        .text_size(12).font_bold().text_color(tint)
+        .child(initials(e.name) || "·"));
+  }
+
   rail(tree) {
     const t = theme();
     const items = [];
@@ -1080,6 +1246,7 @@ export default class RanchSidebar extends View {
       // Machines split by a short rule; the popover names the machine.
       if (gi > 0) items.push(div().id(`rail-sep-${gi}`).flex_none().w(20).h(1).my(6).bg(t.border));
       for (const sp of g.spaces) items.push(this.railCell(sp, g.machine ? g.label : null));
+      for (const e of g.kept ?? []) items.push(this.railDormant(e));
     }
     const top = v_flex().id("rail-top").flex_none().items_center().gap(2).pt(8).pb(6)
       .child(this.railButton("rail-expand", "panel", "Expand sidebar", () => {
@@ -1092,7 +1259,7 @@ export default class RanchSidebar extends View {
       .border(1).border_dashed().border_color(t.border).text_color(t.dim)
       .hover((s) => s.border_color(t.muted).text_color(t.foreground))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click(() => run("space.new", {}))
+      .on_click(() => openNewSpace())
       .child(svg(ICON("plus")).size(14));
     return v_flex().id("rail").w_full().items_center()
       .child(top)
@@ -1117,7 +1284,7 @@ export default class RanchSidebar extends View {
       .child(div().text_size(12).text_color(t.dim).child("No spaces yet"))
       .child(div().id("new-space-empty").px(10).py(4).rounded(7).text_size(12).font_medium()
         .bg(t.solid).text_color(t.solid_foreground).cursor_pointer()
-        .on_click(() => run("space.new", {}))
+        .on_click(() => openNewSpace())
         .child("New space"));
   }
 
@@ -1240,11 +1407,12 @@ export default class RanchSidebar extends View {
       this.prCache = createTtlCache(s.refresh.prSec * 1000, { max: 500 });
     }
     const filter = shared(FILTER_KEY) ?? null;
+    const currentHome = home();
     // The file viewer tab lives only in the top bar (lib/file-viewer.js), not in this tree.
     const paneList = panes();
     const listed = spaces().map((sp) => ({ ...sp, tabs: (sp.tabs ?? []).filter((tb) => !isViewerTab(tb, paneList)) }));
     const tree = buildTree({
-      home: home(),
+      home: currentHome,
       machines: machines(), spaces: listed, agents: agents(), panes: paneList,
       filter, now: Date.now(),
     });
@@ -1252,6 +1420,26 @@ export default class RanchSidebar extends View {
     const jobs = this.decorate(tree, s, Date.now());
     this.scheduleGit(this.allCards(tree));
     this.prQueue = jobs;
+
+    // Remember the folders of the live spaces, then draw the ones with no live
+    // space as dormant rows. A space is recorded only once its git state is
+    // settled (model.js spaceGitState) and its own folder is known (not a
+    // degraded render between its last terminal ending and Herdr closing the
+    // space): an unresolved or degraded one would be keyed by a folder that a
+    // later render replaces with the git top (or, for a linked worktree, drop
+    // entirely). refreshKept is lossless: only Forget and a linked worktree's
+    // own entry ever leave the list. Written to localStorage only on change.
+    const live = this.liveKept(listed, paneList, spaceGitState(tree), currentHome);
+    const refreshed = refreshKept(this.kept,
+      live.filter((l) => l.resolved && !l.linked && !l.degraded),
+      live.filter((l) => l.linked));
+    this.kept = refreshed.list;
+    if (refreshed.changed) this.saveKept();
+    // A linked worktree is not "live" for its main checkout's kept entry: the
+    // main space may be closed and still deserves its dormant row. Home is
+    // never the folder a live raw path is merely inside of.
+    const dormant = filter ? [] : dormantFolders(this.kept, live.filter((l) => !l.linked), { home: currentHome });
+    const view = applyKeptFolders(tree, dormant);
 
     if (setAgentOrder) {
       const primary = [];
@@ -1265,17 +1453,17 @@ export default class RanchSidebar extends View {
     this.order = [];
     const rows = [];
     if (filter) rows.push(this.filterRow(filter));
-    if (spaces().length === 0 && !filter) {
+    if (spaces().length === 0 && !filter && !dormant.length) {
       rows.push(this.emptyState());
-    } else if (!tree.groups.length) {
+    } else if (!view.groups.length) {
       rows.push(div().id("no-match").flex_none().pl(14).pt(8).text_size(11).text_color(t.dim)
         .child("Nothing matches this filter"));
     } else if (narrow) {
-      rows.push(this.rail(tree));
+      rows.push(this.rail(view));
     } else {
-      for (const [i, g] of tree.groups.entries()) {
+      for (const [i, g] of view.groups.entries()) {
         const key = g.machine ?? "";
-        if (tree.showMachines) {
+        if (view.showMachines) {
           rows.push(this.machineHeader(g, i === 0));
           if (this.collapsed.m[key]) continue;
         }
@@ -1303,6 +1491,11 @@ export default class RanchSidebar extends View {
           for (const wt of e.worktrees) {
             rows.push(this.worktreeBlock(wt, { primary: false, foldKey: wt.space }));
           }
+        }
+        // Kept folders with no live space sit at the end of their machine
+        // group, before the machine's Settled section.
+        for (const [ki, e] of (g.kept ?? []).entries()) {
+          rows.push(this.dormantRow(e, g.spaces.length === 0 && ki === 0));
         }
         if (settledAll.length) {
           const folded = !!this.collapsed.settled[`m:${key}`];
