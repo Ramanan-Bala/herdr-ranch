@@ -5,7 +5,10 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import ranchTasks, { TODO_TOOL, normalizeTodos, ranchCommand, sessionSnapshot, todoSummary, toolResponse } from "../adapters/pi-extension.js";
+import ranchTasks, {
+  TODO_TOOL, autoNameEnabled, cleanSessionTitle, generateSessionTitle, normalizeTodos, pickTitleModel, ranchCommand,
+  sessionSnapshot, titlePrompt, todoSummary, toolResponse,
+} from "../adapters/pi-extension.js";
 
 function withEnv(t, vars) {
   const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
@@ -247,4 +250,111 @@ test("the extension sends the snapshot on start and SessionSync on rename and /t
   assert.deepEqual(payloads[1], { hook_event_name: "SessionSync", session_id: "ses-pi", session_name: "Renamed" });
   assert.deepEqual(payloads[2], { hook_event_name: "SessionSync", session_id: "ses-pi", session_name: null });
   assert.deepEqual(payloads[3], { hook_event_name: "SessionSync", session_id: "ses-pi", session_name: "Named", todos: [] });
+});
+
+// ------------------------------------------------------- automatic session name
+
+test("autoNameEnabled is on unless RANCH_PI_AUTONAME turns it off", () => {
+  assert.equal(autoNameEnabled({}), true);
+  assert.equal(autoNameEnabled({ RANCH_PI_AUTONAME: "1" }), true);
+  for (const v of ["0", "false", "OFF", "no"]) assert.equal(autoNameEnabled({ RANCH_PI_AUTONAME: v }), false);
+});
+
+test("pickTitleModel prefers the newest small model of the current provider", () => {
+  const current = { provider: "anthropic", id: "claude-opus-5-5" };
+  const registry = { getAvailable: () => [
+    { provider: "openai", id: "gpt-5-mini" },
+    { provider: "anthropic", id: "claude-3-haiku" },
+    { provider: "anthropic", id: "claude-haiku-4-5" },
+    current,
+  ] };
+  assert.equal(pickTitleModel(registry, current).id, "claude-haiku-4-5");
+  const google = { provider: "google", id: "gemini-2.5-pro" };
+  assert.equal(pickTitleModel({ getAvailable: () => [google, { provider: "google", id: "gemini-2.5-flash" }] }, google).id, "gemini-2.5-flash");
+  assert.equal(pickTitleModel({ getAvailable: () => [google] }, google), google); // "gemini" is not "mini"
+  assert.equal(pickTitleModel({ getAvailable: () => { throw new Error("x"); } }, current), current);
+  assert.equal(pickTitleModel({}, null), null);
+});
+
+test("cleanSessionTitle keeps one short line and drops labels, quotes and SKIP", () => {
+  assert.equal(cleanSessionTitle('"Fix Login Redirect Loop."'), "Fix Login Redirect Loop");
+  assert.equal(cleanSessionTitle("Title: Pi Session Names\nextra"), "Pi Session Names");
+  assert.equal(cleanSessionTitle("**Auth Refactor**"), "Auth Refactor");
+  assert.equal(cleanSessionTitle("SKIP"), null);
+  assert.equal(cleanSessionTitle("  "), null);
+  assert.ok(cleanSessionTitle("word ".repeat(30)).length <= 60);
+});
+
+test("titlePrompt embeds the request", () => {
+  assert.match(titlePrompt("fix the login loop"), /<request>\nfix the login loop\n<\/request>/);
+});
+
+test("generateSessionTitle asks the small model and cleans the reply", async () => {
+  const calls = [];
+  const ctx = {
+    model: { provider: "anthropic", id: "claude-opus-5-5" },
+    modelRegistry: {
+      getAvailable: () => [{ provider: "anthropic", id: "claude-haiku-4-5" }],
+      hasConfiguredAuth: () => true,
+      complete: async (model, context, options) => {
+        calls.push({ model, context, options });
+        return { stopReason: "stop", content: [{ type: "text", text: "Pi Session Auto Names" }] };
+      },
+    },
+  };
+  assert.equal(await generateSessionTitle(ctx, "make pi session names automatic"), "Pi Session Auto Names");
+  assert.equal(calls[0].model.id, "claude-haiku-4-5");
+  assert.match(calls[0].context.messages[0].content[0].text, /make pi session names automatic/);
+
+  ctx.modelRegistry.complete = async () => ({ stopReason: "error", content: [] });
+  assert.equal(await generateSessionTitle(ctx, "x"), null);
+  ctx.modelRegistry.hasConfiguredAuth = () => false;
+  assert.equal(await generateSessionTitle(ctx, "x"), null);
+  assert.equal(await generateSessionTitle({}, "x"), null);
+});
+
+test("the extension names an unnamed session once from its first prompt", async (t) => {
+  withEnv(t, { HC_TERMINAL_ID: undefined, RANCH_PI_AUTONAME: undefined });
+  const { pi, handlers } = fakePi();
+  let name;
+  const named = [];
+  pi.getSessionName = () => name;
+  pi.setSessionName = (n) => { name = n; named.push(n); };
+  let calls = 0;
+  const ctx = {
+    sessionManager: { getSessionId: () => "s1", getBranch: () => [] },
+    model: { provider: "anthropic", id: "claude-haiku-4-5" },
+    modelRegistry: { complete: async () => { calls++; return { stopReason: "stop", content: [{ type: "text", text: "Fix Login Loop" }] }; } },
+  };
+  ranchTasks(pi);
+  await handlers.before_agent_start[0]({ prompt: "fix the login redirect loop", systemPrompt: "" }, ctx);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(named, ["Fix Login Loop"]);
+  await handlers.before_agent_start[0]({ prompt: "and another thing please", systemPrompt: "" }, ctx);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(calls, 1); // once per session
+});
+
+test("the extension leaves named sessions, short prompts and opted-out users alone", async (t) => {
+  withEnv(t, { HC_TERMINAL_ID: undefined, RANCH_PI_AUTONAME: undefined });
+  const run = async (prompt, { name, sid = "s1" } = {}) => {
+    const { pi, handlers } = fakePi();
+    const named = [];
+    pi.getSessionName = () => name;
+    pi.setSessionName = (n) => named.push(n);
+    const ctx = {
+      sessionManager: { getSessionId: () => sid, getBranch: () => [] },
+      model: { provider: "p", id: "m" },
+      modelRegistry: { complete: async () => ({ stopReason: "stop", content: [{ type: "text", text: "Some Title" }] }) },
+    };
+    ranchTasks(pi);
+    await handlers.before_agent_start[0]({ prompt, systemPrompt: "" }, ctx);
+    await new Promise((r) => setTimeout(r, 20));
+    return named;
+  };
+  assert.deepEqual(await run("fix the login redirect loop", { name: "Mine" }), []);
+  assert.deepEqual(await run("hi"), []);
+  assert.deepEqual(await run("/model something long enough"), []);
+  process.env.RANCH_PI_AUTONAME = "0";
+  assert.deepEqual(await run("fix the login redirect loop"), []);
 });

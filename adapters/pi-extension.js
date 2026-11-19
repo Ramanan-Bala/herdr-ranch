@@ -97,6 +97,72 @@ export function sessionSnapshot(sessionManager) {
   return snapshot;
 }
 
+// ------------------------------------------------------------ auto session name
+
+const TITLE_TIMEOUT_MS = 20000;
+const SMALL_MODEL = [/haiku/i, /flash-lite/i, /\bmini\b|-mini/i, /nano/i, /flash/i, /\bsmall\b|-small/i, /\blite\b|-lite/i];
+
+/** True unless RANCH_PI_AUTONAME turns automatic session names off. */
+export function autoNameEnabled(env = process.env) {
+  return !/^(0|false|off|no)$/i.test(String(env.RANCH_PI_AUTONAME ?? "").trim());
+}
+
+/** A cheap model from the current provider for titles, else the current model. */
+export function pickTitleModel(registry, current) {
+  if (!current) return null;
+  let available = [];
+  try {
+    available = registry?.getAvailable?.() ?? [];
+  } catch {
+    available = [];
+  }
+  const sameProvider = available.filter((m) => m && m.provider === current.provider && typeof m.id === "string");
+  for (const pattern of SMALL_MODEL) {
+    // Newest-looking id first (claude-haiku-4-5 over claude-3-haiku).
+    const found = sameProvider.filter((m) => pattern.test(m.id))
+      .sort((a, b) => b.id.localeCompare(a.id, undefined, { numeric: true }));
+    if (found.length) return found[0];
+  }
+  return current;
+}
+
+/** The model's raw reply cleaned to a short session title, or null. */
+export function cleanSessionTitle(raw) {
+  let text = String(raw ?? "").split("\n").map((l) => l.trim()).find(Boolean) ?? "";
+  text = text.replace(/^(session\s+)?(title|name)\s*:\s*/i, "").replace(/^["'`*#\s]+|["'`*.\s]+$/g, "").replace(/\s+/g, " ");
+  if (!text || /^(skip|none|n\/a)$/i.test(text)) return null;
+  if (text.length > 60) text = text.slice(0, 60).replace(/\s+\S*$/, "");
+  return text || null;
+}
+
+/** The instruction sent with the first prompt. */
+export function titlePrompt(prompt) {
+  return [
+    "Name this coding-agent session from the user's first request.",
+    "Reply with ONLY a 2-5 word title in Title Case: no quotes, no punctuation at the end.",
+    "If the request has no clear task (a greeting, a test message), reply SKIP.",
+    "",
+    "<request>",
+    String(prompt).slice(0, 2000),
+    "</request>",
+  ].join("\n");
+}
+
+/** Asks a model for a title for `prompt`; resolves to the title or null. */
+export async function generateSessionTitle(ctx, prompt, signal) {
+  const registry = ctx?.modelRegistry;
+  const model = pickTitleModel(registry, ctx?.model);
+  if (!model || typeof registry?.complete !== "function") return null;
+  if (typeof registry.hasConfiguredAuth === "function" && !registry.hasConfiguredAuth(model)) return null;
+  const response = await registry.complete(
+    model,
+    { messages: [{ role: "user", content: [{ type: "text", text: titlePrompt(prompt) }], timestamp: Date.now() }] },
+    { maxTokens: 40, cacheRetention: "none", signal },
+  );
+  if (!response || response.stopReason === "error" || response.stopReason === "aborted") return null;
+  return cleanSessionTitle(messageText(response.content));
+}
+
 /** The todo_write tool definition (execute is added by the default export). */
 export const TODO_TOOL = {
   name: "todo_write",
@@ -178,6 +244,28 @@ export default function ranchTasks(pi) {
   };
   const cwdOf = (ctx) => ctx?.cwd ?? process.cwd();
 
+  // Automatic session names: one attempt per session, cancelled on shutdown.
+  const titled = new Set();
+  let titleAbort = new AbortController();
+  const autoName = (ctx, prompt) => {
+    if (!autoNameEnabled()) return;
+    const sid = sessionIdOf(ctx);
+    if (!sid || titled.has(sid)) return;
+    titled.add(sid);
+    if (pi.getSessionName?.()) return; // already named (/name, --name)
+    const first = sessionSnapshot(ctx?.sessionManager).first_prompt || String(prompt ?? "");
+    if (first.trim().length < 12 || first.trim().startsWith("/")) return;
+    const { signal } = titleAbort;
+    const timeout = new Promise((resolve) => setTimeout(() => resolve(null), TITLE_TIMEOUT_MS).unref?.());
+    Promise.race([generateSessionTitle(ctx, first, signal), timeout])
+      .then((title) => {
+        if (!title || signal.aborted) return;
+        if (sessionIdOf(ctx) !== sid || pi.getSessionName?.()) return; // switched or named meanwhile
+        pi.setSessionName(title);
+      })
+      .catch(() => {});
+  };
+
   let pendingReminder = "";
   let sessionStart = Promise.resolve("");
   // One promise chain, so payloads reach the CLI in event order.
@@ -240,6 +328,11 @@ export default function ranchTasks(pi) {
       await sessionStart;
       const reminder = pendingReminder;
       pendingReminder = "";
+      try {
+        autoName(ctx, event?.prompt);
+      } catch {
+        // naming is best effort
+      }
       const prompt = await send({
         hook_event_name: "UserPromptSubmit",
         session_id: sessionIdOf(ctx),
@@ -280,6 +373,8 @@ export default function ranchTasks(pi) {
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
+    titleAbort.abort();
+    titleAbort = new AbortController();
     try {
       // Awaited: on quit Pi exits right after its handlers settle, which
       // would otherwise kill the send (and anything still queued) mid-flight.
