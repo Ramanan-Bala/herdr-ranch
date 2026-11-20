@@ -19,7 +19,7 @@ const tasksCmd = (dir, args, machine) => tasksCommand(dir, args, machine ? looks
 const UPDATE_KEY = "ranch.update.byMachine"; // { [machine or ""]: { upd, checkedAt } }
 const UPDATE_EVERY = 30 * 60_000;
 const IDLE_UPD = { state: "checking", installed: null, latest: null, message: "", bridgeOnly: false };
-const TASK_KEYS = ["claude", "codex", "opencode", "pi"];
+const TASK_KEYS = ["claude", "codex", "opencode", "pi", "antigravity"];
 const HERDR_MIN = [0, 1, 15];
 const ROW_H = 28;
 

@@ -15,7 +15,8 @@ export const SOURCE_RANK = Object.freeze({
 
 const GENERIC_TITLES = [
   "zsh", "bash", "fish", "sh", "pwsh", "powershell", "nu", "claude", "codex",
-  "opencode", "pi", "new session", "new chat", "untitled", "terminal", "shell",
+  "opencode", "pi", "antigravity", "agy", "new session", "new chat", "untitled",
+  "terminal", "shell",
 ];
 
 const DEFAULT_BRANCHES = ["main", "master", "develop", "dev", "trunk", "head"];
@@ -28,7 +29,7 @@ const EDGE_LEAD_RE = /^[^\p{L}\p{N}#(]+/u;
 const EDGE_TAIL_RE = /[^\p{L}\p{N}#)]+$/u;
 // Agent names are only stripped at the start or end ("Claude Code — Fix login"),
 // never from the middle ("Fix Claude adapter" stays intact).
-const AGENT_NAMES = "(?:Claude Code|OpenCode|Claude|Codex|Pi)";
+const AGENT_NAMES = "(?:Claude Code|OpenCode|Antigravity|Claude|Codex|Pi)";
 const AGENT_LEAD_RE = new RegExp(`^${AGENT_NAMES}(?:[\\s·—–:|,\\-]+|$)`, "iu");
 const AGENT_TAIL_RE = new RegExp(`(?:^|[\\s·—–:|,\\-]+)${AGENT_NAMES}$`, "iu");
 // Brand glyphs ("π Fix login", "OC | Fix login") are only stripped as a whole word.

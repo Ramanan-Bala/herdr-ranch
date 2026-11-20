@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseStore } from "../lib/tasks.js";
 import { homeDir } from "./store.js";
-import { claudeTodoEnvEnabled, codexTrustState, codexUpdatePlanEnabled, opencodeTodoEnabled, statusSummary } from "./install.js";
+import { antigravityPluginStatus, claudeTodoEnvEnabled, codexTrustState, codexUpdatePlanEnabled, hasAntigravityPreToolUse, opencodeTodoEnabled, statusSummary } from "./install.js";
 
 const TODO_PAYLOAD = {
   hook_event_name: "PostToolUse",
@@ -43,6 +43,13 @@ const PI_TODO_PAYLOAD = {
   tool_input: { todos: [{ content: "doctor check", status: "in_progress" }] },
 };
 
+const ANTIGRAVITY_SESSION_PAYLOAD = {
+  hookEventName: "SessionStart",
+  conversationId: "00000000-0000-4000-8000-000000000000",
+  cwd: "/tmp",
+  lastUserInput: "",
+};
+
 /**
  * The node entry this doctor was installed with (repo run falls back to
  * ../bin). The installed bin/ranch-tasks is a sh launcher, so run the .js.
@@ -56,8 +63,8 @@ export function cliPath() {
 /** Store text of the temp home after a synthetic write: the session file the
  * terminal pointer names, or the terminal file itself while no session id is
  * known (fixes §3.3). Shared by the hook, plugin and plan checks. */
-function readSyntheticStore(home) {
-  const pointer = readFileSync(join(home, ".herdr", "ranch", "tasks", "terminals", "doctor.json"), "utf8");
+function readSyntheticStore(home, terminal = "doctor") {
+  const pointer = readFileSync(join(home, ".herdr", "ranch", "tasks", "terminals", `${terminal}.json`), "utf8");
   const raw = JSON.parse(pointer);
   const path = typeof raw.session === "string"
     ? join(home, ".herdr", "ranch", "tasks", "sessions", `${raw.session}.json`)
@@ -77,6 +84,33 @@ function syntheticHook(agent, payload, home) {
   if (run.status !== 0) return { error: run.stderr?.trim() || `exit ${run.status}` };
   try {
     return readSyntheticStore(home);
+  } catch (err) {
+    return { error: `no store appeared (${err?.code ?? err?.message ?? err})` };
+  }
+}
+
+/** Runs the antigravity hook adapter against an isolated store, confirming stdout
+ * is a valid JSON object (required by agy) and a parseable store was written. */
+function syntheticAntigravity(home) {
+  const env = { ...process.env, RANCH_HOME: home, HOME: home, HC_TERMINAL_ID: "doctor-agy" };
+  const run = spawnSync(process.execPath, [cliPath(), "antigravity"], {
+    env,
+    input: JSON.stringify(ANTIGRAVITY_SESSION_PAYLOAD),
+    encoding: "utf8",
+    timeout: 10000,
+  });
+  if (run.status !== 0) return { error: run.stderr?.trim() || `exit ${run.status}` };
+  let out;
+  try {
+    out = JSON.parse(run.stdout ?? "");
+  } catch {
+    return { error: `stdout is not valid JSON (${JSON.stringify((run.stdout ?? "").slice(0, 80))})` };
+  }
+  if (!out || typeof out !== "object" || Array.isArray(out)) {
+    return { error: "stdout did not parse as a JSON object" };
+  }
+  try {
+    return readSyntheticStore(home, "doctor-agy");
   } catch (err) {
     return { error: `no store appeared (${err?.code ?? err?.message ?? err})` };
   }
@@ -109,6 +143,13 @@ function storeCheck(name, result) {
   if (!parsed.ok) return check(name, false, `store did not parse (${parsed.reason})`);
   const ok = parsed.store.tasks.length === 1 && parsed.store.tasks[0].title === "doctor check";
   return check(name, ok, ok ? "store appeared with the task" : "store missing the task");
+}
+
+function antigravityStoreCheck(name, result) {
+  if (result.error) return check(name, false, result.error);
+  const parsed = parseStore(result.store);
+  if (!parsed.ok) return check(name, false, `store did not parse (${parsed.reason})`);
+  return check(name, true, "stdout JSON object and store appeared");
 }
 
 /**
@@ -176,11 +217,30 @@ export async function doctor() {
     agents = statusSummary().agents;
   } catch {}
   for (const [agent, state] of Object.entries(agents ?? {})) {
+    if (agent === "antigravity" && state === "missing") continue;
     checks.push(check(`${agent} hooks`, state === "installed", state));
   }
   codexChecks(checks, agents, home);
   checks.push(check("opencode experimental.todo", opencodeTodoEnabled(), "opencode config"));
   const piInstalled = !!agents?.pi && agents.pi !== "missing";
+  const antigravityInstalled = !!agents?.antigravity && agents.antigravity !== "missing";
+  const agyHooksFile = join(home, ".gemini", "config", "plugins", "ranch-tasks", "hooks.json");
+  let agyHooksDoc = null;
+  try {
+    agyHooksDoc = JSON.parse(readFileSync(agyHooksFile, "utf8"));
+  } catch {}
+  const agyHasPreToolUse = hasAntigravityPreToolUse(agyHooksDoc);
+  if (antigravityInstalled) {
+    const plugin = antigravityPluginStatus();
+    checks.push(check("antigravity plugin files", plugin.ok, plugin.detail));
+  }
+  if (antigravityInstalled || agyHasPreToolUse) {
+    checks.push(check(
+      "antigravity PreToolUse hook",
+      !agyHasPreToolUse,
+      agyHasPreToolUse ? "PreToolUse hook denies every agy tool call; run ranch-tasks install" : "not registered",
+    ));
+  }
   // Claude Code's task tools: settings env, or the shell exporting it.
   const claudeTodo = claudeTodoEnvEnabled(join(home, ".claude", "settings.json")) || process.env.CLAUDE_CODE_ENABLE_TODO_TOOLS === "1";
   checks.push(check("claude CLAUDE_CODE_ENABLE_TODO_TOOLS", claudeTodo, "~/.claude/settings.json env"));
@@ -210,6 +270,9 @@ export async function doctor() {
       // installed `ranch-tasks pi` entry.
       syntheticHook("pi", PI_SESSION_PAYLOAD, temp);
       checks.push(storeCheck("pi synthetic event", syntheticHook("pi", PI_TODO_PAYLOAD, temp)));
+    }
+    if (antigravityInstalled) {
+      checks.push(antigravityStoreCheck("antigravity synthetic event", syntheticAntigravity(temp)));
     }
   } finally {
     try {

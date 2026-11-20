@@ -2,7 +2,7 @@
 // copies the OpenCode plugin and the runtime into ~/.herdr/ranch/
 // (requirements.md §7.1, §7.4). Interactive commands only — never run as a hook.
 import {
-  chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, statSync, unlinkSync, writeFileSync,
+  accessSync, chmodSync, constants, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, statSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -13,7 +13,7 @@ import { createInterface } from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
 import { STALE, pointerSession } from "../lib/tasks.js";
 
-const AGENTS = ["claude", "codex", "opencode", "pi"];
+const AGENTS = ["claude", "codex", "opencode", "pi", "antigravity"];
 import { rulesFor, blockFor, CLAUDE_IMPORT, withBlock, stripBlock } from "./instructions.js";
 
 const RANCH_MARK = "/.herdr/ranch/bin/ranch-tasks";
@@ -256,6 +256,14 @@ function removeOwned(path) {
   const manifest = readInstallManifest();
   if (!manifest.owned[path]) return;
   delete manifest.owned[path];
+  writeManifest(manifest);
+}
+
+function removeInstallCreatedDir(dir) {
+  const manifest = readInstallManifest();
+  const idx = manifest.createdDirs.indexOf(dir);
+  if (idx === -1) return;
+  manifest.createdDirs.splice(idx, 1);
   writeManifest(manifest);
 }
 
@@ -525,7 +533,10 @@ for n in ${q(nodePath)} "$(command -v node 2>/dev/null)" "$latest_nvm" "$HOME/.v
   if [ -n "$n" ] && [ -x "$n" ]; then exec "$n" --no-warnings "$here/ranch-tasks.js" "$@"; fi
 done
 # No node: hooks must stay silent and never fail the agent.
-case "$1" in claude|codex) cat >/dev/null 2>&1; exit 0 ;; esac
+case "$1" in
+  claude|codex) cat >/dev/null 2>&1; exit 0 ;;
+  antigravity) cat >/dev/null 2>&1; printf '{}\n'; exit 0 ;;
+esac
 echo "ranch-tasks: node not found" >&2
 exit 127
 `;
@@ -544,8 +555,25 @@ function writeLauncher(dest, results) {
 }
 
 /** Windows cmd shim so a human can type `ranch-tasks` (hooks call node directly). */
+export function cmdShimScript() {
+  return `@echo off
+where node >nul 2>&1
+if errorlevel 1 (
+  if "%~1"=="claude" exit /b 0
+  if "%~1"=="codex" exit /b 0
+  if "%~1"=="antigravity" (
+    echo {}
+    exit /b 0
+  )
+  echo ranch-tasks: node not found 1>&2
+  exit /b 127
+)
+node "%~dp0ranch-tasks.js" %*
+`;
+}
+
 function writeCmdShim(dest, results) {
-  const text = '@node "%~dp0ranch-tasks.js" %*\n';
+  const text = cmdShimScript();
   mkdirSync(dirname(dest), { recursive: true });
   let same = false;
   try { same = readFileSync(dest, "utf8") === text; } catch {}
@@ -885,6 +913,249 @@ function uninstallPi(results, backups) {
   uninstallPiTheme(results);
 }
 
+// --------------------------------------------------------------- Antigravity
+
+const ANTIGRAVITY_FLAT_EVENTS = ["SessionStart", "PreInvocation", "PostInvocation", "Stop"];
+// Never register PreToolUse: agy treats a PreToolUse reply without "decision"
+// as deny, and Ranch must never make permission decisions.
+const ANTIGRAVITY_MATCHED_EVENTS = ["PostToolUse"];
+
+/** True when `name` exists as a runnable file on PATH (never executes it). */
+function binaryOnPath(name, platform = process.platform) {
+  const pathEnv = process.env.PATH ?? "";
+  if (!pathEnv) return false;
+  const sep = platform === "win32" ? ";" : ":";
+  const exts = platform === "win32"
+    ? [...new Set([...(process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean).map((e) => e.toLowerCase()), ""])]
+    : [""];
+  for (const dir of pathEnv.split(sep)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = join(dir, ext ? `${name}${ext}` : name);
+      try {
+        if (!statSync(candidate).isFile()) continue;
+        if (platform !== "win32") accessSync(candidate, constants.X_OK);
+        return true;
+      } catch {
+        // missing or not executable
+      }
+    }
+  }
+  return false;
+}
+
+/** True when Antigravity CLI is present (`agy` on PATH or ~/.gemini/antigravity-cli exists). */
+export function isAntigravityInstalled(platform = process.platform) {
+  if (existsSync(join(homeDir(), ".gemini", "antigravity-cli"))) return true;
+  return binaryOnPath("agy", platform);
+}
+
+function antigravityPluginDir() {
+  return join(homeDir(), ".gemini", "config", "plugins", "ranch-tasks");
+}
+
+function antigravityAncestorDirs(includeRules = false) {
+  const home = homeDir();
+  const dirs = [
+    join(home, ".gemini"),
+    join(home, ".gemini", "config"),
+    join(home, ".gemini", "config", "plugins"),
+    join(home, ".gemini", "config", "plugins", "ranch-tasks"),
+  ];
+  if (includeRules) dirs.push(join(home, ".gemini", "config", "plugins", "ranch-tasks", "rules"));
+  return dirs;
+}
+
+function ensureAntigravityDirs(includeRules) {
+  const dirs = antigravityAncestorDirs(includeRules);
+  const missing = dirs.filter((d) => !existsSync(d));
+  mkdirSync(dirs[dirs.length - 1], { recursive: true });
+  for (const dir of missing) recordInstallCreated(null, dir);
+}
+
+function antigravityHooksDoc(platform = process.platform) {
+  const command = hookCommand("antigravity", platform);
+  const handler = { type: "command", command, timeout: 10 };
+  const events = {};
+  for (const event of ANTIGRAVITY_FLAT_EVENTS) events[event] = [{ ...handler }];
+  for (const event of ANTIGRAVITY_MATCHED_EVENTS) events[event] = [{ matcher: "*", hooks: [{ ...handler }] }];
+  return { "ranch-tasks": events };
+}
+
+function antigravityHandlers(doc) {
+  const entry = doc?.["ranch-tasks"];
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+  const out = [];
+  for (const items of Object.values(entry)) {
+    if (!Array.isArray(items)) continue;
+    for (const item of items) {
+      if (Array.isArray(item?.hooks)) {
+        for (const h of item.hooks) out.push(h);
+      } else if (item && typeof item === "object") {
+        out.push(item);
+      }
+    }
+  }
+  return out;
+}
+
+function hasAntigravityHandlers(doc) {
+  return antigravityHandlers(doc).some(isRanchHook);
+}
+
+/** True when an Antigravity hooks.json contains a PreToolUse entry. */
+export function hasAntigravityPreToolUse(doc) {
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return false;
+  const hasEntry = (obj) => {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+    const pre = obj.PreToolUse;
+    return Array.isArray(pre) ? pre.length > 0 : pre != null;
+  };
+  return hasEntry(doc) || Object.values(doc).some(hasEntry);
+}
+
+function hasUnrunnableAntigravityHook(doc, platform) {
+  return antigravityHandlers(doc).some((h) => {
+    const command = typeof h?.command === "string" ? h.command : "";
+    if (!normPath(command).includes(RANCH_MARK)) return false;
+    return command.includes("\\") || (platform === "win32" && !command.startsWith("node "));
+  });
+}
+
+function installAntigravityFile({ dest, content, label, includeRules }, results, backups) {
+  const bytes = Buffer.from(content, "utf8");
+  const existed = existsSync(dest);
+  const manifest = readInstallManifest();
+  const current = existed ? readFileSync(dest) : null;
+  const ours = existed && ownedMatches(manifest, dest, current);
+  if (existed && ours) {
+    if (current.equals(bytes)) {
+      results.push({ path: dest, action: "unchanged" });
+      return;
+    }
+    const ownedBackup = manifest.owned[dest]?.backup ?? null;
+    ensureAntigravityDirs(includeRules);
+    writeFileSync(dest, bytes);
+    recordOwned(dest, sha256Of(bytes), ownedBackup);
+    results.push({ path: dest, action: "replaced" });
+    return;
+  }
+  if (existed) {
+    const backup = backupFile(dest, label, backups);
+    if (current.equals(bytes)) {
+      recordOwned(dest, sha256Of(bytes), backup);
+      results.push({ path: dest, action: "unchanged" });
+      return;
+    }
+    ensureAntigravityDirs(includeRules);
+    writeFileSync(dest, bytes);
+    recordOwned(dest, sha256Of(bytes), backup);
+    results.push({ path: dest, action: "replaced" });
+    return;
+  }
+  ensureAntigravityDirs(includeRules);
+  writeFileSync(dest, bytes);
+  recordInstallCreated(dest, null);
+  recordOwned(dest, sha256Of(bytes), null);
+  results.push({ path: dest, action: "created" });
+}
+
+function installAntigravity(results, backups, platform = process.platform, { noInstructions = false } = {}) {
+  const dir = antigravityPluginDir();
+  if (!isAntigravityInstalled(platform)) {
+    results.push({ path: dir, action: "skipped (antigravity not installed)" });
+    return false;
+  }
+  const files = [
+    {
+      dest: join(dir, "plugin.json"),
+      content: JSON.stringify({ name: "ranch-tasks" }, null, 2) + "\n",
+      label: "antigravity-plugin",
+      includeRules: false,
+    },
+    {
+      dest: join(dir, "hooks.json"),
+      content: JSON.stringify(antigravityHooksDoc(platform), null, 2) + "\n",
+      label: "antigravity-hooks",
+      includeRules: false,
+    },
+  ];
+  if (!noInstructions) {
+    files.push({
+      dest: join(dir, "rules", "AGENTS.md"),
+      content: rulesFor("antigravity", homeDir()),
+      label: "antigravity-rules",
+      includeRules: true,
+    });
+  }
+  for (const file of files) installAntigravityFile(file, results, backups);
+  return true;
+}
+
+/** Restores or deletes an Antigravity plugin file only when its bytes still
+ * match the sha256 Ranch recorded; user-modified files are left untouched. */
+function uninstallAntigravityFile(dest, results) {
+  if (!existsSync(dest)) {
+    results.push({ path: dest, action: "not present" });
+    return;
+  }
+  const bytes = readFileSync(dest);
+  const manifest = readInstallManifest();
+  const entry = manifest.owned[dest];
+  if (!ownedMatches(manifest, dest, bytes)) {
+    results.push({ path: dest, action: entry ? "changed since install, left as is" : "unchanged (not Ranch's)" });
+    return;
+  }
+  const backup = entry?.backup;
+  if (backup && existsSync(backup)) {
+    copyFileSync(backup, dest);
+    results.push({ path: dest, action: "restored original" });
+  } else {
+    unlinkSync(dest);
+    results.push({ path: dest, action: "deleted" });
+  }
+  removeOwned(dest);
+}
+
+function uninstallAntigravity(results) {
+  const dir = antigravityPluginDir();
+  for (const dest of [join(dir, "plugin.json"), join(dir, "hooks.json"), join(dir, "rules", "AGENTS.md")]) {
+    uninstallAntigravityFile(dest, results);
+  }
+  const manifest = readInstallManifest();
+  for (const createdDir of antigravityAncestorDirs(true).reverse()) {
+    if (!manifest.createdDirs.includes(createdDir)) continue;
+    try {
+      if (readdirSync(createdDir).length === 0) {
+        rmdirSync(createdDir);
+        removeInstallCreatedDir(createdDir);
+        results.push({ path: createdDir, action: "deleted (created by install)" });
+      }
+    } catch {}
+  }
+}
+
+/** Doctor check: Antigravity plugin files exist and match Ranch's recorded sha256. */
+export function antigravityPluginStatus() {
+  const dir = antigravityPluginDir();
+  const manifest = readInstallManifest();
+  const required = [join(dir, "plugin.json"), join(dir, "hooks.json")];
+  const rules = join(dir, "rules", "AGENTS.md");
+  const files = existsSync(rules) || manifest.owned[rules] ? [...required, rules] : required;
+  const missing = [];
+  const unowned = [];
+  for (const file of files) {
+    if (!existsSync(file)) {
+      missing.push(file);
+      continue;
+    }
+    if (!ownedMatches(manifest, file, readFileSync(file))) unowned.push(file);
+  }
+  if (missing.length) return { ok: false, detail: `missing: ${missing.join(", ")}` };
+  if (unowned.length) return { ok: false, detail: `not owned or modified: ${unowned.join(", ")}` };
+  return { ok: true, detail: `${files.length} plugin files present and owned` };
+}
+
 function selectAgents(opts) {
   const requested = Array.isArray(opts.agents) && opts.agents.length ? opts.agents : [...AGENTS];
   return AGENTS.filter((a) => requested.includes(a));
@@ -913,6 +1184,16 @@ function plan(agents, opts = {}) {
     items.push({ path: join(home, ".pi", "agent", "themes", "opencode-light.json"), action: "copy theme" });
     items.push({ path: join(home, ".pi", "agent", "extensions", "statusline.ts"), action: "copy status line extension" });
     items.push({ path: join(home, ".pi", "agent", "settings.json"), action: "select theme if none chosen" });
+  }
+  if (agents.includes("antigravity")) {
+    const pluginDir = antigravityPluginDir();
+    if (isAntigravityInstalled(platform)) {
+      items.push({ path: join(pluginDir, "plugin.json"), action: "write plugin manifest" });
+      items.push({ path: join(pluginDir, "hooks.json"), action: "write hooks" });
+      if (!opts.noInstructions) items.push({ path: join(pluginDir, "rules", "AGENTS.md"), action: "write task-reporting rules" });
+    } else {
+      items.push({ path: pluginDir, action: "skipped (antigravity not installed)" });
+    }
   }
   if (!opts.noInstructions) {
     for (const f of instructionFiles(agents)) items.push({ path: f.path, action: f.planAction });
@@ -1069,6 +1350,7 @@ export async function install(opts = {}) {
   }
   if (agents.includes("opencode")) installOpencode(results, backups);
   if (agents.includes("pi")) installPi(results, backups);
+  if (agents.includes("antigravity")) installAntigravity(results, backups, platform, { noInstructions: !!opts.noInstructions });
   if (agents.includes("codex")) pruneCodexTrust(results, backups);
   if (!opts.noInstructions) installInstructions(agents, results, backups);
   printResults(results, backups);
@@ -1105,6 +1387,12 @@ export async function uninstall(opts = {}) {
     items.push({ path: join(home, ".pi", "agent", "themes", "opencode-light.json"), action: "delete theme" });
     items.push({ path: join(home, ".pi", "agent", "extensions", "statusline.ts"), action: "delete status line extension" });
     items.push({ path: join(home, ".pi", "agent", "settings.json"), action: "restore theme setting" });
+  }
+  if (agents.includes("antigravity")) {
+    const pluginDir = antigravityPluginDir();
+    items.push({ path: join(pluginDir, "plugin.json"), action: "delete plugin manifest" });
+    items.push({ path: join(pluginDir, "hooks.json"), action: "delete hooks" });
+    items.push({ path: join(pluginDir, "rules", "AGENTS.md"), action: "delete task-reporting rules" });
   }
   if (!items.length) return;
   if (!opts.yes) {
@@ -1223,6 +1511,7 @@ export async function uninstall(opts = {}) {
   }
 
   if (agents.includes("pi")) uninstallPi(results, backups);
+  if (agents.includes("antigravity")) uninstallAntigravity(results);
 
   printResults(results, backups);
 }
@@ -1293,6 +1582,29 @@ export function statusSummary(platform = process.platform) {
     }
     return piOutdated() ? "outdated" : "installed";
   })();
+  const antigravity = (() => {
+    const dir = antigravityPluginDir();
+    const pluginFile = join(dir, "plugin.json");
+    const hooksFile = join(dir, "hooks.json");
+    let pluginDoc = null;
+    let hooksDoc = null;
+    try {
+      pluginDoc = JSON.parse(readFileSync(pluginFile, "utf8"));
+      hooksDoc = JSON.parse(readFileSync(hooksFile, "utf8"));
+    } catch {
+      return "missing";
+    }
+    if (pluginDoc?.name !== "ranch-tasks" || !hasAntigravityHandlers(hooksDoc)) return "missing";
+    if (!binExists) return "missing";
+    if (hasUnrunnableAntigravityHook(hooksDoc, platform)) return "broken";
+    if (outdated || hasAntigravityPreToolUse(hooksDoc)) return "outdated";
+    const expectedPlugin = JSON.stringify({ name: "ranch-tasks" }, null, 2) + "\n";
+    const expectedHooks = JSON.stringify(antigravityHooksDoc(platform), null, 2) + "\n";
+    const manifest = readInstallManifest();
+    if (manifest.owned[pluginFile] && readFileSync(pluginFile, "utf8") !== expectedPlugin) return "outdated";
+    if (manifest.owned[hooksFile] && readFileSync(hooksFile, "utf8") !== expectedHooks) return "outdated";
+    return "installed";
+  })();
   const codexBase = hookStatus(join(home, ".codex", "hooks.json"));
   let codexConfigText = "";
   try {
@@ -1311,6 +1623,7 @@ export function statusSummary(platform = process.platform) {
       codex,
       opencode,
       pi,
+      antigravity,
     },
     opencodeTodo: opencodeTodoEnabled(),
     claudeTodoEnv: claudeTodoEnvEnabled(join(home, ".claude", "settings.json")),

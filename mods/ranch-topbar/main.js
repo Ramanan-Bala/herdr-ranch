@@ -191,7 +191,7 @@ export default class RanchTopbar extends View {
       const agent = this.agents?.find(a => a.key === key);
       const name = agent?.name ?? cap(key);
       // Until knownAgents() answers, Herdr's shipped icon for the key stands in.
-      const fallback = ["claude", "codex", "opencode"].includes(key) ? `icons/${key}.svg` : null;
+      const fallback = ["claude", "codex", "opencode", "antigravity"].includes(key) ? `icons/${key}.svg` : null;
       const icon = agent?.icon
         ? (agent.tint ? svg(agent.icon).size(14).text_color(t.muted) : image(agent.icon).size(14))
         : fallback ? image(fallback).size(14) : div().text_size(10).child(cap(key).slice(0, 2));

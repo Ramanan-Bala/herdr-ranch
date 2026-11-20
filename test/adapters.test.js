@@ -1069,8 +1069,8 @@ test("install/uninstall round trip restores configs byte-for-byte", async () => 
     assert.ok(enabled.includes('// "disabled_providers": ["opencode"],'));
     assert.equal(statusSummary().opencodeTodo, true);
 
-    // status: all installed while running from the repo (pi was not selected)
-    assert.deepEqual(statusSummary().agents, { claude: "installed", codex: "installed", opencode: "installed", pi: "missing" });
+    // status: all installed while running from the repo (pi and antigravity were not selected)
+    assert.deepEqual(statusSummary().agents, { claude: "installed", codex: "installed", opencode: "installed", pi: "missing", antigravity: "missing" });
 
     // tamper with the installed cli.js -> outdated
     const installedCli = join(home, ".herdr", "ranch", "adapters", "cli.js");
@@ -1084,7 +1084,7 @@ test("install/uninstall round trip restores configs byte-for-byte", async () => 
     assert.equal(readFileSync(settings, "utf8"), before);
     assert.equal(readFileSync(opencodeConfig, "utf8"), configBefore);
     // ...and the fresh runtime copy repairs the tampered one
-    assert.deepEqual(statusSummary().agents, { claude: "installed", codex: "installed", opencode: "installed", pi: "missing" });
+    assert.deepEqual(statusSummary().agents, { claude: "installed", codex: "installed", opencode: "installed", pi: "missing", antigravity: "missing" });
 
     // uninstall restores everything
     await uninstall({ yes: true, agents: ["claude", "codex", "opencode"] });
@@ -1094,7 +1094,7 @@ test("install/uninstall round trip restores configs byte-for-byte", async () => 
     assert.equal(existsSync(join(home, ".codex")), false);
     assert.equal(existsSync(join(home, ".config", "opencode", "plugins", "ranch-tasks.js")), false);
     assert.equal(statusSummary().opencodeTodo, false);
-    assert.deepEqual(statusSummary().agents, { claude: "missing", codex: "missing", opencode: "missing", pi: "missing" });
+    assert.deepEqual(statusSummary().agents, { claude: "missing", codex: "missing", opencode: "missing", pi: "missing", antigravity: "missing" });
   } finally {
     delete process.env.RANCH_HOME;
   }

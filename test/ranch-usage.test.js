@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -24,8 +24,23 @@ const { parse: parseCopilot } = await import(
 const { parse: parseOpenCode } = await import(
   pathToFileURL(join(root, "mods/ranch-usage/providers/opencode.js")).href
 );
+const { parse: parseAntigravity } = await import(
+  pathToFileURL(join(root, "mods/ranch-usage/providers/antigravity.js")).href
+);
+const { PROVIDERS } = await import(
+  pathToFileURL(join(root, "mods/ranch-usage/providers/index.js")).href
+);
 const { level } = await import(
   pathToFileURL(join(root, "mods/ranch-usage/usage/format.js")).href
+);
+const { effectivePrefs, isShown, toggleProvider, toggleWindow } = await import(
+  pathToFileURL(join(root, "mods/ranch-usage/usage/prefs.js")).href
+);
+const { parseSession, sessionView } = await import(
+  pathToFileURL(join(root, "mods/ranch-usage/usage/session.js")).href
+);
+const { UNREPORTED } = await import(
+  pathToFileURL(join(root, "mods/ranch-usage/usage/unreported.js")).href
 );
 
 const NOW = Math.floor(Date.parse("2026-11-11T10:00:00Z") / 1000);
@@ -233,6 +248,173 @@ test("opencode parse: data null is not signed in, no go or budgets is unavailabl
   assert.deepEqual(garbage.windows, []);
 });
 
+// --------------------------------------------------------------- antigravity
+
+// Real reply, trimmed: agy -p /usage --output-format json.
+const antigravityReply = JSON.stringify({
+  conversation_id: "",
+  status: "SUCCESS",
+  response: "<tsv text>",
+  command: {
+    name: "usage",
+    data: {
+      description: "Usage limits",
+      groups: [
+        {
+          name: "Gemini Models",
+          description: "Models within this group: ...",
+          buckets: [
+            {
+              id: "gemini-weekly",
+              name: "Weekly Limit Remaining",
+              description: "...",
+              window: "weekly",
+              remaining_fraction: 0.9224,
+              reset_time: "2026-11-27T03:40:36Z",
+            },
+            {
+              id: "gemini-5h",
+              name: "Five Hour Limit Remaining",
+              window: "5h",
+              remaining_fraction: 0.7287,
+              reset_time: "2026-11-20T08:40:36Z",
+            },
+          ],
+        },
+        {
+          name: "Claude and GPT models",
+          buckets: [
+            {
+              id: "3p-weekly",
+              name: "Weekly Limit Remaining",
+              window: "weekly",
+              remaining_fraction: 1,
+              reset_time: "2026-11-27T03:40:36Z",
+            },
+            {
+              id: "3p-5h",
+              name: "Five Hour Limit Remaining",
+              window: "5h",
+              remaining_fraction: 0.4,
+              reset_time: "2026-11-20T09:00:00Z",
+            },
+          ],
+        },
+        {
+          name: "Gemini 4 Argon",
+          buckets: [
+            {
+              id: "gemini-argon-wtu-weekly",
+              name: "Gemini 4 Argon Weekly Limit",
+              window: "weekly",
+              remaining_fraction: 1,
+            },
+          ],
+        },
+      ],
+    },
+  },
+});
+
+test("antigravity parse: 5 windows in group order with 5h before weekly, correct percents/resets/labels", () => {
+  const r = parseAntigravity(antigravityReply, NOW);
+  assert.equal(r.status, "ok");
+  assert.equal(r.source, "agy CLI");
+  assert.equal(r.windows.length, 5);
+  assert.deepEqual(
+    r.windows.map((w) => w.id),
+    ["gemini-5h", "gemini-weekly", "3p-5h", "3p-weekly", "gemini-argon-wtu-weekly"],
+  );
+  assert.deepEqual(r.windows.map((w) => w.percent), [27, 8, 60, 0, 0]);
+  assert.deepEqual(r.windows.map((w) => w.short), ["5h", "wk", "C+G 5h", "C+G wk", "Argon wk"]);
+  assert.deepEqual(r.windows.map((w) => w.long), [
+    "Gemini Models · Five Hour Limit Remaining",
+    "Gemini Models · Weekly Limit Remaining",
+    "Claude and GPT models · Five Hour Limit Remaining",
+    "Claude and GPT models · Weekly Limit Remaining",
+    "Gemini 4 Argon · Gemini 4 Argon Weekly Limit",
+  ]);
+  assert.deepEqual(r.windows.map((w) => w.resetsAt), [
+    Date.parse("2026-11-20T08:40:36Z") / 1000,
+    Date.parse("2026-11-27T03:40:36Z") / 1000,
+    Date.parse("2026-11-20T09:00:00Z") / 1000,
+    Date.parse("2026-11-27T03:40:36Z") / 1000,
+    null,
+  ]);
+  assert.deepEqual(r.windows.map((w) => w.durationSec), [18000, 604800, 18000, 604800, 604800]);
+});
+
+test("antigravity parse: disabled bucket and non-numeric remaining_fraction skipped; missing id falls back to index", () => {
+  const r = parseAntigravity(JSON.stringify({
+    status: "SUCCESS",
+    command: {
+      name: "usage",
+      data: {
+        groups: [
+          {
+            name: "Gemini Models",
+            buckets: [
+              { id: "disabled-one", window: "5h", disabled: true, remaining_fraction: 0.5 },
+              { id: "no-fraction", window: "weekly" },
+              { window: "weekly", remaining_fraction: 0.25 },
+            ],
+          },
+        ],
+      },
+    },
+  }), NOW);
+  assert.equal(r.status, "ok");
+  assert.equal(r.windows.length, 1);
+  assert.equal(r.windows[0].id, "0:2");
+  assert.equal(r.windows[0].percent, 75);
+  assert.equal(r.windows[0].short, "wk");
+  assert.equal(r.windows[0].long, "Gemini Models · Weekly");
+});
+
+test("antigravity parse: non-SUCCESS is error, missing data/buckets is unavailable, garbage is error", () => {
+  const err = parseAntigravity(JSON.stringify({ status: "ERROR", error: "Not signed in to Antigravity" }), NOW);
+  assert.equal(err.status, "error");
+  assert.equal(err.source, "agy CLI");
+  assert.equal(err.message, "Not signed in to Antigravity");
+  assert.deepEqual(err.windows, []);
+
+  const missingData = parseAntigravity(JSON.stringify({ status: "SUCCESS", command: { name: "usage" } }), NOW);
+  assert.equal(missingData.status, "unavailable");
+  assert.equal(missingData.source, "agy CLI");
+
+  const emptyBuckets = parseAntigravity(JSON.stringify({ status: "SUCCESS", command: { name: "usage", data: { groups: [] } } }), NOW);
+  assert.equal(emptyBuckets.status, "unavailable");
+
+  const garbage = parseAntigravity("agy: not logged in\n", NOW);
+  assert.equal(garbage.status, "error");
+  assert.equal(garbage.source, "agy CLI");
+  assert.deepEqual(garbage.windows, []);
+});
+
+test("antigravity registration and prefs (hidden provider and hiddenWindows)", () => {
+  const ids = PROVIDERS.map((p) => p.id);
+  assert.equal(ids.indexOf("antigravity"), ids.indexOf("opencode") + 1);
+  const agy = PROVIDERS.find((p) => p.id === "antigravity");
+  assert.equal(agy.icon, "icons/antigravity.svg");
+  assert.equal(agy.helper, "helpers/antigravity-usage.mjs");
+
+  let prefs = effectivePrefs(null, {});
+  assert.equal(isShown(prefs, "antigravity", "3p-5h"), true);
+  prefs = toggleWindow(prefs, "antigravity", "3p-5h");
+  assert.equal(isShown(prefs, "antigravity", "3p-5h"), false);
+  assert.equal(isShown(prefs, "antigravity", "gemini-5h"), true);
+  assert.ok(prefs.hiddenWindows.includes("antigravity:3p-5h"));
+  prefs = toggleProvider(prefs, "antigravity");
+  assert.equal(isShown(prefs, "antigravity"), false);
+  assert.equal(isShown(prefs, "antigravity", "gemini-5h"), false);
+});
+
+// ------------------------------------------------------------------ unreported
+
+test("UNREPORTED is empty now that Antigravity has a provider", () => {
+  assert.deepEqual(UNREPORTED, []);
+});
+
 // -------------------------------------------------------------------- levels
 
 test("level thresholds: 70/90", () => {
@@ -381,4 +563,133 @@ test("session.mjs: no session file exits 1; missing pid exits 1; codex (via sh) 
   assert.equal(runHelper("session.mjs", { CLAUDE_CONFIG_DIR: conf }, ["claude", "4242"]).status, 1);
   assert.equal(runHelper("session.mjs", { CLAUDE_CONFIG_DIR: conf }, []).status, 1);
   assert.equal(runHelper("session.mjs", { CLAUDE_CONFIG_DIR: conf }, ["codex", "999999"]).status, 1);
+});
+
+test("antigravity-usage.mjs prints JSON with status; 1 on failure, 127 without agy", () => {
+  const ok = runHelper("antigravity-usage.mjs", {
+    HERDR_USAGE_AGY_BIN: fake("agy-ok", `printf '%s\\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[]}}}'`),
+  });
+  assert.equal(ok.status, 0);
+  assert.equal(ok.stdout, '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[]}}}\n');
+
+  const nonSuccess = runHelper("antigravity-usage.mjs", {
+    HERDR_USAGE_AGY_BIN: fake("agy-err", `printf '%s\\n' '{"status":"ERROR","error":"Not signed in"}'; exit 1`),
+  });
+  assert.equal(nonSuccess.status, 0);
+  assert.equal(nonSuccess.stdout, '{"status":"ERROR","error":"Not signed in"}\n');
+
+  const bad = runHelper("antigravity-usage.mjs", {
+    HERDR_USAGE_AGY_BIN: fake("agy-bad", `printf '%s\\n' 'nope'`),
+  });
+  assert.equal(bad.status, 1);
+  assert.equal(bad.stdout, "");
+
+  const missing = runHelper("antigravity-usage.mjs", {
+    HERDR_USAGE_AGY_BIN: join(fakes, "no-such-agy"),
+  });
+  assert.equal(missing.status, 127);
+});
+
+test("session.mjs antigravity: reads latest PLANNER_RESPONSE tokens and call count from transcript", () => {
+  const home = mkdtempSync(join(tmpdir(), "ranch-usage-agy-"));
+  const convId = "123e4567-e89b-12d3-a456-426614174000";
+  const tasksDir = join(home, ".herdr", "ranch", "tasks");
+  mkdirSync(join(tasksDir, "terminals"), { recursive: true });
+  mkdirSync(join(tasksDir, "sessions"), { recursive: true });
+  writeFileSync(join(tasksDir, "terminals", "t6.json"), JSON.stringify({
+    version: 2,
+    terminal: "t6",
+    agent: { app: "antigravity", session: convId, pid: 100 },
+    session: convId,
+  }));
+  writeFileSync(join(tasksDir, "sessions", `${convId}.json`), JSON.stringify({
+    version: 2,
+    terminal: "t6",
+    agent: { app: "antigravity", session: convId, pid: 100 },
+    session: { id: convId, state: "running" },
+  }));
+
+  const logsDir = join(home, ".gemini", "antigravity-cli", "brain", convId, ".system_generated", "logs");
+  mkdirSync(logsDir, { recursive: true });
+  writeFileSync(
+    join(logsDir, "transcript.jsonl"),
+    [
+      '{"step_index":0,"type":"USER_INPUT","content":"hello"}',
+      '{"step_index":1,"type":"PLANNER_RESPONSE","model":"gemini-4-neon-high","input_tokens":1000,"cache_read_tokens":500,"output_tokens":200}',
+      '{"step_index":2,"type":"GENERIC","content":"mentions \\"PLANNER_RESPONSE\\" in text"}',
+      '{"step_index":3,"type":"PLANNER_RESPONSE","model":"gemini-4-neon-high","input_tokens":12000,"cache_read_tokens":3400,"output_tokens":450}',
+    ].join("\n") + "\n",
+  );
+
+  const r = runHelper("session.mjs", { RANCH_HOME: home }, ["antigravity", "t6"]);
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout, "tokens=15400 calls=2\n");
+
+  const parsed = parseSession(r.stdout, "antigravity");
+  assert.deepEqual(parsed, {
+    app: "antigravity",
+    tokens: 15400,
+    window: null,
+    calls: 2,
+    compactions: null,
+    last: null,
+  });
+  const view = sessionView(parsed, "ranch");
+  assert.equal(view.context.text, "15k");
+  assert.equal(view.context.fill, null);
+  assert.equal(view.calls, "2 calls");
+});
+
+test("session.mjs antigravity: validates UUID, blocks path escape / symlinks, and caps reads at ~2 MB", () => {
+  const home = mkdtempSync(join(tmpdir(), "ranch-usage-agy-sec-"));
+  const tasksDir = join(home, ".herdr", "ranch", "tasks");
+  mkdirSync(join(tasksDir, "terminals"), { recursive: true });
+  mkdirSync(join(tasksDir, "sessions"), { recursive: true });
+
+  // 1. Non-UUID / traversal conversationId is rejected before path construction.
+  for (const badId of ["not-a-uuid", "../escape", "123e4567-e89b-12d3-a456-426614174000/../../etc"]) {
+    writeFileSync(join(tasksDir, "terminals", "tbad.json"), JSON.stringify({
+      version: 2,
+      terminal: "tbad",
+      agent: { app: "antigravity", session: badId, pid: 1 },
+      session: { id: badId, state: "running" },
+    }));
+    const r = runHelper("session.mjs", { RANCH_HOME: home }, ["antigravity", "tbad"]);
+    assert.equal(r.status, 1, `should reject conversationId=${badId}`);
+  }
+
+  // 2. Symlink escaping ~/.gemini/antigravity-cli is rejected.
+  const outside = join(home, "outside.jsonl");
+  writeFileSync(outside, '{"type":"PLANNER_RESPONSE","input_tokens":500,"cache_read_tokens":0}\n');
+  const symId = "223e4567-e89b-12d3-a456-426614174000";
+  writeFileSync(join(tasksDir, "terminals", "tsym.json"), JSON.stringify({
+    version: 2,
+    terminal: "tsym",
+    agent: { app: "antigravity", session: symId, pid: 1 },
+    session: { id: symId, state: "running" },
+  }));
+  const symLogs = join(home, ".gemini", "antigravity-cli", "brain", symId, ".system_generated", "logs");
+  mkdirSync(symLogs, { recursive: true });
+  symlinkSync(outside, join(symLogs, "transcript.jsonl"));
+  assert.equal(runHelper("session.mjs", { RANCH_HOME: home }, ["antigravity", "tsym"]).status, 1);
+
+  // 3. Large (>2 MB) transcript reads only the tail and still finds the latest PLANNER_RESPONSE.
+  const bigId = "323e4567-e89b-12d3-a456-426614174000";
+  writeFileSync(join(tasksDir, "terminals", "tbig.json"), JSON.stringify({
+    version: 2,
+    terminal: "tbig",
+    agent: { app: "antigravity", session: bigId, pid: 1 },
+    session: { id: bigId, state: "running" },
+  }));
+  const bigLogs = join(home, ".gemini", "antigravity-cli", "brain", bigId, ".system_generated", "logs");
+  mkdirSync(bigLogs, { recursive: true });
+  const padLine = JSON.stringify({ type: "GENERIC", content: "x".repeat(10000) }) + "\n";
+  const bigContent =
+    '{"type":"PLANNER_RESPONSE","input_tokens":111,"cache_read_tokens":0}\n'
+    + padLine.repeat(240) // ~2.4 MB of padding pushes the first step outside the 2 MB tail
+    + '{"type":"PLANNER_RESPONSE","input_tokens":42000,"cache_read_tokens":8000}\n';
+  writeFileSync(join(bigLogs, "transcript.jsonl"), bigContent);
+  const big = runHelper("session.mjs", { RANCH_HOME: home }, ["antigravity", "tbig"]);
+  assert.equal(big.status, 0);
+  assert.equal(big.stdout, "tokens=50000 calls=1\n");
 });

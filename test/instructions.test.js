@@ -155,4 +155,49 @@ test("reminderFor codex without home keeps the generic fallback", () => {
 
 test("other hook events stay silent", () => {
   assert.equal(reminderFor("codex", "PostToolUse", { tasks: [] }, "/Users/a"), null);
+  assert.equal(reminderFor("antigravity", "PostToolUse", { tasks: [] }, "/Users/a"), null);
+});
+
+// Antigravity rules and reminders point at `task.md` in the artifacts directory.
+
+test("rulesFor antigravity mentions task.md checklist and never ranch-tasks plan", () => {
+  for (const home of ["/Users/a", "C:/Users/x", undefined]) {
+    const rules = rulesFor("antigravity", home);
+    assert.match(rules, /task\.md/);
+    assert.match(rules, /~\/\.gemini\/antigravity-cli\/brain\/<this conversation id>\/task\.md/);
+    assert.match(rules, /file write\/edit tools/);
+    assert.match(rules, /- \[ \] todo/);
+    assert.match(rules, /- \[\/\] in progress/);
+    assert.match(rules, /- \[x\] done/);
+    assert.match(rules, /- \[-\] cancelled/);
+    assert.match(rules, /never run ranch-tasks commands/);
+    assert.doesNotMatch(rules, /ranch-tasks plan/);
+  }
+});
+
+test("reminderFor antigravity SessionStart and UserPromptSubmit", () => {
+  const taskFile = "/Users/a/.gemini/antigravity-cli/brain/conv-1/task.md";
+
+  const start = reminderFor("antigravity", "SessionStart", { tasks: [] }, "/Users/a", { taskFile });
+  assert.ok(start.includes(taskFile), start);
+  assert.match(start, /- \[\/\] in progress/);
+  assert.doesNotMatch(start, /ranch-tasks plan/);
+
+  const prompt = reminderFor("antigravity", "UserPromptSubmit", { tasks: [] }, "/Users/a", { taskFile });
+  assert.ok(prompt.includes(taskFile), prompt);
+  assert.doesNotMatch(prompt, /ranch-tasks plan/);
+
+  // Optional 5th arg: omitted still produces a task.md reminder.
+  const generic = reminderFor("antigravity", "SessionStart", { tasks: [] }, "/Users/a");
+  assert.match(generic, /task\.md/);
+  assert.doesNotMatch(generic, /ranch-tasks plan/);
+
+  const fresh = { tasks: [{ id: "1", title: "X", status: "pending", active_form: null }], missed_turns: 0 };
+  assert.equal(reminderFor("antigravity", "SessionStart", fresh, "/Users/a", { taskFile }), null);
+  assert.equal(reminderFor("antigravity", "UserPromptSubmit", fresh, "/Users/a", { taskFile }), null);
+
+  const missed = { ...fresh, missed_turns: 1 };
+  const nudged = reminderFor("antigravity", "UserPromptSubmit", missed, "/Users/a", { taskFile });
+  assert.ok(nudged.includes(taskFile), nudged);
+  assert.doesNotMatch(nudged, /ranch-tasks plan/);
 });

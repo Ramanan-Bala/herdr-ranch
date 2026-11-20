@@ -265,6 +265,7 @@ test("normalizeTitle strips the OC prefix, spinner glyphs and generic titles", (
   assert.equal(normalizeTitle("OC"), null);
   assert.equal(normalizeTitle("Claude Code"), null);
   assert.equal(normalizeTitle("pi"), null);
+  assert.equal(normalizeTitle("Antigravity"), null);
   assert.equal(normalizeTitle(null), null);
   assert.equal(normalizeTitle(42), null);
 });

@@ -12,6 +12,8 @@ const TOOL = {
   claude: "your task tool (TaskCreate to add tasks, TaskUpdate to change status; TodoWrite if that is what you have)",
   opencode: "the todowrite tool",
   pi: "the todo_write tool (pass the whole list every time; it replaces the previous list)",
+  antigravity:
+    "your file write/edit tools — keep the task list as a markdown checklist in a file named `task.md` in your artifacts directory (`~/.gemini/antigravity-cli/brain/<this conversation id>/task.md`), one item per line: `- [ ] todo`, `- [/] in progress`, `- [x] done`, `- [-] cancelled`; update the file (rewrite it whole or edit lines) whenever a status changes; never run ranch-tasks commands",
 };
 
 const PLAN_EXAMPLE = `"doing: <first task>" "todo: <next task>"`;
@@ -26,7 +28,7 @@ export function planCommandLine(home) {
   return `${cmd.includes(" ") ? `"${cmd}"` : cmd} ${args.join(" ")}`;
 }
 
-/** The rules, worded for one agent ("claude" | "codex" | "opencode" | "pi"). */
+/** The rules, worded for one agent ("claude" | "codex" | "opencode" | "pi" | "antigravity"). */
 export function rulesFor(agent, home) {
   const tool =
     agent === "codex"
@@ -82,21 +84,25 @@ function escape(s) {
 }
 
 /**
- * Hook reminder injected into the agent's context (Claude and Codex add a
- * SessionStart / UserPromptSubmit hook's stdout as context). Conditional
- * (fixes §3.7): nudged on session start and on prompts until a list exists;
- * once there is one, only when the previous turn did not update it
- * (missed_turns > 0).
+ * Hook reminder injected into the agent's context (Claude, Codex and
+ * Antigravity add a SessionStart / UserPromptSubmit hook's output as
+ * context). Conditional (fixes §3.7): nudged on session start and on prompts
+ * until a list exists; once there is one, only when the previous turn did
+ * not update it (missed_turns > 0).
  */
-export function reminderFor(agent, event, store, home) {
+export function reminderFor(agent, event, store, home, extra) {
+  const taskFile = typeof extra?.taskFile === "string" && extra.taskFile ? extra.taskFile : null;
+  const antigravityTool = `your file write/edit tools (update the checklist in ${taskFile ?? "task.md in your artifacts directory"} using - [ ] todo, - [/] in progress, - [x] done, - [-] cancelled; never run ranch-tasks commands)`;
   const tool =
     agent === "codex"
       ? `update_plan (or, without it: ${planCommandLine(home)} "doing: ..." "todo: ...")`
-      : agent === "opencode"
-        ? "todowrite"
-        : agent === "pi"
-          ? "todo_write"
-          : "TaskCreate/TaskUpdate";
+      : agent === "antigravity"
+        ? antigravityTool
+        : agent === "opencode"
+          ? "todowrite"
+          : agent === "pi"
+            ? "todo_write"
+            : "TaskCreate/TaskUpdate";
   if (event !== "SessionStart" && event !== "UserPromptSubmit") return null;
   const hasList = Array.isArray(store?.tasks) && store.tasks.length > 0;
   const missed = Number.isInteger(store?.missed_turns) && store.missed_turns > 0;
