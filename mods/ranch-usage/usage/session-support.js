@@ -1,9 +1,10 @@
 // Whether the focused terminal's session usage can be read at all, decided
 // before any helper runs. Pure: no Herdr imports.
 //
-// The session helpers match a PID against THIS machine's session files, so a
-// terminal on a remote machine must not use them: they would report some other
-// machine's numbers as if they were here. Codex also needs pgrep and lsof
+// The session helpers match a PID or terminal against THIS machine's session
+// files (Claude/Codex logs or Ranch's local Antigravity task store + transcript),
+// so a terminal on a remote machine must not use them: they would report some
+// other machine's numbers as if they were here. Codex also needs pgrep and lsof
 // (helpers/session.sh), which don't exist on Windows.
 //
 // platform is Herdr's window().platform: "macos", "windows" or "linux".

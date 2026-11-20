@@ -27,7 +27,7 @@ const FETCH_EVERY = 5 * 60;       // s, installed providers
 const MISSING_EVERY = 60 * 60;    // s, not-installed providers
 const REFRESH_COOLDOWN = 30;      // s
 const SESSION_EVERY = 10 * 1000;   // ms, at most this often on hover
-const AGENTS = { "claude-code": "claude", codex: "codex" }; // Herdr's app name → session.sh
+const AGENTS = { "claude-code": "claude", codex: "codex", antigravity: "antigravity" }; // Herdr's app name → session helper
 const BAR_W = 30;
 const PANEL_W = 360;
 const PANEL_BAR_W = 96;
@@ -157,19 +157,20 @@ export default class UsageLimits extends View {
         const info = JSON.parse((await exec("hc", ["get", terminal])).stdout);
         const app = AGENTS[info.status?.app];
         const pid = info.foreground?.pid;
+        const target = app === "antigravity" ? terminal : pid != null ? String(pid) : null;
         // Decided before any helper runs (finding 17): the helpers match the
-        // PID against this machine's session files, which lies for a remote
-        // terminal and can't work for Codex on Windows (pgrep/lsof).
+        // PID/terminal against this machine's session files, which lies for a
+        // remote terminal and can't work for Codex on Windows (pgrep/lsof).
         const support = sessionUsageSupport({ remote, agent: app, platform });
         const title = (info.cwd ?? "").split("/").pop();
-        if (app && pid && support.ok) {
+        if (app && target && support.ok) {
           // Node helper (fixes doc F11); sh fallback when node is not on PATH.
           let r = null;
-          try { r = await exec("node", [`${appHome()}/mods/${MOD}/helpers/session.mjs`, app, String(pid)]); } catch {}
-          if (!r || r.code === 127) r = await exec("sh", [`${appHome()}/mods/${MOD}/helpers/session.sh`, app, String(pid)]);
+          try { r = await exec("node", [`${appHome()}/mods/${MOD}/helpers/session.mjs`, app, target]); } catch {}
+          if (!r || r.code === 127) r = await exec("sh", [`${appHome()}/mods/${MOD}/helpers/session.sh`, app, target]);
           const data = r.code === 0 ? parseSession(r.stdout, app) : null;
           if (data) next = { data, title };
-        } else if (app && pid && !support.ok) {
+        } else if (app && target && !support.ok) {
           next = { unsupported: support.reason, title };
         }
       } catch {
@@ -357,7 +358,7 @@ export default class UsageLimits extends View {
     if (session) body.child(v_flex().pt(10).border_t(1).border_color(t.border).child(this.sessionBlock(session, t)));
     const cooling = this.cooling();
     return body.child(h_flex().gap(2).items_center()
-      .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child("Data: claude, codex, gh and opencode CLIs, numbers from session logs."))
+      .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child("Data: claude, codex, gh, opencode and agy CLIs, numbers from session logs."))
       .child(this.iconButton("ul-refresh", "refresh", cooling ? "Refreshing…" : "Refresh now", !cooling, (cx) => this.refresh(cx), t))
       .child(this.iconButton("ul-settings", "gear", "Settings", true, (cx) => this.show("settings", cx), t)));
   }
@@ -412,7 +413,7 @@ export default class UsageLimits extends View {
           return this.check(`s-${row}`, isOnBar(prefs, row), [div().text_color(t.foreground).child(name)],
             () => save(toggleOnBar(this.prefs(), row)), t);
         })))
-      .child(div().text_size(10.5).text_color(t.dim).child("Data: claude, codex, gh and opencode CLIs, numbers from session logs."));
+      .child(div().text_size(10.5).text_color(t.dim).child("Data: claude, codex, gh, opencode and agy CLIs, numbers from session logs."));
   }
 
   render(cx) {

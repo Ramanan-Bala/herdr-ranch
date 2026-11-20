@@ -16,11 +16,13 @@ test("local terminal: session usage supported", () => {
   assert.deepEqual(sessionUsageSupport({ remote: false, agent: "claude", platform: "macos" }), { ok: true });
   assert.deepEqual(sessionUsageSupport({ remote: false, agent: "codex", platform: "macos" }), { ok: true });
   assert.deepEqual(sessionUsageSupport({ remote: false, agent: "codex", platform: "linux" }), { ok: true });
+  assert.deepEqual(sessionUsageSupport({ remote: false, agent: "antigravity", platform: "macos" }), { ok: true });
+  assert.deepEqual(sessionUsageSupport({ remote: false, agent: "antigravity", platform: "linux" }), { ok: true });
   assert.deepEqual(sessionUsageSupport({ remote: false, agent: null, platform: "macos" }), { ok: true });
 });
 
 test("remote terminal: never read local files with its PID", () => {
-  for (const agent of [null, "claude", "codex"]) {
+  for (const agent of [null, "claude", "codex", "antigravity"]) {
     for (const platform of ["macos", "windows", "linux"]) {
       const r = sessionUsageSupport({ remote: true, agent, platform });
       assert.equal(r.ok, false, `agent=${agent} platform=${platform}`);
@@ -35,6 +37,7 @@ test("codex on Windows: pgrep/lsof don't exist, so not available", () => {
   assert.match(r.reason, /Windows/);
 });
 
-test("claude on Windows still works: file reading only", () => {
+test("claude and antigravity on Windows still work: file reading only", () => {
   assert.deepEqual(sessionUsageSupport({ remote: false, agent: "claude", platform: "windows" }), { ok: true });
+  assert.deepEqual(sessionUsageSupport({ remote: false, agent: "antigravity", platform: "windows" }), { ok: true });
 });

@@ -4,10 +4,14 @@
 // process.platform (docs/fixes/ranch-tasks-windows-install-plan.md §3.4).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { backupLabel, hookCommand, homeDir, install, repoRoot, statusSummary, uninstall } from "../adapters/install.js";
+import {
+  backupLabel, cmdShimScript, hookCommand, homeDir, install, launcherScript, repoRoot, statusSummary, uninstall,
+} from "../adapters/install.js";
+import { rulesFor } from "../adapters/instructions.js";
 
 const RANCH_MARK = "/.herdr/ranch/bin/ranch-tasks";
 
@@ -358,4 +362,201 @@ test("pi uninstall leaves a theme the person changed after install", async (t) =
   writeFileSync(file, JSON.stringify({ theme: "light" }, null, 2) + "\n");
   await uninstall({ yes: true, agents: ["pi"] });
   assert.equal(JSON.parse(readFileSync(file, "utf8")).theme, "light");
+});
+
+// --------------------------------------------------------------- Antigravity
+
+test("antigravity install writes plugin.json, hooks.json (5 events, no PreToolUse) and rules/AGENTS.md", async (t) => {
+  const home = tempHome();
+  mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+  withEnv(t, { RANCH_HOME: home, PATH: "" });
+
+  await install({ yes: true, agents: ["antigravity"] });
+
+  const pluginDir = join(home, ".gemini", "config", "plugins", "ranch-tasks");
+  const pluginJson = JSON.parse(readFileSync(join(pluginDir, "plugin.json"), "utf8"));
+  assert.deepEqual(pluginJson, { name: "ranch-tasks" });
+
+  const hooksJson = JSON.parse(readFileSync(join(pluginDir, "hooks.json"), "utf8"));
+  const expectedCmd = hookCommand("antigravity", process.platform);
+  const expectedHandler = { type: "command", command: expectedCmd, timeout: 10 };
+  assert.deepEqual(hooksJson, {
+    "ranch-tasks": {
+      SessionStart: [expectedHandler],
+      PreInvocation: [expectedHandler],
+      PostInvocation: [expectedHandler],
+      Stop: [expectedHandler],
+      PostToolUse: [{ matcher: "*", hooks: [expectedHandler] }],
+    },
+  });
+  assert.equal("PreToolUse" in hooksJson["ranch-tasks"], false);
+
+  const rules = readFileSync(join(pluginDir, "rules", "AGENTS.md"), "utf8");
+  assert.equal(rules, rulesFor("antigravity", home));
+  assert.equal(statusSummary().agents.antigravity, "installed");
+});
+
+test("statusSummary reports antigravity outdated when hooks.json still contains PreToolUse", async (t) => {
+  const home = tempHome();
+  mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+  withEnv(t, { RANCH_HOME: home, PATH: "" });
+
+  await install({ yes: true, agents: ["antigravity"], noInstructions: true });
+  const hooksFile = join(home, ".gemini", "config", "plugins", "ranch-tasks", "hooks.json");
+  const doc = JSON.parse(readFileSync(hooksFile, "utf8"));
+  const expectedHandler = { type: "command", command: hookCommand("antigravity", process.platform), timeout: 10 };
+  doc["ranch-tasks"].PreToolUse = [{ matcher: "*", hooks: [expectedHandler] }];
+  writeFileSync(hooksFile, JSON.stringify(doc, null, 2) + "\n");
+
+  assert.equal(statusSummary().agents.antigravity, "outdated");
+
+  // Reinstalling drops PreToolUse and restores "installed".
+  await install({ yes: true, agents: ["antigravity"], noInstructions: true });
+  const updated = JSON.parse(readFileSync(hooksFile, "utf8"));
+  assert.equal("PreToolUse" in updated["ranch-tasks"], false);
+  assert.equal(statusSummary().agents.antigravity, "installed");
+});
+
+test("antigravity install on win32 uses node command with forward slashes and detects broken hooks", async (t) => {
+  const home = tempHome();
+  mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+  withEnv(t, { RANCH_HOME: home, PATH: "" });
+
+  await install({ yes: true, agents: ["antigravity"], platform: "win32", noInstructions: true });
+  const hooksFile = join(home, ".gemini", "config", "plugins", "ranch-tasks", "hooks.json");
+  const doc = JSON.parse(readFileSync(hooksFile, "utf8"));
+  const cmd = doc["ranch-tasks"].SessionStart[0].command;
+  assert.ok(cmd.startsWith('node "'), cmd);
+  assert.ok(cmd.endsWith('/.herdr/ranch/bin/ranch-tasks.js" antigravity'), cmd);
+  assert.ok(!cmd.includes("\\"), cmd);
+  assert.equal(statusSummary("win32").agents.antigravity, "installed");
+
+  // POSIX launcher command is unrunnable on win32 -> broken
+  doc["ranch-tasks"].SessionStart[0].command = `${home.replace(/\\/g, "/")}/.herdr/ranch/bin/ranch-tasks antigravity`;
+  writeFileSync(hooksFile, JSON.stringify(doc, null, 2) + "\n");
+  assert.equal(statusSummary("win32").agents.antigravity, "broken");
+});
+
+test("antigravity install with --no-instructions omits rules/AGENTS.md", async (t) => {
+  const home = tempHome();
+  mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+  withEnv(t, { RANCH_HOME: home, PATH: "" });
+
+  await install({ yes: true, agents: ["antigravity"], noInstructions: true });
+
+  const pluginDir = join(home, ".gemini", "config", "plugins", "ranch-tasks");
+  assert.ok(existsSync(join(pluginDir, "plugin.json")));
+  assert.ok(existsSync(join(pluginDir, "hooks.json")));
+  assert.equal(existsSync(join(pluginDir, "rules", "AGENTS.md")), false);
+  assert.equal(existsSync(join(pluginDir, "rules")), false);
+  assert.equal(statusSummary().agents.antigravity, "installed");
+});
+
+test("antigravity reinstall is idempotent", async (t) => {
+  const home = tempHome();
+  mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+  withEnv(t, { RANCH_HOME: home, PATH: "" });
+
+  await install({ yes: true, agents: ["antigravity"] });
+  const pluginDir = join(home, ".gemini", "config", "plugins", "ranch-tasks");
+  const files = [
+    join(pluginDir, "plugin.json"),
+    join(pluginDir, "hooks.json"),
+    join(pluginDir, "rules", "AGENTS.md"),
+  ];
+  const before = files.map((f) => readFileSync(f, "utf8"));
+
+  const lines = await captureOutput(() => install({ yes: true, agents: ["antigravity"] }));
+  assert.deepEqual(files.map((f) => readFileSync(f, "utf8")), before);
+  for (const f of files) {
+    assert.ok(lines.some((l) => l.includes(f) && l.includes("unchanged")), lines.join("\n"));
+  }
+  assert.equal(existsSync(join(home, ".herdr", "ranch", "backups")), false);
+  assert.equal(statusSummary().agents.antigravity, "installed");
+});
+
+test("antigravity install detects agy on PATH without ~/.gemini/antigravity-cli", async (t) => {
+  const home = tempHome();
+  const binDir = join(home, "fake-bin");
+  mkdirSync(binDir, { recursive: true });
+  const agyBin = join(binDir, "agy");
+  writeFileSync(agyBin, "#!/bin/sh\nexit 99\n");
+  chmodSync(agyBin, 0o755);
+  withEnv(t, { RANCH_HOME: home, PATH: binDir });
+
+  await install({ yes: true, agents: ["antigravity"] });
+  const pluginDir = join(home, ".gemini", "config", "plugins", "ranch-tasks");
+  assert.ok(existsSync(join(pluginDir, "plugin.json")));
+  assert.ok(existsSync(join(pluginDir, "hooks.json")));
+  assert.ok(existsSync(join(pluginDir, "rules", "AGENTS.md")));
+  assert.equal(statusSummary().agents.antigravity, "installed");
+
+  await uninstall({ yes: true, agents: ["antigravity"] });
+  assert.equal(existsSync(join(home, ".gemini")), false);
+  assert.equal(statusSummary().agents.antigravity, "missing");
+});
+
+test("antigravity install is skipped when agy is missing", async (t) => {
+  const home = tempHome();
+  withEnv(t, { RANCH_HOME: home, PATH: "" });
+
+  const lines = await captureOutput(() => install({ yes: true, agents: ["antigravity"] }));
+  assert.ok(lines.some((l) => l.includes("skipped")), lines.join("\n"));
+  assert.equal(existsSync(join(home, ".gemini")), false);
+  assert.equal(statusSummary().agents.antigravity, "missing");
+});
+
+test("antigravity uninstall removes owned files and directories created by install", async (t) => {
+  const home = tempHome();
+  mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+  withEnv(t, { RANCH_HOME: home, PATH: "" });
+
+  await install({ yes: true, agents: ["antigravity"] });
+  await uninstall({ yes: true, agents: ["antigravity"] });
+
+  assert.equal(existsSync(join(home, ".gemini", "config")), false);
+  assert.ok(existsSync(join(home, ".gemini", "antigravity-cli")));
+  assert.equal(statusSummary().agents.antigravity, "missing");
+});
+
+test("launcherScript no-node fallback prints {} and exits 0 for antigravity", () => {
+  const script = launcherScript("/nonexistent/node");
+  assert.match(script, /antigravity\)/);
+  assert.match(cmdShimScript(), /"%~1"=="antigravity"/);
+
+  if (process.platform === "win32") return;
+
+  // Strip hardcoded host node locations so the no-node fallback always runs.
+  const isolated = script
+    .replace("/opt/homebrew/bin/node", "/nonexistent/a")
+    .replace("/usr/local/bin/node", "/nonexistent/b")
+    .replace("/usr/bin/node", "/nonexistent/c");
+  const dir = tempHome();
+  const launcher = join(dir, "ranch-tasks");
+  writeFileSync(launcher, isolated);
+  chmodSync(launcher, 0o755);
+
+  const minBin = join(dir, "bin");
+  mkdirSync(minBin, { recursive: true });
+  for (const tool of ["cat", "dirname", "ls", "sort", "tail"]) {
+    const src = existsSync(`/bin/${tool}`) ? `/bin/${tool}` : `/usr/bin/${tool}`;
+    if (existsSync(src)) symlinkSync(src, join(minBin, tool));
+  }
+
+  const agy = spawnSync("/bin/sh", [launcher, "antigravity"], {
+    env: { HOME: dir, PATH: minBin },
+    input: JSON.stringify({ hookEventName: "SessionStart" }),
+    encoding: "utf8",
+  });
+  assert.equal(agy.status, 0, agy.stderr);
+  assert.deepEqual(JSON.parse(agy.stdout), {});
+  assert.equal(agy.stderr, "");
+
+  const claude = spawnSync("/bin/sh", [launcher, "claude"], {
+    env: { HOME: dir, PATH: minBin },
+    input: JSON.stringify({ hook_event_name: "SessionStart" }),
+    encoding: "utf8",
+  });
+  assert.equal(claude.status, 0, claude.stderr);
+  assert.equal(claude.stdout, "");
 });

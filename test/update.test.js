@@ -9,7 +9,9 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { applyUpdate, checkUpdate, updatePaths } from "../adapters/update.js";
+import { repoRoot } from "../adapters/install.js";
 
 // Temp dirs live in os.tmpdir() and are left for the OS to clean.
 function tempHome() {
@@ -201,4 +203,24 @@ test("no manifest: bridge-only only when task reporting is installed and there i
   assert.equal(checkUpdate().bridgeOnly, true);
   mkdirSync(f.herdr, { recursive: true });
   assert.equal(checkUpdate().bridgeOnly, false);
+});
+
+test("applyUpdate refreshes the antigravity plugin via install when task reporting is installed", (t) => {
+  const f = fixture(t);
+  const installMod = pathToFileURL(join(repoRoot(), "adapters", "install.js")).href;
+  write(f.repo, "bin/ranch-tasks", `import { install } from ${JSON.stringify(installMod)};\nawait install({ yes: true });\n`);
+  git(f.repo, "add", "-A");
+  git(f.repo, "commit", "-m", "real install");
+
+  mkdirSync(join(f.home, ".gemini", "antigravity-cli"), { recursive: true });
+  mkdirSync(f.herdr, { recursive: true });
+  write(f.home, ".herdr/ranch/install.json", "{}\n");
+
+  const result = applyUpdate({ yes: true });
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.tasks, "reinstalled");
+  const pluginDir = join(f.home, ".gemini", "config", "plugins", "ranch-tasks");
+  assert.deepEqual(JSON.parse(readFileSync(join(pluginDir, "plugin.json"), "utf8")), { name: "ranch-tasks" });
+  assert.ok(existsSync(join(pluginDir, "hooks.json")));
+  assert.ok(existsSync(join(pluginDir, "rules", "AGENTS.md")));
 });

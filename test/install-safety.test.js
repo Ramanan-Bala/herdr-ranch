@@ -247,3 +247,66 @@ test("a person's own (non-Ranch) file at the plugin path is not drift", async (t
   writeFileSync(plugin, "// my own plugin\nexport default {};\n");
   assert.equal(statusSummary(process.platform).agents.claude, "installed");
 });
+
+// --------------------------------------------------------------- antigravity
+
+test("antigravity uninstall removes only owned unchanged files and keeps a user-modified hooks.json", async (t) => {
+  const home = tempHome();
+  withEnv(t, home);
+  mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+  await captureOutput(() => install({ yes: true, agents: ["antigravity"], platform: process.platform }));
+
+  const pluginDir = join(home, ".gemini", "config", "plugins", "ranch-tasks");
+  const pluginJson = join(pluginDir, "plugin.json");
+  const hooksJson = join(pluginDir, "hooks.json");
+  const rulesMd = join(pluginDir, "rules", "AGENTS.md");
+  const edited = readFileSync(hooksJson, "utf8") + "\n";
+  writeFileSync(hooksJson, edited);
+
+  const lines = await captureOutput(() => uninstall({ yes: true, agents: ["antigravity"] }));
+  assert.equal(existsSync(pluginJson), false);
+  assert.equal(existsSync(rulesMd), false);
+  assert.equal(existsSync(join(pluginDir, "rules")), false);
+  assert.equal(existsSync(hooksJson), true);
+  assert.equal(readFileSync(hooksJson, "utf8"), edited);
+  assert.ok(
+    lines.some((l) => l.includes(hooksJson) && l.includes("changed since install, left as is")),
+    lines.join("\n"),
+  );
+});
+
+test("antigravity install and uninstall leave an existing user ~/.gemini/config/hooks.json byte-for-byte untouched", async (t) => {
+  const home = tempHome();
+  withEnv(t, home);
+  mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+  mkdirSync(join(home, ".gemini", "config"), { recursive: true });
+  const userHooks = join(home, ".gemini", "config", "hooks.json");
+  const original = '{\n  "my-custom-hook":   {\n    "Stop": [{"type":"command","command":"echo hi"}]\n  }\n}\n';
+  writeFileSync(userHooks, original);
+
+  await captureOutput(() => install({ yes: true, agents: ["antigravity"], platform: process.platform }));
+  assert.equal(readFileSync(userHooks, "utf8"), original);
+
+  await captureOutput(() => uninstall({ yes: true, agents: ["antigravity"] }));
+  assert.equal(readFileSync(userHooks, "utf8"), original);
+  assert.equal(existsSync(join(home, ".gemini", "config", "plugins")), false);
+});
+
+test("pre-existing custom antigravity hooks.json is backed up and restored byte-identical", async (t) => {
+  const home = tempHome();
+  withEnv(t, home);
+  mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+  const pluginDir = join(home, ".gemini", "config", "plugins", "ranch-tasks");
+  mkdirSync(pluginDir, { recursive: true });
+  const hooksJson = join(pluginDir, "hooks.json");
+  const original = '{"custom": true}\n';
+  writeFileSync(hooksJson, original);
+
+  await captureOutput(() => install({ yes: true, agents: ["antigravity"], platform: process.platform }));
+  const backups = backupNames(home, "antigravity-hooks.");
+  assert.equal(backups.length, 1);
+  assert.equal(readFileSync(join(home, ".herdr", "ranch", "backups", backups[0]), "utf8"), original);
+
+  await captureOutput(() => uninstall({ yes: true, agents: ["antigravity"] }));
+  assert.equal(readFileSync(hooksJson, "utf8"), original);
+});

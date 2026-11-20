@@ -147,9 +147,11 @@ test("defaultBranchLine", () => {
   assert.equal(defaultBranchLine({ branch: null, default: "main", vsDefault: { ahead: 1, behind: 0 } }).kind, "diverged");
 });
 
-test("TASK_AGENTS and adapterKey include Pi", () => {
+test("TASK_AGENTS and adapterKey include Pi and Antigravity", () => {
   assert.equal(TASK_AGENTS.has("pi"), true);
   assert.equal(adapterKey("pi"), "pi");
+  assert.equal(TASK_AGENTS.has("antigravity"), true);
+  assert.equal(adapterKey("antigravity"), "antigravity");
 });
 
 test("taskEmptyState", () => {
@@ -157,10 +159,11 @@ test("taskEmptyState", () => {
   assert.equal(taskEmptyState(ok([{ title: "x" }]), "claude-code"), null);
   assert.deepEqual(taskEmptyState(ok([]), "claude-code"), { text: "No plan yet." });
   assert.deepEqual(taskEmptyState(ok([]), "pi"), { text: "No plan yet." });
+  assert.deepEqual(taskEmptyState(ok([]), "antigravity"), { text: "No plan yet." });
   assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, "claude"), { text: "No plan yet." });
   assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, "codex"), { text: "No plan yet." });
   assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, "opencode"), { text: "No plan yet." });
-  for (const app of ["claude-code", "claude", "codex", "opencode", "pi"]) {
+  for (const app of ["claude-code", "claude", "codex", "opencode", "pi", "antigravity"]) {
     assert.deepEqual(taskEmptyState({ ok: false, reason: "missing" }, app, "missing"), {
       text: "Task reporting isn't set up", setup: true,
     });

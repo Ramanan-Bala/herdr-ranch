@@ -1,17 +1,22 @@
 // ranch-tasks CLI (requirements.md §7.4). Subcommands:
 //   claude | codex | pi               hook entry points — read stdin JSON,
 //                                     update the store, print NOTHING, exit 0
+//   antigravity                       Antigravity CLI hook entry point — reads
+//                                     stdin JSON, updates store, prints JSON, exits 0
 //   install [--yes] [--agents a,b,c]  set the hooks up
 //   uninstall [--yes]                 take them back out
 //   status [--json]                   what's installed where
 //   update [check] [--yes] [--json]   self-update from the repo's main branch
 //   gc                                delete store files for dead terminals
 //   plan "<status>: <title>" ...      report the whole task list in one go
-import { readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { hookError, homeDir, recordSharedPr, terminalPath, updateStore } from "./store.js";
 import { parsePlanArgs, planSummary } from "./plan.js";
 import { agentApp } from "../lib/tasks.js";
+import { applyAntigravity } from "./antigravity.js";
 import { applyClaude } from "./claude.js";
 import { applyCodex } from "./codex.js";
 import { applyPi } from "./pi.js";
@@ -80,13 +85,210 @@ function runHook(agent, apply) {
   }
 }
 
-const REFUSAL = "ranch: this terminal is not running a Codex session; refusing to change its task list";
+const PBTXT_ESCAPES = {
+  a: 0x07, b: 0x08, f: 0x0c, n: 0x0a, r: 0x0d, t: 0x09, v: 0x0b, '"': 0x22, "'": 0x27, "\\": 0x5c, "?": 0x3f,
+};
+const UUID_RE = /^[0-9a-f-]{36}$/i;
+const MAX_TASK_MD = 256 * 1024;
+
+function decodePbtxtString(raw) {
+  const bytes = [];
+  for (let i = 0; i < raw.length; ) {
+    if (raw[i] === "\\" && i + 1 < raw.length) {
+      const rest = raw.slice(i + 1);
+      const oct = /^[0-7]{1,3}/.exec(rest);
+      if (oct) {
+        bytes.push(parseInt(oct[0], 8) & 0xff);
+        i += 1 + oct[0].length;
+        continue;
+      }
+      const hex = /^x([0-9a-fA-F]{1,2})/.exec(rest);
+      if (hex) {
+        bytes.push(parseInt(hex[1], 16));
+        i += 1 + hex[0].length;
+        continue;
+      }
+      const u4 = /^u([0-9a-fA-F]{4})/.exec(rest);
+      if (u4) {
+        for (const b of Buffer.from(String.fromCodePoint(parseInt(u4[1], 16)), "utf8")) bytes.push(b);
+        i += 1 + u4[0].length;
+        continue;
+      }
+      const u8 = /^U([0-9a-fA-F]{8})/.exec(rest);
+      if (u8) {
+        const cp = parseInt(u8[1], 16);
+        if (cp <= 0x10ffff) {
+          for (const b of Buffer.from(String.fromCodePoint(cp), "utf8")) bytes.push(b);
+        }
+        i += 1 + u8[0].length;
+        continue;
+      }
+      const esc = raw[i + 1];
+      if (Object.prototype.hasOwnProperty.call(PBTXT_ESCAPES, esc)) {
+        bytes.push(PBTXT_ESCAPES[esc]);
+      } else {
+        for (const b of Buffer.from(esc, "utf8")) bytes.push(b);
+      }
+      i += 2;
+      continue;
+    }
+    const cp = raw.codePointAt(i);
+    const ch = String.fromCodePoint(cp);
+    for (const b of Buffer.from(ch, "utf8")) bytes.push(b);
+    i += ch.length;
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+function readPbtxtTitle(home, conversationId) {
+  try {
+    const path = join(home, ".gemini", "antigravity-cli", "annotations", `${conversationId}.pbtxt`);
+    const text = readFileSync(path, "utf8");
+    const match = /(?:^|\r?\n)\s*title\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/.exec(text);
+    if (!match) return null;
+    const title = decodePbtxtString(match[1] ?? match[2] ?? "").trim();
+    return title || null;
+  } catch {
+    return null;
+  }
+}
+
+async function readAntigravitySqlite(home, conversationId) {
+  const dbPath = join(home, ".gemini", "antigravity-cli", "conversation_summaries.db");
+  if (!existsSync(dbPath)) return null;
+  let db;
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    db = new DatabaseSync(`${pathToFileURL(dbPath).href}?immutable=1`, { readOnly: true });
+    const row = db
+      .prepare("SELECT title, parent_conversation_id FROM conversation_summaries WHERE conversation_id = ?")
+      .get(conversationId);
+    if (!row) return null;
+    return {
+      title: typeof row.title === "string" && row.title.trim() ? row.title.trim() : null,
+      parent_conversation_id: typeof row.parent_conversation_id === "string" && row.parent_conversation_id
+        ? row.parent_conversation_id
+        : null,
+    };
+  } catch {
+    return null;
+  } finally {
+    try { db?.close(); } catch {}
+  }
+}
+
+function readAntigravityTaskMd(artifactDirectoryPath, home) {
+  if (typeof artifactDirectoryPath !== "string" || !artifactDirectoryPath) return undefined;
+  try {
+    const realGemini = realpathSync(resolve(home, ".gemini"));
+    const realTask = realpathSync(resolve(artifactDirectoryPath, "task.md"));
+    const rel = relative(realGemini, realTask);
+    if (!rel || rel.startsWith("..") || isAbsolute(rel)) return undefined;
+    const stat = statSync(realTask);
+    if (!stat.isFile() || stat.size >= MAX_TASK_MD) return undefined;
+    return readFileSync(realTask, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+async function enrichAntigravityPayload(payload, home) {
+  const out = { ...payload };
+  const cid = typeof payload.conversationId === "string" && UUID_RE.test(payload.conversationId)
+    ? payload.conversationId
+    : null;
+  let title = typeof out.session_title === "string" && out.session_title.trim()
+    ? out.session_title.trim()
+    : null;
+  if (cid) {
+    if (!title) title = readPbtxtTitle(home, cid);
+    const dbInfo = await readAntigravitySqlite(home, cid);
+    if (dbInfo) {
+      if (!out.parent_conversation_id && dbInfo.parent_conversation_id) {
+        out.parent_conversation_id = dbInfo.parent_conversation_id;
+      }
+      if (!title && dbInfo.title) title = dbInfo.title;
+    }
+  }
+  if (title) out.session_title = title;
+  if (out.task_md === undefined) {
+    const taskMd = readAntigravityTaskMd(payload.artifactDirectoryPath, home);
+    if (taskMd !== undefined) out.task_md = taskMd;
+  }
+  return out;
+}
 
 /**
- * `ranch-tasks plan "<status>: <title>" ...`: the Codex agent reports its
- * whole task list in one shell command. Writes through the normal store
+ * Antigravity CLI (agy) hook entry point. agy requires a valid JSON object on
+ * stdout on every invocation, so we always emit one JSON line (`{}` minimum)
+ * and exit 0, even when HC_TERMINAL_ID is unset or stdin is malformed.
+ * Stale installs may still invoke us on PreToolUse; because agy treats `{}` as
+ * a deny, PreToolUse skips the store update and replies `{"decision":"ask"}`
+ * (respecting agy's normal permission flow; never "allow" or "deny").
+ */
+async function runAntigravityHook() {
+  let out = {};
+  try {
+    let text = "";
+    try {
+      text = readFileSync(0, "utf8");
+    } catch {
+      return;
+    }
+    let payload = null;
+    try {
+      if (text.trim()) payload = JSON.parse(text);
+    } catch {
+      if (/"hookEventName"\s*:\s*"PreToolUse"/.test(text)) out = { decision: "ask" };
+      return;
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
+    if (payload.hookEventName === "PreToolUse") {
+      out = { decision: "ask" };
+      return;
+    }
+    if (!process.env.HC_TERMINAL_ID) return;
+    const home = homeDir();
+    payload = await enrichAntigravityPayload(payload, home);
+    const next = updateStore("antigravity", (store) => {
+      const updated = applyAntigravity(store, payload);
+      if (typeof updated?.hook_error === "string") {
+        hookError(updated.hook_error);
+        delete updated.hook_error;
+      }
+      return updated;
+    });
+    if (process.env.RANCH_REMIND !== "0") {
+      const event = payload.hookEventName === "SessionStart"
+        ? "SessionStart"
+        : payload.hookEventName === "PreInvocation" && payload.invocationNum === 0
+          ? "UserPromptSubmit"
+          : null;
+      if (event) {
+        const taskFile = typeof payload.artifactDirectoryPath === "string" && payload.artifactDirectoryPath
+          ? join(payload.artifactDirectoryPath, "task.md")
+          : undefined;
+        const text = reminderFor("antigravity", event, next, home, { taskFile });
+        if (text) out = { injectSteps: [{ systemMessage: { systemMessage: text } }] };
+      }
+    }
+  } catch (err) {
+    hookError(err);
+    out = {};
+  } finally {
+    process.stdout.write(JSON.stringify(out) + "\n");
+  }
+}
+
+const PLAN_AGENTS = new Set(["codex", "antigravity"]);
+const REFUSAL = "ranch: this terminal is not running a Codex or Antigravity session; refusing to change its task list";
+
+/**
+ * `ranch-tasks plan "<status>: <title>" ...`: Codex or Antigravity reports
+ * its whole task list in one shell command. Writes through the normal store
  * writer and reducer only; refuses unless the terminal is live and already
- * running a Codex session (never adopted, no pointer writes, no new locks).
+ * running a Codex or Antigravity session (never adopted, no pointer writes,
+ * no new locks).
  */
 function runPlan(args) {
   if (!process.env.HC_TERMINAL_ID) {
@@ -107,22 +309,29 @@ function runPlan(args) {
   } catch {
     // missing or unreadable pointer: refused below
   }
-  if (agentApp(raw?.agent) !== "codex") {
+  const app = agentApp(raw?.agent);
+  if (!PLAN_AGENTS.has(app)) {
     console.error(REFUSAL);
     process.exitCode = 1;
     return;
   }
   let wrote = false;
   try {
-    updateStore("codex", (store) => {
+    updateStore(app, (store) => {
       // Guard 2, inside the lock: covers a race with another writer that
       // re-pointed the terminal between the check above and this read.
-      if (agentApp(store?.agent) !== "codex" || typeof store?.session?.id !== "string" || !store.session.id) return null;
+      const storeApp = agentApp(store?.agent);
+      if (!PLAN_AGENTS.has(storeApp) || typeof store?.session?.id !== "string" || !store.session.id) return null;
       wrote = true;
-      return applyCodex(store, { hook_event_name: "PostToolUse", tool_name: "update_plan", tool_input: { plan: parsed.plan } });
+      return storeApp === "antigravity"
+        ? applyAntigravity(store, { hookEventName: "RanchPlan", plan: parsed.plan })
+        : applyCodex(store, { hook_event_name: "PostToolUse", tool_name: "update_plan", tool_input: { plan: parsed.plan } });
     });
   } catch (err) {
-    console.error(`ranch: could not write the task list (${err?.code ?? err?.message}). If Codex runs sandboxed, add ~/.herdr/ranch to sandbox_workspace_write.writable_roots or enable [tools.update_plan] (see RECIPE.md)`);
+    const hint = app === "codex"
+      ? " If Codex runs sandboxed, add ~/.herdr/ranch to sandbox_workspace_write.writable_roots or enable [tools.update_plan] (see RECIPE.md)"
+      : "";
+    console.error(`ranch: could not write the task list (${err?.code ?? err?.message}).${hint}`);
     process.exitCode = 1;
     hookError(err);
     return;
@@ -242,7 +451,7 @@ function humanUpdate(result) {
 }
 
 const USAGE =
-  'usage: ranch-tasks <claude|codex|pi|plan "<status>: <title>" ...|doctor [--json]|install [--yes] [--no-instructions] [--agents claude,codex,opencode,pi]|uninstall [--yes]|status [--json]|update [check] [--yes] [--json]|gc>';
+  'usage: ranch-tasks <claude|codex|pi|antigravity|plan "<status>: <title>" ...|doctor [--json]|install [--yes] [--no-instructions] [--agents claude,codex,opencode,pi,antigravity]|uninstall [--yes]|status [--json]|update [check] [--yes] [--json]|gc>';
 
 export async function main(argv) {
   const [command = "", ...rest] = argv ?? [];
@@ -256,6 +465,10 @@ export async function main(argv) {
   }
   if (command === "pi") {
     runHook("pi", applyPi);
+    return;
+  }
+  if (command === "antigravity") {
+    await runAntigravityHook();
     return;
   }
   if (command === "plan") {

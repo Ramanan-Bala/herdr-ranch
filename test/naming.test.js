@@ -41,6 +41,8 @@ test("cleanTitle strips glyphs, agent names, paths and user@host", () => {
   assert.equal(cleanTitle("Fix login — Claude Code"), "Fix login");
   assert.equal(cleanTitle("Pi — Fix pipeline"), "Fix pipeline");
   assert.equal(cleanTitle("Fix pipeline — Pi"), "Fix pipeline");
+  assert.equal(cleanTitle("Antigravity — Fix login"), "Fix login");
+  assert.equal(cleanTitle("Fix login — Antigravity"), "Fix login");
   // "Pi" is only an agent name as a whole word at the start or end.
   assert.equal(cleanTitle("Pin deps"), "Pin deps");
   assert.equal(cleanTitle("Fix pipeline"), "Fix pipeline");
@@ -55,6 +57,8 @@ test("cleanTitle rejects empty and generic titles", () => {
   assert.equal(cleanTitle("New session"), null);
   assert.equal(cleanTitle("OpenCode"), null);
   assert.equal(cleanTitle("pi"), null);
+  assert.equal(cleanTitle("Antigravity"), null);
+  assert.equal(cleanTitle("agy"), null);
   assert.equal(cleanTitle("claude"), null);
   assert.equal(cleanTitle("Ranch", { repo: "ranch" }), null);
   assert.equal(cleanTitle("12345"), null);
@@ -324,6 +328,7 @@ test("recallSession returns null on misses", () => {
 
 test("agent names are stripped only at the edges", () => {
   assert.equal(cleanTitle("Fix Claude adapter"), "Fix Claude adapter");
+  assert.equal(cleanTitle("Fix Antigravity adapter"), "Fix Antigravity adapter");
   assert.equal(cleanTitle("Claude Code — Fix login"), "Fix login");
   assert.equal(cleanTitle("Fix login · Codex"), "Fix login");
 });
@@ -443,7 +448,7 @@ test("sessionChanged and withRecordSession", () => {
 // --------------------------------------- launcher-named tabs (Herdr New menu)
 
 test("a tab named after its agent by the launcher is not locked", () => {
-  for (const name of ["Pi", "Claude Code", "codex", "OpenCode", "Pi 2", " zsh "]) {
+  for (const name of ["Pi", "Claude Code", "codex", "OpenCode", "Antigravity", "Pi 2", " zsh "]) {
     assert.equal(isLauncherName(name), true, name);
     assert.equal(ownership({ name, named: true }, undefined), "unnamed", name);
   }

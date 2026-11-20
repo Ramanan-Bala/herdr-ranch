@@ -210,6 +210,11 @@ export function parseStore(text) {
       tasks,
       subagents,
       prs,
+      // Antigravity: hash of the last task.md applied, so an unchanged
+      // planner checklist never overwrites a newer `ranch-tasks plan` list.
+      ...(typeof raw.antigravity_task_md === "string" && raw.antigravity_task_md
+        ? { antigravity_task_md: raw.antigravity_task_md.slice(0, 64) }
+        : {}),
     },
   };
 }
@@ -272,7 +277,7 @@ export function storeFileName(address) {
 /** Cap for a terminal pointer's session index (most recent first). */
 export const SESSION_INDEX_MAX = 20;
 
-const GENERIC_TITLES = new Set(["new session", "opencode", "oc", "claude code", "pi"]);
+const GENERIC_TITLES = new Set(["new session", "opencode", "oc", "claude code", "pi", "antigravity"]);
 
 /**
  * Comparison key for a session title, or null when the title says nothing

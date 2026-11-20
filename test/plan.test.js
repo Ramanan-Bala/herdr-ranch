@@ -187,7 +187,7 @@ test("plan refuses a Claude terminal and writes nothing", () => {
   const before = snapshot(home);
   const out = run(["plan", "done: A"], null, home);
   assert.equal(out.status, 1);
-  assert.match(out.stderr, /not running a Codex session/);
+  assert.match(out.stderr, /not running a Codex or Antigravity session/);
   assert.deepEqual(snapshot(home), before);
 });
 
@@ -196,8 +196,48 @@ test("plan refuses a terminal with no pointer file and writes nothing", () => {
   const before = snapshot(home);
   const out = run(["plan", "done: A"], null, home);
   assert.equal(out.status, 1);
-  assert.match(out.stderr, /not running a Codex session/);
+  assert.match(out.stderr, /not running a Codex or Antigravity session/);
   assert.deepEqual(snapshot(home), before);
+});
+
+test("ranch-tasks plan writes the session store in an antigravity terminal", () => {
+  const home = tempHome();
+  const cid = "11111111-1111-4111-8111-111111111111";
+  const started = run(["antigravity"], JSON.stringify({
+    hookEventName: "SessionStart", conversationId: cid,
+  }), home);
+  assert.equal(started.status, 0);
+
+  const out = run(["plan", "done: Survey", "doing: Implement", "todo: Test"], null, home);
+  assert.equal(out.status, 0);
+  assert.match(out.stdout, /3 tasks/);
+
+  const disk = parseStore(readFileSync(join(tasksDir(home), "sessions", `${cid}.json`), "utf8"));
+  assert.equal(disk.ok, true);
+  assert.equal(disk.store.agent.app, "antigravity");
+  assert.deepEqual(disk.store.tasks, [
+    { id: "1", title: "Survey", status: "completed", active_form: null },
+    { id: "2", title: "Implement", status: "in_progress", active_form: null },
+    { id: "3", title: "Test", status: "pending", active_form: null },
+  ]);
+});
+
+test("antigravity plan clears missed_turns and prevents Stop miss", () => {
+  const home = tempHome();
+  const cid = "22222222-2222-4222-8222-222222222222";
+  run(["antigravity"], JSON.stringify({ hookEventName: "SessionStart", conversationId: cid }), home);
+  run(["antigravity"], JSON.stringify({
+    hookEventName: "PreInvocation", invocationNum: 0, lastUserInput: "go", conversationId: cid,
+  }), home);
+  run(["antigravity"], JSON.stringify({
+    hookEventName: "PostToolUse", stepIdx: 1, toolCall: { id: "c1", name: "run_command", args: { CommandLine: "ls" } }, conversationId: cid,
+  }), home);
+  assert.equal(run(["plan", "doing: Work"], null, home).status, 0);
+  run(["antigravity"], JSON.stringify({
+    hookEventName: "Stop", terminationReason: "NO_TOOL_CALL", conversationId: cid,
+  }), home);
+  const disk = parseStore(readFileSync(join(tasksDir(home), "sessions", `${cid}.json`), "utf8"));
+  assert.equal(disk.store.missed_turns, 0);
 });
 
 test("the old codex update_plan hook path still replaces tasks", () => {
