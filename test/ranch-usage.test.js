@@ -344,6 +344,33 @@ test("antigravity parse: 5 windows in group order with 5h before weekly, correct
   assert.deepEqual(r.windows.map((w) => w.durationSec), [18000, 604800, 18000, 604800, 604800]);
 });
 
+test("antigravity parse: an unstarted window's 1970 reset_time means no reset, not expired", () => {
+  const r = parseAntigravity(JSON.stringify({
+    status: "SUCCESS",
+    command: {
+      name: "usage",
+      data: {
+        groups: [
+          { name: "Gemini Models", buckets: [{ id: "gemini-5h", window: "5h", remaining_fraction: 0.5, reset_time: "2026-11-20T08:40:36Z" }] },
+          {
+            name: "Claude and GPT models",
+            buckets: [
+              { id: "3p-weekly", window: "weekly", remaining_fraction: 1, reset_time: "1970-01-01T00:00:00Z" },
+              { id: "3p-5h", window: "5h", remaining_fraction: 1, reset_time: "1970-01-01T00:00:00Z" },
+            ],
+          },
+        ],
+      },
+    },
+  }), NOW);
+  assert.equal(r.status, "ok");
+  assert.deepEqual(r.windows.map((w) => [w.id, w.percent, w.resetsAt]), [
+    ["gemini-5h", 50, Date.parse("2026-11-20T08:40:36Z") / 1000],
+    ["3p-5h", 0, null],
+    ["3p-weekly", 0, null],
+  ]);
+});
+
 test("antigravity parse: disabled bucket and non-numeric remaining_fraction skipped; missing id falls back to index", () => {
   const r = parseAntigravity(JSON.stringify({
     status: "SUCCESS",

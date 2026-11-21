@@ -53,6 +53,13 @@ const textColor = (level, text, t) => (level === "ok" ? (text === "—" ? t.dim 
 const limitColor = (level, text, t) => (text === "—" ? t.dim : levelColor(level, t));
 
 // One-colour glyphs (tint) take the text colour; full-colour logos draw as images.
+// GPUI can't report whether text was cut off, so estimate it from the text and
+// the room it has: truncated text gets its full value as a tooltip.
+const INNER_W = PANEL_W - 28; // the panel's content width (p(14) each side)
+const fits = (text, px, size = 12) => String(text ?? "").length * size * 0.56 <= px;
+const clip = (id, text, px, size = 12) => div().id(id).min_w(0).truncate()
+  .when(!fits(text, px, size), (e) => e.tooltip(String(text))).child(text);
+
 const providerIcon = (p, size, t) => (p.tint ? svg(p.icon).size(size).flex_none().text_color(t.foreground) : image(p.icon).size(size).flex_none());
 
 function usageBar(width, fill, tick, color, t) {
@@ -292,24 +299,26 @@ export default class UsageLimits extends View {
   // ---------- panel: limits ----------
 
   cardRow(r, providerId, t) {
+    const labelW = INNER_W - PANEL_BAR_W - (this.prefs().showRemaining ? PCT_W.remaining : PCT_W.used) - LEFT_W - 24;
     return v_flex().gap(3)
       .child(h_flex().id(`ul-row-${providerId}-${r.id}`).gap(8).items_center()
         .when(r.hint != null, (e) => e.tooltip(r.hint))
-        .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(r.long))
+        .child(clip(`ul-row-${providerId}-${r.id}-label`, r.long, labelW).flex_1().text_color(t.muted))
         .child(usageBar(PANEL_BAR_W, r.fill, r.tick, levelColor(r.level, t), t))
         .child(div().w(this.prefs().showRemaining ? PCT_W.remaining : PCT_W.used).flex_none().flex().justify_end().whitespace_nowrap().text_color(textColor(r.level, r.percent, t)).child(r.percent))
         .child(div().w(LEFT_W).flex_none().flex().justify_end().whitespace_nowrap().text_size(11).text_color(t.dim).child(r.left)))
-      .when(r.detail !== "", (e) => e.child(div().text_size(11).text_color(t.dim).truncate().child(r.detail)));
+      .when(r.detail !== "", (e) => e.child(clip(`ul-row-${providerId}-${r.id}-detail`, r.detail, INNER_W, 11).text_size(11).text_color(t.dim)));
   }
 
   cardGroup(g, t) {
+    const statusW = INNER_W - 13 - 24 - String(g.name).length * 7.5 - (g.plan != null ? String(g.plan).length * 6 + 16 : 0);
     return v_flex().gap(8)
       .child(h_flex().gap(6).items_center()
         .child(providerIcon(g, 13, t))
         .child(div().flex_none().font_semibold().child(g.name))
         .when(g.plan != null, (e) => e.child(div().flex_none().px(5).rounded(4).bg(t.raised).text_size(10).text_color(t.accent).child(g.plan)))
         .child(div().flex_1())
-        .child(div().min_w(0).truncate().text_size(11).text_color(g.failed ? levelColor("hot", t) : t.dim).child(g.status)))
+        .child(clip(`ul-status-${g.providerId}`, g.status, statusW, 11).text_size(11).text_color(g.failed ? levelColor("hot", t) : t.dim)))
       .when(g.age != null, (e) => e.child(div().text_size(11).text_color(t.dim).child(g.age)))
       .child(v_flex().gap(6).opacity(g.dim ? 0.55 : 1).children(g.rows.map((r) => this.cardRow(r, g.providerId, t))));
   }
@@ -319,7 +328,7 @@ export default class UsageLimits extends View {
     return v_flex().gap(4)
       .child(h_flex().gap(6).items_center()
         .child(div().flex_none().font_semibold().child("This session"))
-        .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(v.title))
+        .child(clip("ul-session-title", v.title, INNER_W - 84 - (v.context.fill != null ? SESSION_BAR_W + 6 : 0) - (4 + String(v.context.text).length) * 7 - 12).flex_1().text_color(t.dim))
         .when(v.context.fill != null, (r) => r.child(usageBar(SESSION_BAR_W, v.context.fill, null, levelColor(v.context.level, t), t)))
         .child(div().flex_none().whitespace_nowrap().text_color(textColor(v.context.level, v.context.text, t)).child(`ctx ${v.context.text}`)))
       .child(div().text_size(11).text_color(t.dim).child(stats));
@@ -345,7 +354,7 @@ export default class UsageLimits extends View {
         .child(div().text_size(11).font_semibold().child("Not reported by its CLI"))
         .children(this.unreported.map((u) => h_flex().id(`ul-unreported-${u.id}`).gap(6).items_center()
           .child(image(u.icon).size(13))
-          .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.muted).child(u.name))
+          .child(clip(`ul-unreported-${u.id}-name`, u.name, INNER_W - 13 - 12 - 76, 11).flex_1().text_size(11).text_color(t.muted))
           .child(div().id(`ul-open-${u.id}`).text_size(11).text_color(t.accent).cursor_pointer()
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .on_click((_e, cx) => { cx.stop_propagation(); this.openUrl(u.url); })
@@ -358,62 +367,88 @@ export default class UsageLimits extends View {
     if (session) body.child(v_flex().pt(10).border_t(1).border_color(t.border).child(this.sessionBlock(session, t)));
     const cooling = this.cooling();
     return body.child(h_flex().gap(2).items_center()
-      .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).child("Data: claude, codex, gh, opencode and agy CLIs, numbers from session logs."))
+      .child(clip("ul-data-note", "Data: claude, codex, gh, opencode and agy CLIs, numbers from session logs.", INNER_W - 52, 10.5).flex_1().text_size(10.5).text_color(t.dim))
       .child(this.iconButton("ul-refresh", "refresh", cooling ? "Refreshing…" : "Refresh now", !cooling, (cx) => this.refresh(cx), t))
       .child(this.iconButton("ul-settings", "gear", "Settings", true, (cx) => this.show("settings", cx), t)));
   }
 
   // ---------- panel: settings ----------
+  // Same grammar as the Ranch settings panel: sections split by a hairline, one
+  // row shape (label left, switch right). Labels truncate; a provider's problem
+  // wraps on a hint line under its name, so nothing can push past the card edge.
 
-  check(id, on, label, onToggle, t, indent = 0, extra = null) {
-    return h_flex().id(id).gap(8).items_center().pl(indent).py(3).rounded(4).cursor_pointer()
+  /** Ranch's switch: a 26×14 track with a dot, accent when on. */
+  pill(id, on, t) {
+    return div().id(`${id}-pill`).flex_none().w(26).h(14).rounded(7).p(2).flex().items_center().border(1).border_color(t.border)
+      .bg(on ? t.accent : t.input).when(on, (e) => e.justify_end())
+      .child(div().size(8).rounded(4).bg(on ? t.accent_foreground : t.muted));
+  }
+
+  /** One settings row. `indent` nests a row under its parent's label; `hint` wraps under the label. */
+  toggleRow(id, label, on, onToggle, t, { icon = null, indent = 0, color = null, hint = null, hintColor = null, tooltip = null } = {}) {
+    return h_flex().id(id).w_full().min_w(0).min_h(26).pl(6 + indent).pr(6).gap(8).items_center().rounded(5).cursor_pointer()
       .hover((s) => s.bg(t.hover))
+      .when(tooltip != null, (e) => e.tooltip(tooltip))
       .on_click((_e, cx) => { onToggle(); cx.notify(); })
-      .child(div().size(13).rounded(3).border(1).border_color(on ? t.accent : t.input).bg(on ? t.accent : t.popover)
-        .flex().items_center().justify_center().text_size(9).text_color(t.accent_foreground).child(on ? "✓" : ""))
-      .children(label)
-      .when(extra != null, (e) => e.child(div().text_color(t.dim).truncate().child(extra)));
+      .when(icon != null, (e) => e.child(icon))
+      .child(v_flex().flex_1().min_w(0).py(hint != null ? 4 : 0).gap(2)
+        .child(clip(`${id}-label`, label, INNER_W - 12 - indent - (icon != null ? 22 : 0) - 34).text_color(color ?? t.foreground))
+        .when(hint != null, (e) => e.child(div().w_full().min_w(0).text_size(11).text_color(hintColor ?? t.dim).child(hint))))
+      .child(this.pill(id, on, t));
+  }
+
+  /** A section: heading plus rows; every section after the first starts with a hairline. */
+  settingsSection(id, title, rows, t, first = false) {
+    return v_flex().id(`ul-sec-${id}`).w_full().min_w(0).flex_none().pt(first ? 0 : 8)
+      .when(!first, (e) => e.border_t(1).border_color(t.border))
+      .child(div().flex_none().h(24).px(6).flex().items_center().text_size(11.5).font_semibold().text_color(t.muted).child(title))
+      .children(rows);
   }
 
   settings(canGoBack, t) {
     const prefs = this.prefs();
     const st = states();
     const save = (p) => setShared(KEY_PREFS, p);
-    const rows = [];
+    const limitRows = [];
     for (const p of PROVIDERS) {
       const s = st[p.id] ?? {};
       const on = isShown(prefs, p.id);
-      const reason = s.installed === false ? "not installed" : s.report && s.report.status !== "ok" ? s.report.message : null;
-      rows.push(this.check(`p-${p.id}`, on, [providerIcon(p, 13, t), div().text_color(s.installed === false ? t.dim : t.foreground).child(p.name)],
-        () => save(toggleProvider(this.prefs(), p.id)), t, 0, reason));
+      const missing = s.installed === false;
+      const problem = !missing && s.report && s.report.status !== "ok" ? String(s.report.message || "No usage reported") : null;
+      // Error text comes straight from CLIs and APIs: keep the hint to two short lines, full text on hover.
+      const hint = missing ? "Not installed" : problem && (problem.length > 120 ? `${problem.slice(0, 117).trimEnd()}…` : problem);
+      limitRows.push(this.toggleRow(`p-${p.id}`, p.name, on, () => save(toggleProvider(this.prefs(), p.id)), t, {
+        icon: providerIcon(p, 14, t),
+        color: missing ? t.dim : t.foreground,
+        hint,
+        hintColor: s.report?.status === "error" ? levelColor("hot", t) : t.dim,
+        tooltip: problem && problem !== hint ? problem : null,
+      }));
       const windows = (s.report?.status === "ok" ? s.report : s.lastGood)?.windows ?? [];
       for (const w of windows) {
-        rows.push(this.check(`w-${p.id}-${w.id}`, on && isShown(prefs, p.id, w.id), [div().text_color(on ? t.muted : t.dim).child(w.long)],
-          () => save(toggleWindow(this.prefs(), p.id, w.id)), t, 21));
+        limitRows.push(this.toggleRow(`w-${p.id}-${w.id}`, w.long, on && isShown(prefs, p.id, w.id),
+          () => save(toggleWindow(this.prefs(), p.id, w.id)), t, { indent: 22, color: on ? t.muted : t.dim }));
       }
     }
-    return this.shell(t)
-      .child(h_flex().gap(6).items_center().h(24)
-        .when(canGoBack, (e) => e.child(this.iconButton("ul-back", "back", "Back to limits", true, (cx) => this.show("limits", cx), t)))
-        .child(div().font_semibold().child("Settings")))
-      .child(div().text_size(11).text_color(t.dim).child("What the bar shows. This panel always shows everything."))
-      .child(v_flex().gap(1).children(rows))
-      .child(div().h(1).bg(t.border).flex_none())
-      .child(this.check("opt-reset-time", prefs.showResetTime, [div().text_color(t.foreground).child("Always show time to reset")],
-        () => save(toggleShowResetTime(this.prefs())), t))
-      .child(this.check("opt-bars", prefs.showBars, [div().text_color(t.foreground).child("Show bars")],
-        () => save(toggleShowBars(this.prefs())), t))
-      .child(this.check("opt-remaining", prefs.showRemaining, [div().text_color(t.foreground).child("Show remaining instead of used")],
-        () => save(toggleShowRemaining(this.prefs())), t))
-      .child(div().h(1).bg(t.border).flex_none())
-      .child(v_flex().gap(1)
-        .child(div().font_semibold().pb(3).child("This session"))
-        .children(["Context", "Calls", "Compactions"].map((name) => {
-          const row = name.toLowerCase();
-          return this.check(`s-${row}`, isOnBar(prefs, row), [div().text_color(t.foreground).child(name)],
-            () => save(toggleOnBar(this.prefs(), row)), t);
-        })))
-      .child(div().text_size(10.5).text_color(t.dim).child("Data: claude, codex, gh, opencode and agy CLIs, numbers from session logs."));
+    const display = [
+      ["opt-reset-time", "Always show time to reset", prefs.showResetTime, toggleShowResetTime],
+      ["opt-bars", "Show bars", prefs.showBars, toggleShowBars],
+      ["opt-remaining", "Show remaining, not used", prefs.showRemaining, toggleShowRemaining],
+    ].map(([id, label, on, flip]) => this.toggleRow(id, label, on, () => save(flip(this.prefs())), t));
+    const session = ["Context", "Calls", "Compactions"].map((name) => {
+      const row = name.toLowerCase();
+      return this.toggleRow(`s-${row}`, name, isOnBar(prefs, row), () => save(toggleOnBar(this.prefs(), row)), t);
+    });
+    return this.shell(t).gap(10)
+      .child(v_flex().w_full().min_w(0).gap(2)
+        .child(h_flex().gap(4).items_center().h(24)
+          .when(canGoBack, (e) => e.child(this.iconButton("ul-back", "back", "Back to limits", true, (cx) => this.show("limits", cx), t)))
+          .child(div().pl(canGoBack ? 0 : 6).font_semibold().child("Usage bar")))
+        .child(div().w_full().min_w(0).px(6).text_size(11).text_color(t.dim).child("Choose what the status bar shows. This panel always lists everything.")))
+      .child(this.settingsSection("limits", "Limits", limitRows, t, true))
+      .child(this.settingsSection("display", "Display", display, t))
+      .child(this.settingsSection("session", "This session", session, t))
+      .child(div().w_full().min_w(0).px(6).text_size(10.5).text_color(t.dim).child("Data: claude, codex, gh, opencode and agy CLIs, numbers from session logs."));
   }
 
   render(cx) {

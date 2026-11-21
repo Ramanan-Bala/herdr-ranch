@@ -33,6 +33,14 @@ function groupPrefix(name, groupIndex) {
   return pick.length > 10 ? pick.slice(0, 10) : pick;
 }
 
+// A window that hasn't started (nothing used in it yet) comes back with
+// reset_time "1970-01-01T00:00:00Z". That is "no reset scheduled", not a reset
+// in the past: the panel would otherwise read it as expired and show "—".
+function resetTime(value) {
+  const at = toEpoch(value);
+  return at != null && at > 0 ? at : null;
+}
+
 function windowRank(win) {
   return Object.prototype.hasOwnProperty.call(ORDER, win) ? ORDER[win] : 2;
 }
@@ -62,7 +70,7 @@ function bucketWindows(groups) {
         short: prefix ? `${prefix} ${winShort}` : winShort,
         long: groupName ? `${groupName} · ${bucketName}` : bucketName,
         percent,
-        resetsAt: toEpoch(b.reset_time),
+        resetsAt: resetTime(b.reset_time),
         durationSec: DURATION[win] ?? null,
       }));
     }
