@@ -1,9 +1,25 @@
 import { View, div, image, svg } from "gpui-kit";
-import { h_flex, v_flex } from "gpui-base";
-import { theme, run, props, window, shared, setShared, updates, layout, agents, spaces, panes, machines, checking, exec } from "herdr";
+import { Popover, h_flex } from "gpui-base";
+import { theme, run, props, window, shared, setShared, updates, layout, agents, spaces, panes, machines, checking, exec, terminals } from "herdr";
 import { FILTER_KEY, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
 import { effectiveStatus } from "./lib/format.js";
-import { parsePs, sessionPids, sumUsage, parseLsofListen, sessionPorts, formatMemory } from "./lib/sysstats.js";
+import {
+  parsePs,
+  sessionPids,
+  sumUsage,
+  parseLsofListen,
+  sessionPorts,
+  parseHcGet,
+  attributeTerminals,
+  pushHistory,
+  sweepHistory,
+  herdrUsage,
+  ownerSplit,
+  isOrphan,
+  buildResourceTree,
+  historySamples,
+} from "./lib/sysstats.js";
+import { renderResourcePopover } from "./resources.js";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -58,18 +74,34 @@ export default class RanchChrome extends View {
     // Herdr hands init() no props here; the block's props come from props().
     if (!props()?.status) return;
     // Status bar only: the processes inside Herdr sessions and what they use.
-    // Render can't spawn, so a 5 s tick does the ps/lsof lookups.
+    // Render can't spawn, so a 1 s tick polls every 5 s (or 2 s while open).
     this.stats = null;
     this.statsBusy = false;
+    this.pidCache = new Map();
+    this.refreshDetails = false;
+    this.history = new Map();
+    this.resOpen = false;
+    this.resTab = "resources";
+    this.resSort = "memory";
+    this.collapsed = new Set();
+    this.selected = new Set();
+    this.expanded = new Set();
+    this.confirmKill = null;
+    this.hoveredRow = null;
+    this.lastPollAt = 0;
     if (!checking() && window()?.platform !== "windows") {
       this.pollStats(cx);
-      cx.timer.every(5000, (cx) => this.pollStats(cx));
+      cx.timer.every(1000, (cx) => {
+        const interval = this.resOpen ? 2000 : 5000;
+        if (Date.now() - this.lastPollAt >= interval - 50) this.pollStats(cx);
+      });
     }
   }
 
   pollStats(cx) {
-    if (this.statsBusy) return;
+    if (this.statsBusy || checking() || window()?.platform === "windows") return;
     this.statsBusy = true;
+    this.lastPollAt = Date.now();
     cx.spawn(async (cx) => {
       try {
         let ps = null;
@@ -90,7 +122,116 @@ export default class RanchChrome extends View {
         const pids = sessionPids(procs);
         const usage = sumUsage(procs, pids);
         const ports = lsof && lsof.code === 0 ? sessionPorts(parseLsofListen(lsof.stdout), pids) : null;
-        this.stats = { rssKB: usage.rssKB, cpu: usage.cpu, procs: usage.count, ports };
+
+        let rows = this.stats?.rows ?? [];
+        let other = this.stats?.other ?? { rssKB: 0, cpu: 0, count: 0 };
+        let herdr = this.stats?.herdr ?? herdrUsage(procs);
+        let agentAddresses = this.stats?.agentAddresses ?? new Set();
+        let orphanAddresses = this.stats?.orphanAddresses ?? new Set();
+        let split = this.stats?.split ?? ownerSplit({ herdr, rows, agentAddresses });
+        let localTerms = this.stats?.terminals ?? [];
+        const observedAt = Date.now();
+
+        try {
+          localTerms = (terminals() ?? []).filter((t) =>
+            t && typeof t.address === "string" && t.address
+            && !t.address.includes(":") && !t.address.includes("/")
+            && t.machine == null && t.host == null);
+          const listed = new Set(localTerms.map((t) => t.address));
+          for (const addr of this.pidCache.keys()) {
+            if (!listed.has(addr)) this.pidCache.delete(addr);
+          }
+          for (const addr of this.selected) {
+            if (!listed.has(addr)) this.selected.delete(addr);
+          }
+          for (const addr of this.expanded) {
+            if (!listed.has(addr)) this.expanded.delete(addr);
+          }
+          if (this.hoveredRow && !listed.has(this.hoveredRow)) this.hoveredRow = null;
+          if (typeof this.confirmKill === "string") {
+            if (this.confirmKill.startsWith("row:") && !listed.has(this.confirmKill.slice(4))) {
+              this.confirmKill = null;
+            } else if (this.confirmKill.startsWith("term:") && !listed.has(this.confirmKill.slice(5))) {
+              this.confirmKill = null;
+            } else if (this.confirmKill === "__selected__" && this.selected.size === 0) {
+              this.confirmKill = null;
+            }
+          }
+
+          const refreshAll = Boolean(this.refreshDetails);
+          let fetched = 0;
+          for (const term of localTerms) {
+            if (!refreshAll) {
+              if (this.pidCache.has(term.address)) continue;
+              if (fetched >= 6) break;
+              fetched++;
+            }
+            try {
+              const r = await exec("hc", ["get", "--json", term.address], { timeout: 5000 });
+              if (r && r.code === 0) {
+                const parsed = parseHcGet(r.stdout);
+                if (parsed) this.pidCache.set(term.address, parsed);
+              }
+            } catch {}
+          }
+          if (refreshAll) this.refreshDetails = false;
+
+          const cached = [];
+          for (const term of localTerms) {
+            const c = this.pidCache.get(term.address);
+            if (!c) continue;
+            const labels = term.labels && typeof term.labels === "object" ? term.labels : null;
+            cached.push({
+              ...c,
+              tab: (labels && typeof labels["herdr.tab"] === "string" && labels["herdr.tab"]) || c.tab,
+              space: (labels && typeof labels["herdr.space"] === "string" && labels["herdr.space"]) || c.space,
+              title: typeof term.title === "string" ? term.title : c.title,
+            });
+          }
+
+          const attr = attributeTerminals(procs, cached);
+          rows = attr.terminals;
+          other = attr.other;
+          herdr = herdrUsage(procs);
+          agentAddresses = new Set(localTerms.filter((t) => Boolean(t.agent)).map((t) => t.address));
+          const spList = spaces() ?? [];
+          const knownTabIds = new Set();
+          for (const sp of spList) {
+            for (const tb of sp?.tabs ?? []) {
+              if (typeof tb?.id === "string" && tb.id) knownTabIds.add(tb.id);
+            }
+          }
+          orphanAddresses = new Set(localTerms.filter((t) => isOrphan(t, listed, knownTabIds)).map((t) => t.address));
+          split = ownerSplit({ herdr, rows, agentAddresses });
+          const tree = buildResourceTree({
+            rows,
+            spaces: spList,
+            history: this.history,
+            sort: this.resSort,
+            agentAddresses,
+            orphanAddresses,
+          });
+          for (const [key, bytes] of historySamples(tree)) {
+            pushHistory(this.history, key, bytes, observedAt);
+          }
+          pushHistory(this.history, "herdr", herdr.rssKB * 1024, observedAt);
+          sweepHistory(this.history, observedAt);
+        } catch {}
+
+        this.stats = {
+          rssKB: usage.rssKB,
+          cpu: usage.cpu,
+          procs: usage.count,
+          ports,
+          rows,
+          other,
+          herdr,
+          split,
+          orphanAddresses,
+          agentAddresses,
+          terminals: localTerms,
+          observedAt,
+        };
         cx.notify();
       } finally {
         this.statsBusy = false;
@@ -116,11 +257,33 @@ export default class RanchChrome extends View {
         .child(svg(`mods/ranch-chrome/${icon}.svg`).size(12).flex_none().text_color(t.dim))
         .child(div().truncate().child(text));
       const items = [];
-      if (show.memory && stats) {
-        items.push(item("sb-memory", "memory-stick", formatMemory(stats.rssKB), `Memory used by ${stats.procs} processes in Herdr sessions`));
-      }
-      if (show.cpu && stats) {
-        items.push(item("sb-cpu", "cpu", `${Math.round(stats.cpu)}%`, "CPU used by Herdr sessions (100% = one core)"));
+      if (show.memory || show.cpu) {
+        try {
+          const aliveCount = (stats?.rows ?? []).filter((r) => r.alive).length;
+          const orphanCount = stats?.orphanAddresses?.size ?? 0;
+          const tip = `Resource Manager, ${aliveCount} terminal${aliveCount === 1 ? "" : "s"}\nClick for memory and CPU per terminal`;
+          const trigger = h_flex().id("sb-resources").gap(5).items_center().min_w(0).flex_shrink(1)
+            .cursor_pointer().hover((s) => s.text_color(t.foreground))
+            .tooltip(tip)
+            .child(svg("mods/ranch-chrome/memory-stick.svg").size(12).flex_none().text_color(t.dim))
+            .child(svg("mods/ranch-chrome/square-terminal.svg").size(12).flex_none().text_color(t.dim))
+            .child(div().truncate().child(String(aliveCount)))
+            .when(orphanCount > 0, (el) => el.child(div().text_color(t.blocked).child(`(${orphanCount})`)));
+          items.push(Popover.new("sb-resources-popover").anchor("bottom_right")
+            .open(!!this.resOpen)
+            .on_open_change((open, cx) => {
+              this.resOpen = open;
+              if (!open) {
+                this.confirmKill = null;
+                this.hoveredRow = null;
+              } else if (!checking() && window()?.platform !== "windows") {
+                this.pollStats(cx);
+              }
+              cx.notify();
+            })
+            .trigger(trigger)
+            .content(renderResourcePopover(this, t, stats)));
+        } catch {}
       }
       if (show.terminals) {
         const n = panes().filter((p) => p.terminal).length;
