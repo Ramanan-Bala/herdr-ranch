@@ -18,6 +18,7 @@ const {
   subtitle,
   totalsOf,
   unfinishedCount,
+  taskListHeight,
   defaultBranchLine,
   taskEmptyState,
   TASK_AGENTS,
@@ -77,6 +78,14 @@ test("totalsOf and unfinishedCount", () => {
   assert.equal(unfinishedCount(tasks(2, "completed")), 0);
   assert.equal(unfinishedCount([...tasks(3, "pending"), ...tasks(2, "in_progress"), tasks(1, "completed")[0]]), 5);
   assert.equal(unfinishedCount(null), 0);
+});
+
+test("task lists scroll only beyond five rows", () => {
+  assert.equal(taskListHeight(0), null);
+  assert.equal(taskListHeight(1), null);
+  assert.equal(taskListHeight(5), null);
+  assert.equal(taskListHeight(6), 120); // 5 × 20px rows + 4 × 5px gaps
+  assert.equal(taskListHeight(50), 120);
 });
 
 test("subtitle shows only with tasks (quieter header)", () => {

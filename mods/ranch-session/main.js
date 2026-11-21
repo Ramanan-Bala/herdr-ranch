@@ -63,6 +63,9 @@ import {
   unfinishedCount,
   defaultBranchLine,
   taskEmptyState,
+  TASK_LIST_ROW_HEIGHT,
+  TASK_LIST_ROW_GAP,
+  taskListHeight,
   adapterKey,
   remoteText,
   fileRow,
@@ -1825,14 +1828,48 @@ export default class RanchSession extends View {
     if (lc.flag) {
       card.child(div().text_size(10.5).text_color(t.muted).child("Paused \u00b7 picks up when the agent continues"));
     }
-    // Cancelled tasks render struck through, after the live ones.
-    const cancelled = tasks.filter((x) => x.status === "cancelled");
-    for (const task of [...orderTasks(this.liveTasks(tasks)), ...cancelled]) card.child(this.taskRow(t, task, addr, paused));
+    card.child(this.taskList(t, tasks, addr, paused));
     return card;
   }
 
+  /** All tasks in one per-agent viewport; long lists scroll instead of growing the panel. */
+  taskList(t, tasks, addr, paused) {
+    // Cancelled tasks render struck through, after the live ones.
+    const cancelled = tasks.filter((x) => x.status === "cancelled");
+    const ordered = [...orderTasks(this.liveTasks(tasks)), ...cancelled];
+    const height = taskListHeight(ordered.length);
+    const rows = v_flex()
+      .id(`tasks-list-${addr}`)
+      .w_full()
+      .gap(TASK_LIST_ROW_GAP)
+      .when(height != null, (el) => el.h(height).flex_none().overflow_y_scrollbar())
+      .children(ordered.map((task) => this.taskRow(t, task, addr, paused)));
+    if (height == null) return rows;
+
+    // Layered surface-color strips provide a quiet fade without adding a control.
+    const fade = v_flex()
+      .id(`tasks-fade-${addr}`)
+      .absolute()
+      .left(0)
+      .right(0)
+      .bottom(0)
+      .h(24)
+      .children(
+        Array.from({ length: 6 }, (_, index) =>
+          div().w_full().h(4).bg(t.surface).opacity((index + 1) / 6)
+        )
+      );
+    return v_flex()
+      .relative()
+      .w_full()
+      .h(height)
+      .flex_none()
+      .child(rows)
+      .child(fade);
+  }
+
   taskRow(t, task, addr, paused) {
-    const row = h_flex().id(`task-${addr}-${task.id}`).h(20).px(4).gap(8).items_center().min_w(0);
+    const row = h_flex().id(`task-${addr}-${task.id}`).h(TASK_LIST_ROW_HEIGHT).px(4).gap(8).items_center().min_w(0);
     if (task.status === "in_progress") {
       if (paused) {
         // The agent stopped mid-task: quiet pause icon instead of a spinner.

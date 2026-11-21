@@ -103,6 +103,17 @@ export function nativeFor(list, address) {
   return list.find((k) => k?.address === address) ?? null;
 }
 
+export const TASK_LIST_ROW_HEIGHT = 20;
+export const TASK_LIST_ROW_GAP = 5;
+export const TASK_LIST_VISIBLE_ROWS = 5;
+
+/** Fixed scroll-viewport height for overflowing task lists; natural height otherwise. */
+export function taskListHeight(taskCount) {
+  return taskCount > TASK_LIST_VISIBLE_ROWS
+    ? TASK_LIST_VISIBLE_ROWS * TASK_LIST_ROW_HEIGHT + (TASK_LIST_VISIBLE_ROWS - 1) * TASK_LIST_ROW_GAP
+    : null;
+}
+
 /** { done, total } summed over task lists (arrays of store tasks). */
 export function totalsOf(lists) {
   let done = 0;
