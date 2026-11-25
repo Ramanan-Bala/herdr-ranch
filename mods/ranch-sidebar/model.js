@@ -189,8 +189,9 @@ export function nestWorktrees(spaces, infoOf) {
 // drawn as a dimmed "dormant" row that reopens the folder. Dormant rows are
 // appended at the end of their machine group (position tracking across the
 // space list is not worth its complexity here). Linked git worktrees are never
-// kept on their own; a closed worktree space leaves no dormant row, while its
-// main checkout keeps one.
+// stored in the kept list itself; instead, worktrees are listed from a git
+// scan of their main checkout, so a closed worktree still shows a dormant row
+// under its project while its main checkout keeps one.
 // ---------------------------------------------------------------------------
 
 /**
@@ -736,4 +737,54 @@ export function branchLine(name, checkout) {
     : checkout.branch ?? null;
   if (!label || label === name) return null;
   return label;
+}
+
+/**
+ * The main checkout folder for a git common directory (e.g. `"/r/app/.git"`
+ * -> `"/r/app"`). Strips one trailing `"/.git"` or `"\\.git"` (accepting
+ * trailing separators). Returns null for empty/non-string input or a common
+ * dir that does not end in `.git` (such as a bare repository).
+ *
+ * @param {string|null|undefined} common
+ * @returns {string|null}
+ */
+export function mainCheckoutOf(common) {
+  if (typeof common !== "string" || !common) return null;
+  const trimmed = common.replace(/[\\/]+$/, "");
+  if (!/[\\/]\.git$/.test(trimmed)) return null;
+  return trimmed.slice(0, -5) || trimmed[0];
+}
+
+/**
+ * Linked worktrees from a `parseWorktrees` scan that currently have no live
+ * space on this machine. Filters out `main`, `bare`, and `prunable` entries
+ * and any entry whose `path` matches `liveTops` (compared with trailing
+ * separators stripped), sorted by `path`. Never mutates inputs.
+ *
+ * @param {Array<{path: string, branch?: string|null, detached?: boolean,
+ *   bare?: boolean, prunable?: boolean, main?: boolean}>|null|undefined} scanned
+ * @param {Set<string>|Array<string>|null|undefined} liveTops
+ * @returns {Array<{path: string, branch: string|null, detached: boolean, name: string}>}
+ */
+export function dormantWorktrees(scanned, liveTops) {
+  const live = new Set();
+  for (const top of liveTops ?? []) {
+    const bare = barePath(top);
+    if (bare) live.add(bare);
+  }
+  const out = [];
+  for (const wt of scanned ?? []) {
+    if (!wt || typeof wt.path !== "string" || !wt.path) continue;
+    if (wt.main || wt.bare || wt.prunable) continue;
+    const bare = barePath(wt.path);
+    if (!bare || live.has(bare)) continue;
+    out.push({
+      path: wt.path,
+      branch: wt.branch ?? null,
+      detached: !!wt.detached,
+      name: topSegment(wt.path) ?? wt.path,
+    });
+  }
+  out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return out;
 }

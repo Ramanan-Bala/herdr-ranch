@@ -12,9 +12,10 @@ import {
   buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials,
   normalizeCollapsed, topOfFresh, cardRows, moveIndex, worktreeName, branchLine,
   keptKey, spaceCwd, spaceGitState, liveSpaceFolder, normalizeKept, refreshKept, forgetKept,
-  dormantFolders, applyKeptFolders,
+  dormantFolders, applyKeptFolders, mainCheckoutOf, dormantWorktrees,
 } from "./model.js";
 import { isViewerTab } from "./lib/file-viewer.js";
+import { parseWorktrees } from "./lib/newspace.js";
 import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrgent, closeNeedsConfirm, closeConfirmProps } from "./lib/format.js";
 import {
   repoSummary, parsePr, createTtlCache, createLimiter, runGh, PR_JSON_FIELDS,
@@ -105,6 +106,11 @@ export default class RanchSidebar extends View {
       sleep: (ms) => cx.sleep(ms),
     });
     this.wanted = new Set(); // repo keys the current render still needs
+    // Worktree scan cache: `${machine ?? ""}|${folder}` -> { list, at }.
+    this.wtScans = new Map();
+    this.pendingScans = new Map();
+    this.scanBusy = new Set();
+    this.wantedScans = new Set();
 
     // PRs: TTL cache keyed `${machine}|${top}|${branch}`; render rebuilds the
     // queue, drain() pumps it through the shared gh limiter.
@@ -293,10 +299,53 @@ export default class RanchSidebar extends View {
       const due = now - entry.at > (machine ? remoteMs : 30_000);
       if (due) this.refreshRepo(machine, key.slice(i + 1), cx);
     }
+    for (const [key, entry] of [...this.wtScans]) {
+      if (!this.wantedScans.has(key)) {
+        this.wtScans.delete(key);
+        continue;
+      }
+      const i = key.indexOf("|");
+      const machine = key.slice(0, i) || null;
+      const due = now - entry.at > (machine ? remoteMs : 30_000);
+      if (due) this.refreshScan(machine, key.slice(i + 1), cx);
+    }
+    for (const key of [...this.pendingScans.keys()]) {
+      if (!this.wantedScans.has(key)) this.pendingScans.delete(key);
+    }
     for (const top of this.repoWatch.wanted()) {
       if (!this.wanted.has(`|${top}`)) this.repoWatch.remove(top);
     }
     this.prCache.prune(now);
+  }
+
+  // ---- worktree scans ----
+
+  /** Mark `${machine ?? ""}|${folder}` wanted and enqueue a scan if uncached. */
+  scheduleScan(machine, folder) {
+    if (!folder) return;
+    const key = keptKey(machine, folder);
+    this.wantedScans.add(key);
+    if (!this.wtScans.has(key) && !this.pendingScans.has(key) && !this.scanBusy.has(key)) {
+      this.pendingScans.set(key, { machine: machine ?? null, folder });
+    }
+  }
+
+  /** Run `git worktree list --porcelain` in `folder` and cache the result. */
+  async refreshScan(machine, folder, cx) {
+    const key = keptKey(machine, folder);
+    if (this.scanBusy.has(key)) return;
+    this.scanBusy.add(key);
+    try {
+      let list = [];
+      try {
+        const r = await this.gitCmd(machine, folder)(["worktree", "list", "--porcelain"]);
+        if (r?.code === 0) list = parseWorktrees(r.stdout);
+      } catch {}
+      this.wtScans.set(key, { list, at: Date.now() });
+    } finally {
+      this.scanBusy.delete(key);
+    }
+    cx.notify();
   }
 
   // ---- pull requests ----
@@ -402,6 +451,17 @@ export default class RanchSidebar extends View {
       for (const [mk, machine] of regs) {
         cx.spawn(async (cx) => {
           await this.refreshRegistry(machine, cx);
+        });
+      }
+    }
+    let scanSlots = 4 - this.scanBusy.size;
+    if (scanSlots > 0 && this.pendingScans.size) {
+      for (const [key, job] of this.pendingScans) {
+        if (scanSlots <= 0) break;
+        this.pendingScans.delete(key);
+        scanSlots -= 1;
+        cx.spawn(async (cx) => {
+          await this.refreshScan(job.machine, job.folder, cx);
         });
       }
     }
@@ -783,6 +843,58 @@ export default class RanchSidebar extends View {
         .child("No sessions")))
       .when(hovered, (el) => el.child(iconBtn("forget", "x", "Forget this folder",
         (cx) => this.forgetDormant(e, cx))));
+  }
+
+  /**
+   * A dimmed row for a linked git worktree that currently has no live space,
+   * indented under its project (main checkout space or dormant kept folder).
+   */
+  dormantWorktreeRow(wt, machine, last = false) {
+    const t = theme();
+    const key = keptKey(machine, wt.path);
+    const id = `wt-dormant-${key}`;
+    const hovered = this.hoveredSpace === id;
+    const branch = wt.detached || !wt.branch ? "detached" : wt.branch;
+    const open = () => run("space.new", { folder: wt.path, machine: machine ?? "", focus: true });
+    const iconBtn = (suffix, icon, tip, go) => div().id(`wt-dormant-${suffix}-${key}`)
+      .flex_none().size(16).flex().items_center().justify_center()
+      .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip(tip)
+      .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
+      .on_click((_ev, cx) => {
+        cx.stop_propagation();
+        go();
+      })
+      .child(svg(ICON(icon)).size(11));
+    return h_flex().id(id).h(24).mx(6).mt(2).flex_none().pl(10).pr(8).gap(6).items_center()
+      .rounded(6).cursor_pointer().opacity(0.6).hover((s) => s.opacity(1).bg(t.hover))
+      .tooltip([wt.name, wt.path, "No sessions"].filter(Boolean).join("\n"))
+      .on_hover((isIn, cx) => {
+        const next = isIn ? id : null;
+        if (this.hoveredSpace !== next) {
+          this.hoveredSpace = next;
+          cx.notify();
+        }
+      })
+      .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
+      .on_click(() => {
+        if (this.clickSuppressed()) return;
+        open();
+      })
+      .child(div().flex_none().text_size(11).text_color(t.dim).child(last ? "└─" : "├─"))
+      .child(svg(ICON("git-branch")).size(11).flex_none().text_color(t.dim))
+      .child(div().flex_none().min_w(0).truncate().text_size(12).font_medium()
+        .text_color(t.muted).child(truncateMiddle(wt.name, 24)))
+      .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim)
+        .child(truncateMiddle(branch, 24)))
+      .when(!hovered, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim)
+        .child("No sessions")))
+      .when(hovered, (el) => el
+        .child(iconBtn("plus", "plus", "New terminal here", open))
+        .child(iconBtn("spark", "sparkle", "Start agent here", () => {
+          open();
+          openOverlay({ mod: "ranch-launch", kind: "dialog", width: 520, height: 256 });
+        })));
   }
 
   /**
@@ -1400,6 +1512,7 @@ export default class RanchSidebar extends View {
 
   render(cx) {
     const t = theme();
+    this.wantedScans = new Set();
     const s = resolveSettings(shared(SETTINGS_KEY));
     this.settings = s;
     if (this.prSec !== s.refresh.prSec) {
@@ -1429,10 +1542,37 @@ export default class RanchSidebar extends View {
     // later render replaces with the git top (or, for a linked worktree, drop
     // entirely). refreshKept is lossless: only Forget and a linked worktree's
     // own entry ever leave the list. Written to localStorage only on change.
-    const live = this.liveKept(listed, paneList, spaceGitState(tree), currentHome);
-    const refreshed = refreshKept(this.kept,
-      live.filter((l) => l.resolved && !l.linked && !l.degraded),
-      live.filter((l) => l.linked));
+    const gitState = spaceGitState(tree);
+    const live = this.liveKept(listed, paneList, gitState, currentHome);
+    const keepLive = live.filter((l) => l.resolved && !l.linked && !l.degraded);
+    const knownKept = new Set([
+      ...this.kept.map((e) => keptKey(e.machine, e.folder)),
+      ...keepLive.map((l) => keptKey(l.machine, l.folder)),
+    ]);
+    for (const g of tree.groups) {
+      for (const sp of g.spaces) {
+        const st = gitState.get(sp.space);
+        if (!st?.resolved || !st.linked) continue;
+        const main = mainCheckoutOf(sp.checkout?.common);
+        if (!main) continue;
+        const mk = keptKey(g.machine, main);
+        if (knownKept.has(mk)) continue;
+        knownKept.add(mk);
+        const name = main.split(/[\\/]/).filter(Boolean).pop() ?? main;
+        keepLive.push({
+          machine: g.machine ?? null,
+          folder: main,
+          raw: main,
+          name,
+          named: false,
+          color: null,
+          resolved: true,
+          linked: false,
+          degraded: false,
+        });
+      }
+    }
+    const refreshed = refreshKept(this.kept, keepLive, live.filter((l) => l.linked));
     this.kept = refreshed.list;
     if (refreshed.changed) this.saveKept();
     // A linked worktree is not "live" for its main checkout's kept entry: the
@@ -1440,6 +1580,21 @@ export default class RanchSidebar extends View {
     // never the folder a live raw path is merely inside of.
     const dormant = filter ? [] : dormantFolders(this.kept, live.filter((l) => !l.linked), { home: currentHome });
     const view = applyKeptFolders(tree, dormant);
+
+    for (const g of view.groups) {
+      for (const sp of g.spaces) {
+        if (!sp.checkout) continue;
+        if (!sp.checkout.linked && sp.checkout.top) {
+          this.scheduleScan(g.machine, sp.checkout.top);
+        } else if (sp.checkout.linked) {
+          const main = mainCheckoutOf(sp.checkout.common);
+          if (main) this.scheduleScan(g.machine, main);
+        }
+      }
+      for (const e of g.kept ?? []) {
+        this.scheduleScan(e.machine, e.folder);
+      }
+    }
 
     if (setAgentOrder) {
       const primary = [];
@@ -1463,6 +1618,11 @@ export default class RanchSidebar extends View {
     } else {
       for (const [i, g] of view.groups.entries()) {
         const key = g.machine ?? "";
+        const liveTops = new Set();
+        for (const sp of g.spaces) {
+          if (sp.checkout?.top) liveTops.add(sp.checkout.top);
+        }
+        const scan = (folder) => (folder ? this.wtScans.get(keptKey(g.machine, folder))?.list ?? null : null);
         if (view.showMachines) {
           rows.push(this.machineHeader(g, i === 0));
           if (this.collapsed.m[key]) continue;
@@ -1491,11 +1651,21 @@ export default class RanchSidebar extends View {
           for (const wt of e.worktrees) {
             rows.push(this.worktreeBlock(wt, { primary: false, foldKey: wt.space }));
           }
+          if (!e.checkout.linked) {
+            const dWts = dormantWorktrees(scan(e.checkout.top), liveTops);
+            for (const [wi, wt] of dWts.entries()) {
+              rows.push(this.dormantWorktreeRow(wt, g.machine, wi === dWts.length - 1));
+            }
+          }
         }
         // Kept folders with no live space sit at the end of their machine
         // group, before the machine's Settled section.
         for (const [ki, e] of (g.kept ?? []).entries()) {
           rows.push(this.dormantRow(e, g.spaces.length === 0 && ki === 0));
+          const dWts = dormantWorktrees(scan(e.folder), liveTops);
+          for (const [wi, wt] of dWts.entries()) {
+            rows.push(this.dormantWorktreeRow(wt, g.machine, wi === dWts.length - 1));
+          }
         }
         if (settledAll.length) {
           const folded = !!this.collapsed.settled[`m:${key}`];
