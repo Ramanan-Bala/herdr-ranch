@@ -12,7 +12,7 @@ import {
   buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials,
   normalizeCollapsed, topOfFresh, cardRows, moveIndex, worktreeName,
   keptKey, spaceCwd, spaceGitState, liveSpaceFolder, normalizeKept, refreshKept, forgetKept,
-  dormantFolders, applyKeptFolders, mainCheckoutOf, dormantWorktrees, touchesWorktrees,
+  dormantFolders, applyKeptFolders, mainCheckoutOf, dormantWorktrees, dormantPrimary, touchesWorktrees,
 } from "./model.js";
 import { isViewerTab } from "./lib/file-viewer.js";
 import { parseWorktrees } from "./lib/newspace.js";
@@ -810,14 +810,17 @@ export default class RanchSidebar extends View {
   /**
    * A dimmed row for a kept folder whose last session closed: the space row's
    * shape and folder icon, but muted, no status ring, with a "No sessions"
-   * hint. Clicking it reopens the folder as a live space; on hover "+" opens a
-   * terminal there, sparkle opens the start-agent dialog, and "x" forgets it.
-   * No right-click: clicking is the only way back.
+   * hint. Clicking it folds or unfolds its dormant worktree rows; on hover "+"
+   * opens a terminal there, sparkle opens the start-agent dialog, and "x"
+   * forgets it. No right-click.
    */
   dormantRow(e, first = false) {
     const t = theme();
     const id = keptKey(e.machine, e.folder);
+    const folded = !!this.collapsed.s[id];
     const hovered = this.hoveredSpace === id;
+    const fold = div().flex_none().size(16).flex().items_center().justify_center()
+      .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
     const { tint } = this.spaceTint({ space: id, color: e.color });
     const iconBtn = (suffix, icon, tip, go) => div().id(`kept-${suffix}-${id}`)
       .flex_none().size(16).flex().items_center().justify_center()
@@ -844,7 +847,7 @@ export default class RanchSidebar extends View {
       .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
       .on_click((_ev, cx) => {
         if (this.clickSuppressed()) return;
-        this.reopenDormant(e);
+        this.toggleFold("s", id, cx);
       })
       .child(svg(ICON("folder")).size(14).flex_none().text_color(tint))
       .child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold()
@@ -861,24 +864,32 @@ export default class RanchSidebar extends View {
       .when(!hovered, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim)
         .child("No sessions")))
       .when(hovered, (el) => el.child(iconBtn("forget", "x", "Forget this folder",
-        (cx) => this.forgetDormant(e, cx))));
+        (cx) => this.forgetDormant(e, cx))))
+      .when(hovered || folded, (el) => el.child(fold))
+      .when(!hovered && !folded, (el) => el.child(div().flex_none().size(16)));
   }
 
   /**
-   * A linked git worktree with no live space: drawn in the same two-line
-   * block shape as worktreeBlock (worktree name, then its branch in small
+   * A git checkout (primary or linked worktree, or a non-git folder) with no
+   * live space: drawn in the same two-line block shape as worktreeBlock
+   * (checkout name with an optional "primary" pill, then its branch in small
    * text), dimmed, with "No sessions" on the right. Click or "+" opens a
    * space there; sparkle also opens the start-agent dialog.
    */
-  dormantWorktreeRow(wt, machine) {
+  dormantWorktreeRow(wt, machine, opts = {}) {
+    const { primary = false, onOpen = null } = opts ?? {};
     const t = theme();
     const key = keptKey(machine, wt.path);
-    const id = `wt-dormant-${key}`;
+    const prefix = primary ? "wt-dormant-main-" : "wt-dormant-";
+    const id = `${prefix}${key}`;
     const hovered = this.hoveredSpace === id;
     const name = wt.name;
-    const branch = !wt.detached && wt.branch ? wt.branch : "detached";
-    const open = () => run("space.new", { folder: wt.path, machine: machine ?? "", focus: true });
-    const iconBtn = (suffix, icon, tip, go) => div().id(`wt-dormant-${suffix}-${key}`)
+    const showPrimary = Boolean(primary) && wt.git !== false;
+    const branch = wt.git === false
+      ? "no branch"
+      : (!wt.detached && wt.branch ? wt.branch : "detached");
+    const open = onOpen ?? (() => run("space.new", { folder: wt.path, machine: machine ?? "", focus: true }));
+    const iconBtn = (suffix, icon, tip, go) => div().id(`${prefix}${suffix}-${key}`)
       .flex_none().size(16).flex().items_center().justify_center()
       .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .tooltip(tip)
@@ -892,6 +903,8 @@ export default class RanchSidebar extends View {
       .child(div().flex_none().w(14))
       .child(div().min_w(0).truncate().text_size(12.5).font_medium()
         .text_color(t.muted).child(truncateMiddle(name, 30)))
+      .when(showPrimary, (el) => el.child(div().flex_none().h(16).px(5).rounded(4).flex().items_center()
+        .bg(t.selected).text_size(10).text_color(t.muted).child("primary")))
       .child(div().flex_1())
       .when(!hovered, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim)
         .child("No sessions")))
@@ -1685,6 +1698,14 @@ export default class RanchSidebar extends View {
         // group, before the machine's Settled section.
         for (const [ki, e] of (g.kept ?? []).entries()) {
           rows.push(this.dormantRow(e, g.spaces.length === 0 && ki === 0));
+          if (this.collapsed.s[keptKey(e.machine, e.folder)]) continue;
+          const p = dormantPrimary(scan(e.folder), e.folder);
+          if (p) {
+            rows.push(this.dormantWorktreeRow(p, g.machine, {
+              primary: p.git,
+              onOpen: () => this.reopenDormant(e),
+            }));
+          }
           const dWts = dormantWorktrees(scan(e.folder), liveTops);
           for (const wt of dWts) rows.push(this.dormantWorktreeRow(wt, g.machine));
         }

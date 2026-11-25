@@ -790,6 +790,47 @@ export function dormantWorktrees(scanned, liveTops) {
 }
 
 /**
+ * Primary (main) checkout row data for a kept folder with no live space.
+ * Uses the `main` entry from a `parseWorktrees` scan when present (`git: true`),
+ * falling back to the kept folder itself when unscanned or not a git repo
+ * (`git: false`). Returns null when `folder` is falsy and no main entry exists.
+ * Never mutates inputs.
+ *
+ * @param {Array<{path: string, branch?: string|null, detached?: boolean,
+ *   bare?: boolean, prunable?: boolean, main?: boolean}>|null|undefined} scanned
+ * @param {string|null|undefined} folder
+ * @returns {{path: string, branch: string|null, detached: boolean, name: string, git: boolean}|null}
+ */
+export function dormantPrimary(scanned, folder) {
+  let main = null;
+  for (const wt of scanned ?? []) {
+    if (wt && wt.main) {
+      main = wt;
+      break;
+    }
+  }
+  if (main) {
+    const path = folder || main.path;
+    if (!path) return null;
+    return {
+      path,
+      branch: main.branch ?? null,
+      detached: !!main.detached,
+      name: topSegment(path) ?? path,
+      git: true,
+    };
+  }
+  if (!folder) return null;
+  return {
+    path: folder,
+    branch: null,
+    detached: false,
+    name: topSegment(folder) ?? folder,
+    git: false,
+  };
+}
+
+/**
  * Whether a `watchFolder(gitDir)` batch can have changed the repository's
  * worktree list: a path at or under `<gitDir>/worktrees` (git writes
  * `worktrees/<name>/…` on `worktree add`, removes it on `remove`/`prune`),
