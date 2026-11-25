@@ -10,9 +10,9 @@ import {
 } from "herdr";
 import {
   buildTree, nestWorktrees, BADGE_COLORS, badgeColorIndex, initials,
-  normalizeCollapsed, topOfFresh, cardRows, moveIndex, worktreeName, branchLine,
+  normalizeCollapsed, topOfFresh, cardRows, moveIndex, worktreeName,
   keptKey, spaceCwd, spaceGitState, liveSpaceFolder, normalizeKept, refreshKept, forgetKept,
-  dormantFolders, applyKeptFolders, mainCheckoutOf, dormantWorktrees,
+  dormantFolders, applyKeptFolders, mainCheckoutOf, dormantWorktrees, touchesWorktrees,
 } from "./model.js";
 import { isViewerTab } from "./lib/file-viewer.js";
 import { parseWorktrees } from "./lib/newspace.js";
@@ -111,6 +111,19 @@ export default class RanchSidebar extends View {
     this.pendingScans = new Map();
     this.scanBusy = new Set();
     this.wantedScans = new Set();
+    // Instant worktree updates on this computer: one watch per repo on its
+    // `.git` folder; a batch that touches `.git/worktrees` (git worktree
+    // add/remove/prune) rescans at once. Commits and fetches are ignored.
+    // The 30 s sweep stays as the fallback (remote machines, failed watches).
+    this.wtWatch = createWatchLoops({
+      watch: (folder) => watchFolder(`${folder}/.git`),
+      onChange: async (folder, paths) => {
+        if (!touchesWorktrees(paths, `${folder}/.git`)) return;
+        await cx.sleep(300); // let git finish writing the new entry
+        await this.refreshScan(null, folder, cx);
+      },
+      sleep: (ms) => cx.sleep(ms),
+    });
 
     // PRs: TTL cache keyed `${machine}|${top}|${branch}`; render rebuilds the
     // queue, drain() pumps it through the shared gh limiter.
@@ -299,6 +312,9 @@ export default class RanchSidebar extends View {
       const due = now - entry.at > (machine ? remoteMs : 30_000);
       if (due) this.refreshRepo(machine, key.slice(i + 1), cx);
     }
+    for (const folder of this.wtWatch.wanted()) {
+      if (!this.wantedScans.has(keptKey(null, folder))) this.wtWatch.remove(folder);
+    }
     for (const [key, entry] of [...this.wtScans]) {
       if (!this.wantedScans.has(key)) {
         this.wtScans.delete(key);
@@ -342,6 +358,9 @@ export default class RanchSidebar extends View {
         if (r?.code === 0) list = parseWorktrees(r.stdout);
       } catch {}
       this.wtScans.set(key, { list, at: Date.now() });
+      // Watch only real local repos (a non-repo has no .git to watch, and a
+      // remote folder cannot be watched from here).
+      if (!machine && list.length && this.wantedScans.has(key)) this.wtWatch.add(folder);
     } finally {
       this.scanBusy.delete(key);
     }
@@ -846,15 +865,18 @@ export default class RanchSidebar extends View {
   }
 
   /**
-   * A dimmed row for a linked git worktree that currently has no live space,
-   * indented under its project (main checkout space or dormant kept folder).
+   * A linked git worktree with no live space: drawn in the same two-line
+   * block shape as worktreeBlock (worktree name, then its branch in small
+   * text), dimmed, with "No sessions" on the right. Click or "+" opens a
+   * space there; sparkle also opens the start-agent dialog.
    */
-  dormantWorktreeRow(wt, machine, last = false) {
+  dormantWorktreeRow(wt, machine) {
     const t = theme();
     const key = keptKey(machine, wt.path);
     const id = `wt-dormant-${key}`;
     const hovered = this.hoveredSpace === id;
-    const branch = wt.detached || !wt.branch ? "detached" : wt.branch;
+    const name = wt.name;
+    const branch = !wt.detached && wt.branch ? wt.branch : "detached";
     const open = () => run("space.new", { folder: wt.path, machine: machine ?? "", focus: true });
     const iconBtn = (suffix, icon, tip, go) => div().id(`wt-dormant-${suffix}-${key}`)
       .flex_none().size(16).flex().items_center().justify_center()
@@ -866,9 +888,27 @@ export default class RanchSidebar extends View {
         go();
       })
       .child(svg(ICON(icon)).size(11));
-    return h_flex().id(id).h(24).mx(6).mt(2).flex_none().pl(10).pr(8).gap(6).items_center()
-      .rounded(6).cursor_pointer().opacity(0.6).hover((s) => s.opacity(1).bg(t.hover))
-      .tooltip([wt.name, wt.path, "No sessions"].filter(Boolean).join("\n"))
+    const head = h_flex().id(`${id}-head`).flex_none().h(22).pl(10).pr(8).gap(8).items_center()
+      .child(div().flex_none().w(14))
+      .child(div().min_w(0).truncate().text_size(12.5).font_medium()
+        .text_color(t.muted).child(truncateMiddle(name, 30)))
+      .child(div().flex_1())
+      .when(!hovered, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim)
+        .child("No sessions")))
+      .when(hovered, (el) => el
+        .child(iconBtn("plus", "plus", "New terminal here", open))
+        .child(iconBtn("spark", "sparkle", "Start agent here", () => {
+          open();
+          openOverlay({ mod: "ranch-launch", kind: "dialog", width: 520, height: 256 });
+        })))
+      .child(div().flex_none().size(16));
+    const sub = h_flex().flex_none().h(16).pl(32).pr(8).items_center()
+      .child(div().min_w(0).truncate().text_size(11).text_color(t.dim)
+        .child(truncateMiddle(branch, 30)));
+    return v_flex().id(id).flex_none().mx(6).mt(4).py(4).rounded(8).border(1)
+      .border_color(t.chrome).cursor_pointer().opacity(0.6)
+      .hover((s) => s.opacity(1).bg(t.hover))
+      .tooltip([name, branch, wt.path, "No sessions"].filter(Boolean).join("\n"))
       .on_hover((isIn, cx) => {
         const next = isIn ? id : null;
         if (this.hoveredSpace !== next) {
@@ -881,26 +921,16 @@ export default class RanchSidebar extends View {
         if (this.clickSuppressed()) return;
         open();
       })
-      .child(div().flex_none().text_size(11).text_color(t.dim).child(last ? "└─" : "├─"))
-      .child(svg(ICON("git-branch")).size(11).flex_none().text_color(t.dim))
-      .child(div().flex_none().min_w(0).truncate().text_size(12).font_medium()
-        .text_color(t.muted).child(truncateMiddle(wt.name, 24)))
-      .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim)
-        .child(truncateMiddle(branch, 24)))
-      .when(!hovered, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim)
-        .child("No sessions")))
-      .when(hovered, (el) => el
-        .child(iconBtn("plus", "plus", "New terminal here", open))
-        .child(iconBtn("spark", "sparkle", "Start agent here", () => {
-          open();
-          openOverlay({ mod: "ranch-launch", kind: "dialog", width: 520, height: 256 });
-        })));
+      .child(head)
+      .child(sub);
   }
 
   /**
-   * One checkout block: a compact header (status ring · name · "primary" pill
-   * and a branch line with diff stats + PR badges) followed by its session
-   * rows. The main checkout's space entry is drawn through this too: pass
+   * One checkout block: a two-line header followed by its session rows. Line
+   * 1: status ring · worktree name (its folder name) ·
+   * "primary" pill on the main checkout. Line 2, small: the branch
+   * (`detached @<head>` when detached) with diff stats + PR badges. Main and
+   * linked checkouts look the same. The main checkout's space entry is drawn through this too: pass
    * `primary: true` and a `foldKey` distinct from any space id (ids and hover
    * keys are keyed by foldKey).
    */
@@ -908,7 +938,7 @@ export default class RanchSidebar extends View {
     const t = theme();
     const folded = !!this.collapsed.w[foldKey];
     const hovered = this.hoveredSpace === foldKey;
-    const name = worktreeName(entry, primary);
+    const name = worktreeName(entry, false);
     const fold = div().id(`fold-${foldKey}`).flex_none().size(16).flex().items_center().justify_center()
       .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .tooltip(folded ? "Expand" : "Collapse")
@@ -919,7 +949,7 @@ export default class RanchSidebar extends View {
       })
       .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
     const co = entry.checkout ?? null;
-    const branch = branchLine(name, co);
+    const branch = co ? (co.detached ? `detached @${co.head ?? ""}` : co.branch ?? null) : null;
     const stat = co?.stat ?? null;
     // Stats follow card.line3, PR badges card.pr alone (finding 19).
     const rows = cardRows({
@@ -951,7 +981,7 @@ export default class RanchSidebar extends View {
         cx.stop_propagation();
         openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: entry.space } } });
       })
-      .tooltip([name, entry.checkout?.top ?? null].filter(Boolean).join("\n"))
+      .tooltip([name, branch, entry.checkout?.top ?? null].filter(Boolean).join("\n"))
       .child(div().flex_none().w(14).flex().items_center().justify_center()
         .when(Boolean(entry.status), (e) => e.child(this.ring(entry.status, 10))))
       .child(div().min_w(0).truncate().text_size(12.5).font_medium()
@@ -959,8 +989,6 @@ export default class RanchSidebar extends View {
       .when(primary, (e) => e.child(div().flex_none().h(16).px(5).rounded(4).flex().items_center()
         .bg(t.selected).text_size(10).text_color(t.muted).child("primary")))
       .child(div().flex_1())
-      // No branch line to carry them: diff stats and PR badges sit on line 1.
-      .when(!branch && right.length > 0, (e) => e.children(right))
       .when(hovered, (e) => e.child(this.plusBtn(entry.space, foldKey)).child(this.sparkBtn(entry.space, foldKey)))
       .when(folded && entry.blocked > 0, (e) => e.child(div().flex_none().text_size(10).text_color(t.blocked).child("Needs you")))
       .when(folded && !(entry.blocked > 0), (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
@@ -968,17 +996,14 @@ export default class RanchSidebar extends View {
       .when(hovered || folded, (e) => e.child(fold))
       .when(!hovered && !folded, (e) => e.child(div().flex_none().size(16)));
 
-    const sub = branch
-      ? h_flex().flex_none().h(18).pl(32).pr(8).gap(6).items_center()
-        .when(Boolean(branch), (e) => e
-          .child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim))
-          .child(div().min_w(0).truncate().text_size(11).text_color(t.dim)
-            .child(truncateMiddle(branch, 30))))
-        .child(div().flex_1())
-        .children(right)
-      : null;
+    // Line 2 lines up under the name (padding 10 + status slot 14 + gap 8).
+    const sub = h_flex().flex_none().h(16).pl(32).pr(8).gap(6).items_center()
+      .child(div().min_w(0).truncate().text_size(11).text_color(t.dim)
+        .child(truncateMiddle(branch ?? "no branch", 30)))
+      .child(div().flex_1())
+      .children(right);
 
-    const body = [head, sub].filter(Boolean);
+    const body = [head, sub];
     if (!folded) {
       const grouped = (c) => Boolean(co) && c.top === co.top;
       for (const c of entry.cards) {
@@ -1653,9 +1678,7 @@ export default class RanchSidebar extends View {
           }
           if (!e.checkout.linked) {
             const dWts = dormantWorktrees(scan(e.checkout.top), liveTops);
-            for (const [wi, wt] of dWts.entries()) {
-              rows.push(this.dormantWorktreeRow(wt, g.machine, wi === dWts.length - 1));
-            }
+            for (const wt of dWts) rows.push(this.dormantWorktreeRow(wt, g.machine));
           }
         }
         // Kept folders with no live space sit at the end of their machine
@@ -1663,9 +1686,7 @@ export default class RanchSidebar extends View {
         for (const [ki, e] of (g.kept ?? []).entries()) {
           rows.push(this.dormantRow(e, g.spaces.length === 0 && ki === 0));
           const dWts = dormantWorktrees(scan(e.folder), liveTops);
-          for (const [wi, wt] of dWts.entries()) {
-            rows.push(this.dormantWorktreeRow(wt, g.machine, wi === dWts.length - 1));
-          }
+          for (const wt of dWts) rows.push(this.dormantWorktreeRow(wt, g.machine));
         }
         if (settledAll.length) {
           const folded = !!this.collapsed.settled[`m:${key}`];

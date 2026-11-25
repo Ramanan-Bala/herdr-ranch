@@ -788,3 +788,26 @@ export function dormantWorktrees(scanned, liveTops) {
   out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return out;
 }
+
+/**
+ * Whether a `watchFolder(gitDir)` batch can have changed the repository's
+ * worktree list: a path at or under `<gitDir>/worktrees` (git writes
+ * `worktrees/<name>/…` on `worktree add`, removes it on `remove`/`prune`),
+ * or the watched root itself (the batch overflowed: refresh everything).
+ * Commits, fetches and index writes elsewhere under `.git` return false.
+ *
+ * @param {Array<string>|null|undefined} paths absolute changed paths
+ * @param {string} gitDir the watched `.git` folder
+ * @returns {boolean}
+ */
+export function touchesWorktrees(paths, gitDir) {
+  const root = barePath(gitDir);
+  if (!root) return false;
+  const dir = `${root}/worktrees`;
+  for (const p of paths ?? []) {
+    const bare = barePath(typeof p === "string" ? p.replace(/\\/g, "/") : p);
+    if (!bare) continue;
+    if (bare === root || bare === dir || bare.startsWith(`${dir}/`)) return true;
+  }
+  return false;
+}
