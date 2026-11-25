@@ -1,4 +1,5 @@
-// New-space dialog: machine, folder, worktree, branch. Opened by the sidebar's
+// New-space dialog: machine and folder (a repository opens at its main
+// checkout; worktrees are listed and opened from the sidebar). Opened by the sidebar's
 // New space buttons (the Projects header, the rail and the empty state) with
 // openOverlay({ mod: "ranch-newspace", kind: "dialog", width: 560,
 //   props: { machine, folder } }); props are the active space's machine and
@@ -324,14 +325,15 @@ export default class RanchNewSpace extends View {
   /** What pressing Enter does; lib/newspace.js decides, the view only knows
    * its own inputs. */
   plan() {
-    if (this.probe === "repo" && this.worktree === "new" && !this.homeDir) {
-      return { action: "error", error: "Couldn't get the machine's home folder, so no worktree can be made there." };
-    }
+    // A repository always opens at its main checkout: the dialog no longer
+    // picks or creates worktrees (the sidebar lists every worktree of the
+    // repo, and a worktree is opened from there).
+    const main = this.checkouts.find((c) => c.main)?.path ?? this.repo?.main ?? null;
     return newSpacePlan({
       probe: this.probe,
       folder: this.folderNow(),
       repoTop: this.repo?.main ?? null,
-      worktree: this.worktree,
+      worktree: this.probe === "repo" && main ? main : this.worktree,
       checkouts: this.checkouts,
       branch: this.branchInput.value(),
       localBranches: this.branches?.local ?? [],
@@ -1014,7 +1016,6 @@ export default class RanchNewSpace extends View {
   render() {
     const t = theme();
     const plan = this.plan();
-    const inRepo = this.probe === "repo" && Boolean(this.repo);
     const label = this.busy
       ? plan.action === "create-worktree" ? "Creating…" : "Opening…"
       : planLabel(plan);
@@ -1039,9 +1040,7 @@ export default class RanchNewSpace extends View {
       )
       .child(v_flex().w_full().gap(10)
         .child(this.machineField(t))
-        .child(this.folderField(t))
-        .when(inRepo, (e) => e.child(this.worktreeField(t)))
-        .when(inRepo && this.worktree === "new", (e) => e.child(this.branchField(t))))
+        .child(this.folderField(t)))
       .child(
         v_flex().w_full().gap(8).pt(11).border_t(1).border_color(t.border)
           .when(Boolean(confirm), (e) => e.child(confirm))
