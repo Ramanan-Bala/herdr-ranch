@@ -92,7 +92,13 @@ export default class Files extends View {
     // render after it is shown again catches up at once (lib/panels.js).
     this.vis = new PanelVisibility(() => blockShown(layout(), { id: "files", mod: "ranch-files" }));
     this.refreshIfShown(cx);
-    cx.timer.every(10000, cx => this.refreshIfShown(cx));
+    // Every 10 s; every 60 s while a local folder watch is working (it
+    // refreshes on change, so the timer is only a safety net).
+    this.lastRead = 0;
+    cx.timer.every(10000, cx => {
+      if (this.watched && !this.on && Date.now() - this.lastRead < 60000) return;
+      this.refreshIfShown(cx);
+    });
   }
 
   /** refresh() while the panel is on screen; otherwise remember it for the next show. */
@@ -282,6 +288,7 @@ export default class Files extends View {
     if (!cwd || this.loading) return;
     const context = this.context;
     this.loading = true;
+    this.lastRead = Date.now();
     this.limited = false;
     cx.spawn(async cx => {
       try {

@@ -88,7 +88,7 @@ Every mod lives in `mods/ranch-*/` and is `place: "none"`. Ranch places them onl
 | [`ranch-chrome`](mods/ranch-chrome) | Brand header (logo, space search, sidebar collapse) and the right side of the status bar: the **Resource Manager** popover (memory and CPU per terminal, orphans, ports, end processes), terminal count, ports and hosts. |
 | [`ranch-sidebar`](mods/ranch-sidebar) | The projects tree: machines → spaces → git checkouts/worktrees → session cards, with status, branch, diff and PR. Folders are kept after their last session closes. Includes drag reordering, settled-tab groups, status filters, j/k keyboard navigation, and the **tab namer** (`namer.js`), which publishes `ranch.activity`. |
 | [`ranch-topbar`](mods/ranch-topbar) | Current tab (icon, status, space / tab name, branch, cwd), attention pill, agent launchers, and panel toggles. The last open panel is remembered per space. |
-| [`ranch-session`](mods/ranch-session) | Session Details panel: Tasks, Sub-agents, Git and PR cards, plus Shell / Editor / Copy branch / Push / PR actions. |
+| [`ranch-session`](mods/ranch-session) | Session Details panel: Tasks, Sub-agents, Git and PR cards. |
 | [`ranch-files`](mods/ranch-files) | Read-only file browser. A restyled clone of Herdr 0.1.15's `files` mod. |
 | [`ranch-changes`](mods/ranch-changes) | Git diff viewer with history and stashes. A restyled clone of Herdr 0.1.15's `changes` mod. |
 | [`ranch-settings`](mods/ranch-settings) | All Ranch settings: top-bar agents, card and panel toggles, refresh intervals, tab naming, status-bar items, task-reporting health and setup per machine, and updates. |

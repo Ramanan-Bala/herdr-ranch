@@ -251,29 +251,6 @@ test("same-folder branch change hides the old branch's PR until the new one land
   assert.equal(view.ctx.prEntry().parsed.number, 7);
 });
 
-test("push keeps the context it started on: late finish never shows on B", async () => {
-  setAnswers(repoAnswers("/top/a", "f1"));
-  const { view, cx } = makeView(null, "/a", (c) => c.args[0] === "push");
-  await view.refreshGit(cx);
-  const p = view.pushBranch(cx);
-  const push = pending.find((x) => x.call.args[0] === "push");
-  assert.ok(push, "push exec was issued");
-  switchTo(view, null, "/b");
-  push.resolve({ code: 0, stdout: "", stderr: "" });
-  await p;
-  assert.equal(push.call.opts.cwd, "/top/a"); // A's top, not whatever HEAD
-  assert.equal(push.call.opts.on, null); // A's machine
-  assert.equal(push.call.args[3], "f1"); // the branch the button showed
-  const pvB = view.ctx.pushView();
-  assert.equal(pvB.busy, false);
-  assert.equal(pvB.err, null);
-  switchTo(view, null, "/a");
-  const pvA = view.ctx.pushView();
-  assert.equal(pvA.busy, false);
-  assert.ok(pvA.at > 0); // "Pushed" shows on A
-  assert.equal(pvA.err, null);
-});
-
 test("late A PR result after switching to B does not appear on B", async () => {
   setAnswers(repoAnswers("/top/a", "f1"));
   const { view, cx } = makeView(null, "/a", (c) => c.program === "gh");
@@ -363,4 +340,14 @@ test("a failed gh lookup is not shared as 'no PR'", async () => {
   await view.refreshGit(cx);
   await view.refreshPr(cx);
   assert.equal(store["ranch.share.pr"]?.["|/top/a|f1"], undefined);
+});
+
+test("git cadence: 2 min while the repo's folder watch is healthy, 30 s without one", async () => {
+  setAnswers(repoAnswers("/top/a", "f1"));
+  const { view, cx } = makeView(null, "/a");
+  const set = { refresh: { remoteGitSec: 15, prSec: 120 } };
+  assert.equal(view.gitEveryMs({ machine: null }, set), 30000); // nothing read yet, no watch
+  await view.refreshGit(cx); // files the entry and starts watching /top/a
+  assert.equal(view.gitEveryMs({ machine: null }, set), 120000);
+  assert.equal(view.gitEveryMs({ machine: "box" }, set), 15000);
 });

@@ -221,21 +221,6 @@ export function spaceCwd(space, panes = []) {
 }
 
 /**
- * The folder a live space is in: the live cwd of its first pane, else where the
- * space was made (`SpaceInfo.folder`). Herdr's SpaceInfo.folder is where its
- * new terminals start, not where the space is now (a space made in one folder
- * and moved with `cd` keeps the old one), so callers that record a space should
- * prefer `spaceCwd` and treat this fallback as a degraded reading.
- * @param {{tabs?: Array<{id: string}>, folder?: string|null}|null} space
- * @param {Array<{tab: string, cwd: string|null}>} panes
- * @returns {string|null}
- */
-export function spaceFolder(space, panes = []) {
-  if (!space) return null;
-  return spaceCwd(space, panes) || space.folder || null;
-}
-
-/**
  * The folder a live space is read as this render, and whether that reading is
  * degraded: the last terminal is gone (no pane cwd: Herdr then reports the
  * folder it was made in, or the machine's home) or the pane's folder flipped
@@ -751,32 +736,6 @@ export function badgeColorIndex(id) {
 }
 
 /**
- * Five squares summarising a diff: proportional "add" (green) and "del"
- * (red) counts, padded to five with "none".
- */
-export function diffSquares(add = 0, del = 0) {
-  add = Math.max(0, Math.floor(Number(add) || 0));
-  del = Math.max(0, Math.floor(Number(del) || 0));
-  const total = add + del;
-  if (total === 0) return ["none", "none", "none", "none", "none"];
-
-  let nAdd = Math.round((add / total) * 5);
-  let nDel = Math.round((del / total) * 5);
-  // Anything nonzero gets at least one square.
-  if (nAdd === 0 && add > 0) nAdd = 1;
-  if (nDel === 0 && del > 0) nDel = 1;
-  if (nAdd + nDel > 5) {
-    if (nAdd >= nDel) nAdd = 5 - nDel;
-    else nDel = 5 - nAdd;
-  }
-  const squares = [];
-  for (let i = 0; i < nAdd; i++) squares.push("add");
-  for (let i = 0; i < nDel; i++) squares.push("del");
-  while (squares.length < 5) squares.push("none");
-  return squares;
-}
-
-/**
  * How long a repo-root discovery that found no repository is trusted before
  * it is tried again (audit finding 16). lib/git.js cannot distinguish a
  * definite "not a repo" from a timeout/unreachable machine (both come back
@@ -877,23 +836,6 @@ export function worktreeName(entry, primary) {
     return co.branch ?? entry?.name ?? null;
   }
   return topSegment(co.top) ?? entry?.name ?? null;
-}
-
-/**
- * The branch label a worktree header's second line shows, or null when there
- * is nothing to add: no checkout, no branch, or the label would just repeat
- * the header's own name (`worktreeName`).
- * @param {string|null} name the header name (from `worktreeName`)
- * @param {{branch?: string|null, detached?: boolean, head?: string|null}|null} checkout
- * @returns {string|null}
- */
-export function branchLine(name, checkout) {
-  if (!checkout) return null;
-  const label = checkout.detached
-    ? `detached @${checkout.head ?? ""}`
-    : checkout.branch ?? null;
-  if (!label || label === name) return null;
-  return label;
 }
 
 /**

@@ -6,6 +6,12 @@
  */
 
 /**
+ * How often to re-read a folder whose watch is healthy: changes arrive through
+ * the watch, so the periodic re-read is only a safety net (30 s without one).
+ */
+export const WATCHED_REREAD_MS = 120_000;
+
+/**
  * @param {{ watch: (root: string) => Promise<any>,
  *           onChange: (root: string, paths: any) => (void|Promise<void>),
  *           sleep: (ms: number) => Promise<void>,
@@ -17,6 +23,7 @@
 export function createWatchLoops({ watch, onChange, sleep, errorDelayMs = 5000 }) {
   const wanted = new Set();
   const live = new Set();
+  const failing = new Set(); // roots whose last watch() threw (backing off)
 
   /** Plain async loop for one root; never rejects. */
   async function loop(root) {
@@ -26,7 +33,9 @@ export function createWatchLoops({ watch, onChange, sleep, errorDelayMs = 5000 }
         let paths;
         try {
           paths = await watch(root);
+          failing.delete(root);
         } catch {
+          failing.add(root);
           await sleep(errorDelayMs);
           if (!wanted.has(root)) break;
           continue;
@@ -39,6 +48,7 @@ export function createWatchLoops({ watch, onChange, sleep, errorDelayMs = 5000 }
       }
     } finally {
       live.delete(root);
+      failing.delete(root);
     }
   }
 
@@ -86,6 +96,15 @@ export function createWatchLoops({ watch, onChange, sleep, errorDelayMs = 5000 }
      */
     wanted() {
       return new Set(wanted);
+    },
+
+    /**
+     * True when root has a running loop whose watch is not failing: changes
+     * there are seen as they happen, so periodic re-reads can be rare.
+     * @param {string} root
+     */
+    healthy(root) {
+      return live.has(root) && !failing.has(root);
     },
 
     /**

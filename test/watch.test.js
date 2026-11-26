@@ -255,3 +255,29 @@ test("falsy roots are ignored", async () => {
   loops.remove(null);
   assert.deepEqual([...loops.wanted()], ["real"]);
 });
+
+test("healthy: true while a watch is armed, false while it is failing or gone", async () => {
+  const fw = fakeWatch();
+  let wake;
+  const loops = createWatchLoops({
+    watch: fw.watch,
+    onChange: () => {},
+    sleep: () => new Promise((r) => { wake = r; }),
+  });
+  assert.equal(loops.healthy("root"), false);
+  loops.add("root");
+  await tick();
+  assert.equal(loops.healthy("root"), true);
+  fw.reject("root");
+  await tick();
+  assert.equal(loops.healthy("root"), false, "backing off after a failed watch");
+  wake();
+  await tick();
+  fw.resolve("root", []);
+  await tick();
+  assert.equal(loops.healthy("root"), true, "a working watch again");
+  loops.remove("root");
+  fw.resolve("root", []);
+  await tick();
+  assert.equal(loops.healthy("root"), false);
+});

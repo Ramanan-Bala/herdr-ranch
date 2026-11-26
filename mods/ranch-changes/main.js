@@ -95,7 +95,13 @@ export default class Changes extends View {
     // it is shown again catches up at once (lib/panels.js).
     this.vis = new PanelVisibility(() => blockShown(layout(), { id: "changes", mod: "ranch-changes" }));
     this.refreshIfShown(cx);
-    cx.timer.every(10000, (cx) => this.refreshIfShown(cx));
+    // Every 10 s; every 60 s while a local folder watch is working (it
+    // refreshes on change, so the timer is only a safety net).
+    this.lastRead = 0;
+    cx.timer.every(10000, (cx) => {
+      if (this.watched && !this.on && Date.now() - this.lastRead < 60000) return;
+      this.refreshIfShown(cx);
+    });
   }
 
   /** refresh() while the panel is on screen; otherwise remember it for the next show. */
@@ -255,6 +261,7 @@ export default class Changes extends View {
     }
     const token = plan.token;
     this.loading = token;
+    this.lastRead = Date.now();
     cx.spawn(async (cx) => {
       try {
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });

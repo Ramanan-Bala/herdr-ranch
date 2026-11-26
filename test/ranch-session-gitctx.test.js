@@ -222,44 +222,6 @@ test("not-repo caches a clean non-failed entry", () => {
   assert.equal(e.top, null);
 });
 
-test("push: one at a time, cross-context view is blocked, stale ids ignored", () => {
-  const g = new GitContexts();
-  let t = 1000;
-  g.select(null, "/a");
-  g.finishGit(g.beginGit(), ok(summary("f1")), t);
-  const p1 = g.beginPush();
-  assert.ok(p1);
-  assert.equal(Object.isFrozen(p1), true);
-  assert.equal(p1.branch, "f1");
-  assert.equal(g.beginPush(), null); // one push at a time
-  g.select(null, "/b");
-  assert.deepEqual(g.pushView(), { busy: false, err: null, at: 0, blocked: true });
-  g.finishGit(g.beginGit(), ok(summary("f2")), t);
-  assert.equal(g.beginPush(), null); // still A's push in flight
-  assert.equal(g.finishPush(p1, { ok: true, err: null }, t), true);
-  g.select(null, "/a");
-  assert.equal(g.pushView().at, t);
-  assert.equal(g.pushView().blocked, false);
-  // A stale op (wrong id) never changes the newer push's state.
-  const stale = { ...p1, id: p1.id + 9 };
-  const snapshot = { ...g.push };
-  assert.equal(g.finishPush(stale, { ok: true, err: null }, t + 1), false);
-  assert.deepEqual(g.push, snapshot);
-  // A failed push shows its error only on its own context.
-  const p2 = g.beginPush();
-  assert.equal(g.finishPush(p2, { ok: false, err: "boom" }, t + 2), true);
-  assert.equal(g.pushView().err, "boom");
-  assert.equal(g.pushView().busy, false);
-  g.select(null, "/b");
-  assert.deepEqual(g.pushView(), { busy: false, err: null, at: 0, blocked: false });
-  g.select(null, "/a");
-  // A successful push on the current context marks git dirty.
-  const p3 = g.beginPush();
-  g.finishPush(p3, { ok: true, err: null }, t + 3);
-  assert.equal(g.gitDirty, true);
-  assert.equal(g.prDirty, true);
-});
-
 test("ageLabel buckets the age for the as-of badge", () => {
   assert.equal(ageLabel(0), "as of 0s");
   assert.equal(ageLabel(59999), "as of 59s");

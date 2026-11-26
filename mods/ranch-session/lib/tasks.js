@@ -110,14 +110,6 @@ export function normalizeActivity(a) {
   return { state: a.state, at };
 }
 
-/** Returns a new store with session.activity set (session created if missing). */
-export function withActivity(store, state, at) {
-  const session = store.session && typeof store.session === "object"
-    ? store.session
-    : { id: null, title: null, title_source: null, first_prompt: null, state: "running" };
-  return { ...store, session: { ...session, activity: { state, at } } };
-}
-
 /** The per-turn block used for missed-turn detection (fixes §3.7). */
 function normalizeTurn(t) {
   if (!isPlainObject(t) || typeof t.tasks !== "string") return null;

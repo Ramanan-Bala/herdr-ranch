@@ -349,56 +349,6 @@ export function sweepHistory(store, now, staleMs = 600000) {
   }
 }
 
-/** Parses macOS `memory_pressure -Q` free percentage into available bytes, or null. */
-export function parseMemoryPressure(text, totalBytes) {
-  if (typeof text !== "string" || !Number.isFinite(totalBytes) || totalBytes <= 0) return null;
-  const m = /System-wide memory free percentage:\s*([+-]?\d+(?:\.\d+)?)%/.exec(text);
-  if (!m) return null;
-  const pct = Number(m[1]);
-  if (!Number.isFinite(pct) || pct < 0 || pct > 100) return null;
-  return Math.round((totalBytes * pct) / 100);
-}
-
-/** Parses Linux /proc/meminfo MemTotal and MemAvailable (kB) into bytes, or null. */
-export function parseMeminfo(text) {
-  if (typeof text !== "string") return null;
-  let total = null;
-  let available = null;
-  for (const line of text.split("\n")) {
-    const m = /^\s*(MemTotal|MemAvailable):\s*(\d+)\s+kB\s*$/.exec(line);
-    if (!m) continue;
-    const bytes = Number(m[2]) * 1024;
-    if (!Number.isFinite(bytes)) continue;
-    if (m[1] === "MemTotal") total = bytes;
-    else if (m[1] === "MemAvailable") available = bytes;
-  }
-  if (total === null || available === null) return null;
-  return { total, available };
-}
-
-/** Parses the 1-minute load average from macOS sysctl or Linux /proc/loadavg, or null. */
-export function parseLoadAvg(text) {
-  if (typeof text !== "string") return null;
-  const s = text.trim();
-  if (!s) return null;
-  const m =
-    /^\{\s*(\d+(?:\.\d+)?)\s+\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s*\}$/.exec(s) ??
-    /^(\d+(?:\.\d+)?)\s+\d+(?:\.\d+)?\s+\d+(?:\.\d+)?(?:\s|$)/.exec(s);
-  if (!m) return null;
-  const n = Number(m[1]);
-  return Number.isFinite(n) ? n : null;
-}
-
-/** Computes clamped host memory totals, usage, and percentage from byte counts. */
-export function hostMemory(totalBytes, availableBytes) {
-  const total = Number.isFinite(totalBytes) && totalBytes > 0 ? totalBytes : 0;
-  const rawAvail = Number.isFinite(availableBytes) ? availableBytes : 0;
-  const available = Math.min(total, Math.max(0, rawAvail));
-  const used = total - available;
-  const percent = total > 0 ? (used / total) * 100 : 0;
-  return { total, available, used, percent };
-}
-
 /** Returns a new rows array sorted by "memory", "cpu", or "name" (tie/unknown -> name asc). */
 export function sortRows(rows, by) {
   if (!Array.isArray(rows)) return [];
@@ -414,66 +364,6 @@ export function sortRows(rows, by) {
     }
     return nameOf(a).localeCompare(nameOf(b));
   });
-}
-
-/** Deprecated: use buildResourceTree. Groups alive terminal rows by space, attaches history samples, and sorts rows and groups. */
-export function buildResourceGroups({ rows, spaces, history, sort } = {}) {
-  const rowList = Array.isArray(rows) ? rows : [];
-  const spaceList = Array.isArray(spaces) ? spaces : [];
-  const spaceNames = new Map();
-  const tabNames = new Map();
-  for (const sp of spaceList) {
-    if (!sp || typeof sp !== "object") continue;
-    if (typeof sp.id === "string" && sp.id) {
-      spaceNames.set(sp.id, typeof sp.name === "string" && sp.name ? sp.name : "Other");
-    }
-    if (Array.isArray(sp.tabs)) {
-      for (const tb of sp.tabs) {
-        if (!tb || typeof tb !== "object") continue;
-        if (typeof tb.id === "string" && tb.id && typeof tb.name === "string" && tb.name) {
-          tabNames.set(tb.id, tb.name);
-        }
-      }
-    }
-  }
-
-  const bySpace = new Map();
-  for (const r of rowList) {
-    if (!r || typeof r !== "object" || !r.alive) continue;
-    const knownSpace = typeof r.space === "string" && spaceNames.has(r.space);
-    const groupId = knownSpace ? r.space : null;
-    const groupName = knownSpace ? spaceNames.get(r.space) : "Other";
-    const tabName = typeof r.tab === "string" && tabNames.has(r.tab) ? tabNames.get(r.tab) : null;
-    const title = typeof r.title === "string" && r.title ? r.title : null;
-    const label = [tabName, title].filter(Boolean).join(" · ");
-    const rssKB = Number.isFinite(r.rssKB) ? r.rssKB : 0;
-    const cpu = Number.isFinite(r.cpu) ? r.cpu : 0;
-    const item = {
-      address: r.address ?? null,
-      tab: r.tab ?? null,
-      label,
-      rssKB,
-      cpu,
-      alive: true,
-      history: readHistory(history, r.address),
-      name: label,
-    };
-    let group = bySpace.get(groupId);
-    if (!group) {
-      group = { id: groupId, name: groupName, rssKB: 0, cpu: 0, rows: [] };
-      bySpace.set(groupId, group);
-    }
-    group.rssKB += rssKB;
-    group.cpu += cpu;
-    group.rows.push(item);
-  }
-
-  const groups = [];
-  for (const group of bySpace.values()) {
-    const sorted = sortRows(group.rows, sort).map(({ name: _name, ...row }) => row);
-    groups.push({ id: group.id, name: group.name, rssKB: group.rssKB, cpu: group.cpu, rows: sorted });
-  }
-  return sortRows(groups, sort);
 }
 
 /** Summarizes Herdr app and herdr-core RSS, CPU, and process counts from parsed ps rows. */

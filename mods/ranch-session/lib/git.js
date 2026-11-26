@@ -188,26 +188,6 @@ export function parseStatusBranch(text) {
 }
 
 /**
- * Repo and worktree names for the status bar, from `git rev-parse
- * --show-toplevel --path-format=absolute --git-common-dir` output.
- * The repo is the main checkout's folder ("/x/ranch/.git" -> "ranch", a bare
- * "/x/ranch.git" -> "ranch"); the worktree is the linked checkout's folder,
- * null for the main checkout.
- * @param {string} top
- * @param {string|null} common
- * @returns {{repo: string, worktree: string|null}}
- */
-export function repoLabels(top, common) {
-  const base = (p) => String(p ?? "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
-  const t = String(top ?? "").replace(/[\\/]+$/, "");
-  const c = String(common ?? "").replace(/[\\/]+$/, "");
-  if (!c) return { repo: base(t), worktree: null };
-  const repo = /[\\/]\.git$/.test(c) ? base(c.slice(0, -5)) : base(c).replace(/\.git$/, "");
-  const linked = c !== `${t}/.git` && c !== `${t}\\.git`;
-  return { repo: repo || base(t), worktree: linked ? base(t) : null };
-}
-
-/**
  * Map a git remote URL to a web host.
  * @param {string} remoteUrl
  * @returns {{kind: "github"|"gitlab", base: string}|null}

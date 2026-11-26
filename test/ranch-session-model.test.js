@@ -25,7 +25,6 @@ const {
   adapterKey,
   remoteText,
   fileRow,
-  subDuration,
   herdrSubStatus,
   activityStatus,
   nativeActivity,
@@ -206,14 +205,6 @@ test("fileRow", () => {
   assert.deepEqual(fileRow({ path: "src/a.js", add: 3, del: 1 }), { path: "src/a.js", add: "+3", del: "−1" });
   assert.deepEqual(fileRow({ path: "img.png", add: null, del: null }), { path: "img.png", add: "bin", del: null });
   assert.deepEqual(fileRow(null), { path: "", add: "bin", del: null });
-});
-
-test("subDuration", () => {
-  const now = Date.parse("2026-11-11T10:00:00Z");
-  assert.equal(subDuration("2026-11-11T09:59:30Z", null, now), 30000);
-  assert.equal(subDuration("2026-11-11T09:59:30Z", "2026-11-11T09:59:45Z", now), 15000);
-  assert.equal(subDuration(null, null, now), null);
-  assert.equal(subDuration("nope", null, now), null);
 });
 
 test("taskEmptyState points at /hooks when Codex hooks need approval", () => {

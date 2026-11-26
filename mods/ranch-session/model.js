@@ -277,21 +277,6 @@ export function fileRow(f) {
   };
 }
 
-/**
- * A store sub-agent's duration in ms, from its ISO timestamps.
- * @param {string|null} started_at
- * @param {string|null} ended_at
- * @param {number} now ms since the epoch (used while it still runs)
- * @returns {number|null}
- */
-export function subDuration(started_at, ended_at, now) {
-  const start = Date.parse(started_at ?? "");
-  if (Number.isNaN(start)) return null;
-  const end = ended_at ? Date.parse(ended_at) : now;
-  if (Number.isNaN(end)) return null;
-  return Math.max(0, end - start);
-}
-
 /** PR state -> colour token (t.<token>) for the icon and pill, or null. */
 export function prStateToken(state) {
   return { open: "ansi2", draft: "dim", merged: "ansi5", closed: "blocked" }[state] ?? null;

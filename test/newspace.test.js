@@ -2,13 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   parseWorktrees,
-  parseBranches,
   repoInfo,
   tilde,
   expandHome,
   firstLine,
-  pickDefaultBranch,
-  branchSuggestions,
   newSpacePlan,
   planLabel,
   planLines,
@@ -74,33 +71,6 @@ test("parseWorktrees tolerates empty and junk input", () => {
   assert.deepEqual(parseWorktrees("\n\n"), []);
 });
 
-// ------------------------------------------------------ parseBranches
-
-const REFS = [
-  "refs/heads/main\t",
-  "refs/heads/feat/x\t",
-  "refs/remotes/origin/HEAD\trefs/remotes/origin/main",
-  "refs/remotes/origin/main\t",
-  "refs/remotes/origin/feat/x\t",
-  "refs/remotes/upstream/only-here\t",
-].join("\n");
-
-test("parseBranches splits local/remote and derives the default from symref HEAD", () => {
-  const b = parseBranches(REFS);
-  assert.deepEqual(b.local, ["main", "feat/x"]);
-  assert.deepEqual(b.remote, ["origin/main", "origin/feat/x", "upstream/only-here"]);
-  assert.equal(b.default, "main");
-});
-
-test("parseBranches without a remote HEAD has no default", () => {
-  assert.deepEqual(parseBranches("refs/heads/main\t\nrefs/remotes/origin/main\t"), {
-    local: ["main"],
-    remote: ["origin/main"],
-    default: null,
-  });
-  assert.deepEqual(parseBranches(""), { local: [], remote: [], default: null });
-});
-
 // ---------------------------------------------------------- repoInfo
 
 test("repoInfo strips /.git from the common dir and names the repo", () => {
@@ -145,29 +115,6 @@ test("firstLine returns the first non-empty line", () => {
   assert.equal(firstLine("\n fatal: bad\nmore"), "fatal: bad");
   assert.equal(firstLine(""), "");
   assert.equal(firstLine(undefined), "");
-});
-
-test("pickDefaultBranch prefers the remote HEAD, then current, then main/master", () => {
-  assert.equal(pickDefaultBranch({ default: "develop", local: ["main"] }, "main"), "develop");
-  assert.equal(pickDefaultBranch({ default: null, local: ["main", "topic"] }, "topic"), "topic");
-  assert.equal(pickDefaultBranch({ default: null, local: ["master"] }, "topic"), "master");
-  assert.equal(pickDefaultBranch({ default: null, local: ["dev"] }, null), "dev");
-  assert.equal(pickDefaultBranch({ default: null, local: [] }, "topic"), "topic");
-  assert.equal(pickDefaultBranch(null, null), null);
-});
-
-test("branchSuggestions merges local + remote (prefix stripped), dedupes and filters", () => {
-  const branches = parseBranches(REFS);
-  assert.deepEqual(branchSuggestions(branches, ""), ["feat/x", "main", "only-here"]);
-  assert.deepEqual(branchSuggestions(branches, "feat"), ["feat/x"]);
-  assert.deepEqual(branchSuggestions(branches, "o"), ["only-here"]);
-  assert.deepEqual(branchSuggestions(branches, "zzz"), []);
-});
-
-test("branchSuggestions ranks prefix matches before substring matches", () => {
-  const branches = { local: ["feature", "my-feature"], remote: [] };
-  assert.deepEqual(branchSuggestions(branches, "feat"), ["feature", "my-feature"]);
-  assert.deepEqual(branchSuggestions(branches, "e"), ["feature", "my-feature"]);
 });
 
 // -------------------------------------------------------- newSpacePlan

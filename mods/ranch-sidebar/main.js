@@ -21,7 +21,7 @@ import { STATUS_LABEL, formatDuration, truncateMiddle, effectiveStatus, mostUrge
 import {
   repoSummary, parsePr, createTtlCache, createLimiter, runGh, PR_JSON_FIELDS,
 } from "./lib/git.js";
-import { createWatchLoops } from "./lib/watch.js";
+import { createWatchLoops, WATCHED_REREAD_MS } from "./lib/watch.js";
 import { EdgeGrip } from "./lib/edge-grip.js";
 import { Marquee } from "./lib/marquee.js";
 import { homeCache } from "./lib/home.js";
@@ -498,8 +498,10 @@ export default class RanchSidebar extends View {
       if (!entry?.summary) continue;
       const i = key.indexOf("|");
       const machine = key.slice(0, i) || null;
-      const due = now - entry.at > (machine ? remoteMs : 30_000);
-      if (due) this.refreshRepo(machine, key.slice(i + 1), cx);
+      const top = key.slice(i + 1);
+      // Watched locally: changes refresh it at once; the sweep is a safety net.
+      const every = machine ? remoteMs : this.repoWatch.healthy(top) ? WATCHED_REREAD_MS : 30_000;
+      if (now - entry.at > every) this.refreshRepo(machine, top, cx);
     }
     for (const folder of this.wtWatch.wanted()) {
       if (!this.wantedScans.has(keptKey(null, folder))) this.wtWatch.remove(folder);
@@ -511,8 +513,10 @@ export default class RanchSidebar extends View {
       }
       const i = key.indexOf("|");
       const machine = key.slice(0, i) || null;
-      const due = now - entry.at > (machine ? remoteMs : 30_000);
-      if (due) this.refreshScan(machine, key.slice(i + 1), cx);
+      const folder = key.slice(i + 1);
+      // A healthy .git watch rescans on `git worktree` changes at once.
+      const every = machine ? remoteMs : this.wtWatch.healthy(folder) ? WATCHED_REREAD_MS : 30_000;
+      if (now - entry.at > every) this.refreshScan(machine, folder, cx);
     }
     for (const key of [...this.pendingScans.keys()]) {
       if (!this.wantedScans.has(key)) this.pendingScans.delete(key);
@@ -1699,11 +1703,13 @@ export default class RanchSidebar extends View {
     const activity = shared(ACTIVITY_KEY) ?? {};
     const tabs = new Map(spaces().flatMap((sp) => sp.tabs.map((tb) => [tb.id, tb])));
     // The shared registry is read per machine, cached, refreshed on this tick
-    // (sweep cadence); drain() does the actual reads.
+    // (sweep cadence); drain() does the actual reads. Another machine's file
+    // is a remote call each time: refresh.remoteGitSec there, 5 s here.
+    const remoteRegMs = Math.max(5000, (s.refresh?.remoteGitSec ?? 15) * 1000);
     const wantRegistry = (machine) => {
       const mk = machine ?? "";
       const hit = this.prRegistries.get(mk);
-      if (!hit || now - hit.at >= 5000) this.pendingRegistries.set(mk, machine);
+      if (!hit || now - hit.at >= (machine ? remoteRegMs : 5000)) this.pendingRegistries.set(mk, machine);
       return hit?.parsed ?? null;
     };
     const walk = (cards, settled) => {

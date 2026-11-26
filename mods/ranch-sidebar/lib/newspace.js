@@ -33,38 +33,6 @@ export function parseWorktrees(text) {
 }
 
 /**
- * Parse `git for-each-ref --format=%(refname)%09%(symref) refs/heads refs/remotes`
- * into `{ local, remote, default }`. Local branches are short names; remote
- * ones keep their remote prefix (`origin/main`). `default` is the branch a
- * `<remote>/HEAD` symbolic ref points at (usually `main`), or null.
- */
-export function parseBranches(text) {
-  const local = [];
-  const remote = [];
-  let defaultBranch = null;
-  for (const line of String(text ?? "").split("\n")) {
-    if (!line.trim()) continue;
-    const tab = line.indexOf("\t");
-    const ref = (tab === -1 ? line : line.slice(0, tab)).trim();
-    const symref = tab === -1 ? "" : line.slice(tab + 1).trim();
-    if (ref.startsWith("refs/heads/")) {
-      local.push(ref.slice("refs/heads/".length));
-    } else if (ref.startsWith("refs/remotes/")) {
-      const short = ref.slice("refs/remotes/".length);
-      if (short.endsWith("/HEAD")) {
-        if (symref.startsWith("refs/remotes/")) {
-          const target = symref.slice("refs/remotes/".length).split("/").slice(1).join("/");
-          if (target) defaultBranch = target;
-        }
-        continue;
-      }
-      remote.push(short);
-    }
-  }
-  return { local, remote, default: defaultBranch };
-}
-
-/**
  * The repo a folder belongs to, from `rev-parse --show-toplevel` and
  * `rev-parse --path-format=absolute --git-common-dir`: `{ top, main, name }`,
  * or null when either command failed (not a repo). `main` is the primary
@@ -103,45 +71,6 @@ export function expandHome(path, home) {
 /** The first non-empty line of a git error, for the inline error slot. */
 export function firstLine(text) {
   return String(text ?? "").trim().split("\n")[0] ?? "";
-}
-
-/**
- * The branch to base a new branch on: the remote HEAD when the repo names one,
- * else the checked-out branch, then `main`/`master`, then any local branch.
- */
-export function pickDefaultBranch(branches, current) {
-  const local = branches?.local ?? [];
-  if (branches?.default) return branches.default;
-  if (current && local.includes(current)) return current;
-  for (const guess of ["main", "master"]) if (local.includes(guess)) return guess;
-  return local[0] ?? current ?? null;
-}
-
-/**
- * Branch-name autocomplete: local branches plus remote branch names with the
- * remote prefix stripped (`origin/feat` -> `feat`), deduped and prefix-matched
- * against `query` (case-insensitive), most useful first, capped at `limit`.
- */
-export function branchSuggestions(branches, query, limit = 6) {
-  const names = [];
-  const seen = new Set();
-  const add = (name) => {
-    const n = String(name ?? "").trim();
-    if (!n || n === "HEAD" || seen.has(n)) return;
-    seen.add(n);
-    names.push(n);
-  };
-  for (const name of branches?.local ?? []) add(name);
-  for (const ref of branches?.remote ?? []) add(ref.split("/").slice(1).join("/"));
-  const q = String(query ?? "").trim().toLowerCase();
-  const matched = q ? names.filter((n) => n.toLowerCase().includes(q)) : names;
-  // Prefix matches before substring matches, then alphabetical.
-  matched.sort((a, b) => {
-    const ap = a.toLowerCase().startsWith(q) ? 0 : 1;
-    const bp = b.toLowerCase().startsWith(q) ? 0 : 1;
-    return ap - bp || a.localeCompare(b);
-  });
-  return matched.slice(0, limit);
 }
 
 // ------------------------------------------------------ reading a machine

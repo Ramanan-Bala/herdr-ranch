@@ -41,7 +41,7 @@ import { GitContexts, ageLabel } from "./gitctx.js";
 import {
   GIT_SHARE_KEY, PR_SHARE_KEY, withGitSummary, sharedGitSummary, withPr, sharedPr, prBranchKey, prUrlKey,
 } from "./lib/share.js";
-import { createWatchLoops } from "./lib/watch.js";
+import { createWatchLoops, WATCHED_REREAD_MS } from "./lib/watch.js";
 import { TASKS_DIR, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
 import { PRS_FILE, parsePrRegistry, prsFor, registryPrBelongs, repoOfWebBase } from "./lib/prs.js";
 import {
@@ -83,7 +83,7 @@ import {
   prStateLabel,
   prRepoText,
 } from "./model.js";
-import { windowsHome } from "./win.js";
+import { homeCache } from "./lib/home.js";
 import { EdgeGrip } from "./lib/edge-grip.js";
 import { blockShown, PanelVisibility } from "./lib/panels.js";
 
@@ -117,7 +117,9 @@ const TASKS_CACHE_MAX = 32;
 export default class RanchSession extends View {
   init(_props, cx) {
     this.remembered = new Map(); // tabId -> chosen agent address
-    this.homes = new Map(); // machine (null excepted) -> its home dir
+    // Home dir per machine: home() locally, else asked once (sh, then cmd.exe)
+    // with failures retried after 30 s, not on every tick (lib/home.js).
+    this.homeFor = homeCache(exec, home);
     this.tasks = { key: null, parsed: null, read: false, startedAt: null };
     // "addr@machine" -> last parsed store read for that agent: shown while a
     // fresh read for it is in flight, so the card never drops to just the
@@ -206,32 +208,6 @@ export default class RanchSession extends View {
       status: chosen ? agentStatus(chosen.status, (shared("ranch.activity") ?? {})[tabId], Date.now()) : null,
       cwd: pane?.cwd ?? null,
     };
-  }
-
-  /** Home dir on a machine: home() locally; asked once per remote machine. */
-  async homeFor(machine) {
-    if (!machine) return home();
-    const hit = this.homes.get(machine);
-    if (hit) return hit;
-    try {
-      const r = await exec("sh", ["-c", 'printf %s "$HOME"'], { on: machine });
-      const out = r.code === 0 ? r.stdout.trim() : "";
-      if (out) {
-        this.homes.set(machine, out);
-        return out;
-      }
-    } catch {}
-    // Windows remote (F12): sh answered nothing, so ask cmd.exe. Backslashes
-    // are normalized so the store path joins work like on Unix.
-    try {
-      const r = await exec("cmd.exe", ["/c", "echo %USERPROFILE%"], { on: machine });
-      const out = windowsHome(r.code === 0 ? r.stdout : "");
-      if (out) {
-        this.homes.set(machine, out);
-        return out;
-      }
-    } catch {}
-    return null;
   }
 
   choose(agent, cx) {
@@ -804,7 +780,6 @@ export default class RanchSession extends View {
       this.subTasks.clear();
       this.filesOpen = false;
       this.ciOpen = null;
-      if (!this.ctx.push.busy) this.ctx.push = { ...this.ctx.push, err: null, at: 0 };
     }
     // A TUI session switch changes the terminal title with no event: re-read
     // the pointer so the list follows the session now on screen.
@@ -840,8 +815,8 @@ export default class RanchSession extends View {
     // The context may have changed since the last pump (render can switch it
     // earlier): make the schedule below act on the session being drawn.
     if (this.ctx.select(s.machine, s.cwd)) this.syncGitWatch();
-    // Git: immediately on change, then 30 s locally (watchFolder covers the
-    // gaps) and refresh.remoteGitSec on another machine.
+    // Git: immediately on change, then gitEveryMs (a safety net locally, where
+    // watchFolder sees changes; refresh.remoteGitSec on another machine).
     if (this.ctx.shouldRefreshGit(now, this.gitEveryMs(s, set))) this.refreshGit(cx);
     // PR: every refresh.prSec, 20 s while CI checks are pending (I5). The
     // read always queries the current context's branch, so a branch change
@@ -865,15 +840,22 @@ export default class RanchSession extends View {
     // The shared PR registry (~/.herdr/ranch/prs.json): what any terminal's
     // agent opened on this repo + branch. One small file read, at most every
     // few seconds (the tasks watcher also flags it) — recordedPrs() merges it.
+    // Another machine's file is a remote call each time: refresh.remoteGitSec.
     const regKey = `${s.machine ?? ""}`;
-    if (this.prRegistry.key !== regKey || this.prRegistry.dirty || now - this.prRegistry.at >= 3000) {
+    const regEvery = s.machine != null ? Math.max(3000, set.refresh.remoteGitSec * 1000) : 3000;
+    if (this.prRegistry.key !== regKey || this.prRegistry.dirty || now - this.prRegistry.at >= regEvery) {
       this.loadPrRegistry(cx);
     }
   }
 
-  /** Git re-read cadence: 30 s locally (watchFolder covers the gaps), refresh.remoteGitSec elsewhere. */
+  /**
+   * Git re-read cadence: refresh.remoteGitSec on another machine; locally 30 s,
+   * or 2 min while the repo's folder watch is healthy (it re-reads on change).
+   */
   gitEveryMs(s, set) {
-    return s.machine != null ? Math.max(1, set.refresh.remoteGitSec) * 1000 : 30000;
+    if (s.machine != null) return Math.max(1, set.refresh.remoteGitSec) * 1000;
+    const top = this.ctx.gitEntry()?.top;
+    return top && this.gitWatch.healthy(top) ? WATCHED_REREAD_MS : 30000;
   }
 
   /** PR re-read cadence: 20 s while CI checks are pending (I5), else refresh.prSec. */
@@ -1081,24 +1063,6 @@ export default class RanchSession extends View {
           );
       })
     );
-  }
-
-  /** The Push action: push the branch the button showed, then refresh git+PR. */
-  async pushBranch(cx) {
-    const s = this.session();
-    this.ctx.select(s.machine, s.cwd);
-    const op = this.ctx.beginPush(); // captures machine, top and branch once
-    if (!op) return;
-    cx.notify();
-    let res;
-    try {
-      const r = await exec("git", ["push", "-u", "origin", op.branch], { cwd: op.top, on: op.machine, timeout: 60000 });
-      res = r.code === 0 ? { ok: true } : { ok: false, err: (r.stderr ?? "").split("\n").find((l) => l.trim()) ?? "Push failed" };
-    } catch {
-      res = { ok: false, err: "Push failed" };
-    }
-    if (this.ctx.finishPush(op, res, Date.now()) && res.ok) cx.timer.after(1500, (cx) => cx.notify());
-    cx.notify();
   }
 
   // ---- card building blocks ---------------------------------------------

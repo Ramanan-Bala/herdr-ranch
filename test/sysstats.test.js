@@ -13,12 +13,7 @@ import {
   pushHistory,
   readHistory,
   sweepHistory,
-  parseMemoryPressure,
-  parseMeminfo,
-  parseLoadAvg,
-  hostMemory,
   sortRows,
-  buildResourceGroups,
   herdrUsage,
   ownerSplit,
   isOrphan,
@@ -394,76 +389,6 @@ test("history rings enforce capacity, copy on read, coerce non-finite, and sweep
   assert.doesNotThrow(() => sweepHistory(store, NaN));
 });
 
-test("parseMemoryPressure parses macOS memory_pressure -Q output and rejects bad inputs", () => {
-  const sample = [
-    "The system has 34359738368 (8388608 pages with a page size of 4096).",
-    "",
-    "System-wide memory free percentage: 63%",
-  ].join("\n");
-  assert.equal(parseMemoryPressure(sample, 1000), 630);
-  assert.equal(parseMemoryPressure("System-wide memory free percentage: 0%", 1000), 0);
-  assert.equal(parseMemoryPressure("System-wide memory free percentage: 100%", 1000), 1000);
-  assert.equal(parseMemoryPressure("System-wide memory free percentage: 33%", 1000), 330);
-
-  assert.equal(parseMemoryPressure("System-wide memory free percentage: 101%", 1000), null);
-  assert.equal(parseMemoryPressure("System-wide memory free percentage: -5%", 1000), null);
-  assert.equal(parseMemoryPressure("no percentage line here", 1000), null);
-  assert.equal(parseMemoryPressure(sample, 0), null);
-  assert.equal(parseMemoryPressure(sample, -100), null);
-  assert.equal(parseMemoryPressure(sample, NaN), null);
-  assert.equal(parseMemoryPressure(null, 1000), null);
-  assert.equal(parseMemoryPressure(undefined, 1000), null);
-});
-
-test("parseMeminfo parses Linux /proc/meminfo and rejects missing or malformed inputs", () => {
-  const sample = [
-    "MemTotal:       16384000 kB",
-    "MemFree:         2048000 kB",
-    "MemAvailable:    8192000 kB",
-    "Buffers:          512000 kB",
-  ].join("\n");
-  assert.deepEqual(parseMeminfo(sample), {
-    total: 16384000 * 1024,
-    available: 8192000 * 1024,
-  });
-
-  assert.equal(parseMeminfo("MemTotal: 16384000 kB\n"), null);
-  assert.equal(parseMeminfo("MemAvailable: 8192000 kB\n"), null);
-  assert.equal(parseMeminfo("MemTotal: bad kB\nMemAvailable: 100 kB\n"), null);
-  assert.equal(parseMeminfo(""), null);
-  assert.equal(parseMeminfo(null), null);
-  assert.equal(parseMeminfo(undefined), null);
-});
-
-test("parseLoadAvg parses macOS sysctl and Linux /proc/loadavg outputs", () => {
-  assert.equal(parseLoadAvg("{ 1.23 1.45 1.67 }\n"), 1.23);
-  assert.equal(parseLoadAvg("{0.00 0.10 0.20}"), 0);
-  assert.equal(parseLoadAvg("0.52 0.58 0.59 1/389 12345\n"), 0.52);
-  assert.equal(parseLoadAvg("2 1.5 1.0"), 2);
-
-  assert.equal(parseLoadAvg(""), null);
-  assert.equal(parseLoadAvg("   "), null);
-  assert.equal(parseLoadAvg("{ }"), null);
-  assert.equal(parseLoadAvg("{ 1.23 1.45 }"), null);
-  assert.equal(parseLoadAvg("-1.0 0.5 0.5"), null);
-  assert.equal(parseLoadAvg("1.23abc 0.5 0.5"), null);
-  assert.equal(parseLoadAvg("not loadavg"), null);
-  assert.equal(parseLoadAvg(null), null);
-  assert.equal(parseLoadAvg(undefined), null);
-  assert.equal(parseLoadAvg(42), null);
-});
-
-test("hostMemory clamps available and handles zero or non-finite inputs", () => {
-  assert.deepEqual(hostMemory(1000, 400), { total: 1000, available: 400, used: 600, percent: 60 });
-  assert.deepEqual(hostMemory(1000, 1500), { total: 1000, available: 1000, used: 0, percent: 0 });
-  assert.deepEqual(hostMemory(1000, -50), { total: 1000, available: 0, used: 1000, percent: 100 });
-  assert.deepEqual(hostMemory(0, 100), { total: 0, available: 0, used: 0, percent: 0 });
-  assert.deepEqual(hostMemory(-100, 50), { total: 0, available: 0, used: 0, percent: 0 });
-  assert.deepEqual(hostMemory(NaN, NaN), { total: 0, available: 0, used: 0, percent: 0 });
-  assert.deepEqual(hostMemory(1000, Infinity), { total: 1000, available: 0, used: 1000, percent: 100 });
-  assert.deepEqual(hostMemory(null, undefined), { total: 0, available: 0, used: 0, percent: 0 });
-});
-
 test("sortRows sorts without mutating, breaks ties by name, and tolerates missing fields", () => {
   const rows = [
     { name: "charlie", rssKB: 200, cpu: 10 },
@@ -489,72 +414,6 @@ test("sortRows sorts without mutating, breaks ties by name, and tolerates missin
 
   assert.deepEqual(sortRows(null, "memory"), []);
   assert.deepEqual(sortRows([null, { name: "a", rssKB: 10 }], "memory").map((r) => r?.name ?? ""), ["a", ""]);
-});
-
-test("buildResourceGroups groups alive rows by space, formats labels, attaches history, and sorts", () => {
-  const history = new Map();
-  pushHistory(history, "t1", 1024, 1000);
-  pushHistory(history, "t1", 2048, 2000);
-  pushHistory(history, "t2", 512, 1000);
-
-  const spaces = [
-    { id: "sp1", name: "Ranch", tabs: [{ id: "tb1", name: "API" }, { id: "tb2", name: "Web" }] },
-    { id: "sp2", name: "Docs", tabs: [{ id: "tb3", name: "Guide" }] },
-    { id: "sp_empty", name: "Empty", tabs: [] },
-  ];
-
-  const rows = [
-    { address: "t1", tab: "tb1", space: "sp1", title: "claude", pid: 10, alive: true, rssKB: 1000, cpu: 2 },
-    { address: "t2", tab: "tb2", space: "sp1", title: null, pid: 11, alive: true, rssKB: 3000, cpu: 5 },
-    { address: "t3", tab: "tb3", space: "sp2", title: "vite", pid: 12, alive: true, rssKB: 2000, cpu: 10 },
-    { address: "t4", tab: null, space: null, title: "orphan", pid: 13, alive: true, rssKB: 500, cpu: 1 },
-    { address: "t5", tab: "tb_gone", space: "sp_gone", title: null, pid: 14, alive: true, rssKB: 200, cpu: 0.5 },
-    { address: "t_dead", tab: "tb1", space: "sp1", title: "dead", pid: 15, alive: false, rssKB: 9999, cpu: 99 },
-  ];
-
-  const byMem = buildResourceGroups({ rows, spaces, history, sort: "memory" });
-  assert.deepEqual(byMem, [
-    {
-      id: "sp1",
-      name: "Ranch",
-      rssKB: 4000,
-      cpu: 7,
-      rows: [
-        { address: "t2", tab: "tb2", label: "Web", rssKB: 3000, cpu: 5, alive: true, history: [512] },
-        { address: "t1", tab: "tb1", label: "API · claude", rssKB: 1000, cpu: 2, alive: true, history: [1024, 2048] },
-      ],
-    },
-    {
-      id: "sp2",
-      name: "Docs",
-      rssKB: 2000,
-      cpu: 10,
-      rows: [
-        { address: "t3", tab: "tb3", label: "Guide · vite", rssKB: 2000, cpu: 10, alive: true, history: [] },
-      ],
-    },
-    {
-      id: null,
-      name: "Other",
-      rssKB: 700,
-      cpu: 1.5,
-      rows: [
-        { address: "t4", tab: null, label: "orphan", rssKB: 500, cpu: 1, alive: true, history: [] },
-        { address: "t5", tab: "tb_gone", label: "", rssKB: 200, cpu: 0.5, alive: true, history: [] },
-      ],
-    },
-  ]);
-
-  const byCpu = buildResourceGroups({ rows, spaces, history, sort: "cpu" });
-  assert.deepEqual(byCpu.map((g) => g.name), ["Docs", "Ranch", "Other"]);
-  assert.deepEqual(byCpu[1].rows.map((r) => r.address), ["t2", "t1"]);
-
-  const byName = buildResourceGroups({ rows, spaces, history, sort: "name" });
-  assert.deepEqual(byName.map((g) => g.name), ["Docs", "Other", "Ranch"]);
-  assert.deepEqual(byName[2].rows.map((r) => r.label), ["API · claude", "Web"]);
-
-  assert.deepEqual(buildResourceGroups(), []);
-  assert.deepEqual(buildResourceGroups({ rows: [rows[5]], spaces, history, sort: "memory" }), []);
 });
 
 test("herdrUsage separates Herdr app and herdr-core processes from real ps output", () => {
