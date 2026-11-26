@@ -18,6 +18,10 @@ import {
   isOrphan,
   buildResourceTree,
   historySamples,
+  WINDOWS_PS_SCRIPT,
+  parseWinProcs,
+  applyWinCpu,
+  parseNetstatListen,
 } from "./lib/sysstats.js";
 import { renderResourcePopover } from "./resources.js";
 
@@ -89,7 +93,8 @@ export default class RanchChrome extends View {
     this.confirmKill = null;
     this.hoveredRow = null;
     this.lastPollAt = 0;
-    if (!checking() && window()?.platform !== "windows") {
+    this.winCpu = new Map();
+    if (!checking()) {
       this.pollStats(cx);
       cx.timer.every(1000, (cx) => {
         const interval = this.resOpen ? 2000 : 5000;
@@ -99,29 +104,40 @@ export default class RanchChrome extends View {
   }
 
   pollStats(cx) {
-    if (this.statsBusy || checking() || window()?.platform === "windows") return;
+    if (this.statsBusy || checking()) return;
     this.statsBusy = true;
     this.lastPollAt = Date.now();
     cx.spawn(async (cx) => {
       try {
-        let ps = null;
-        try {
-          ps = await exec("ps", ["-axo", "pid=,ppid=,rss=,pcpu=,comm="], { timeout: 5000 });
-        } catch {
-          ps = null;
+        // Windows has no ps/lsof: PowerShell's Win32_Process list (CPU from the
+        // tick delta between polls) and netstat stand in for them.
+        const win = window()?.platform === "windows";
+        const tryExec = async (cmd, args, timeout) => {
+          try {
+            return await exec(cmd, args, { timeout });
+          } catch {
+            return null;
+          }
+        };
+        let procs;
+        let listens = null;
+        if (win) {
+          const ps = await tryExec("powershell", ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_PS_SCRIPT], 15000);
+          // Without a process list there is nothing to attribute; keep the last stats (or null).
+          if (!ps || ps.code !== 0) return;
+          procs = applyWinCpu(parseWinProcs(ps.stdout), this.winCpu, Date.now());
+          const ns = await tryExec("netstat", ["-ano"], 5000);
+          if (ns && ns.code === 0) listens = parseNetstatListen(ns.stdout, procs);
+        } else {
+          const ps = await tryExec("ps", ["-axo", "pid=,ppid=,rss=,pcpu=,comm="], 5000);
+          if (!ps || ps.code !== 0) return;
+          procs = parsePs(ps.stdout);
+          const lsof = await tryExec("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"], 5000);
+          if (lsof && lsof.code === 0) listens = parseLsofListen(lsof.stdout);
         }
-        let lsof = null;
-        try {
-          lsof = await exec("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"], { timeout: 5000 });
-        } catch {
-          lsof = null;
-        }
-        // Without ps there is nothing to attribute; leave the last stats (or null).
-        if (!ps || ps.code !== 0) return;
-        const procs = parsePs(ps.stdout);
         const pids = sessionPids(procs);
         const usage = sumUsage(procs, pids);
-        const ports = lsof && lsof.code === 0 ? sessionPorts(parseLsofListen(lsof.stdout), pids) : null;
+        const ports = listens ? sessionPorts(listens, pids) : null;
 
         let rows = this.stats?.rows ?? [];
         let other = this.stats?.other ?? { rssKB: 0, cpu: 0, count: 0 };
@@ -276,7 +292,7 @@ export default class RanchChrome extends View {
               if (!open) {
                 this.confirmKill = null;
                 this.hoveredRow = null;
-              } else if (!checking() && window()?.platform !== "windows") {
+              } else if (!checking()) {
                 this.pollStats(cx);
               }
               cx.notify();

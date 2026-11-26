@@ -10,6 +10,11 @@ function baseName(comm) {
   return i >= 0 ? s.slice(i + 1) : s;
 }
 
+/** baseName without a Windows ".exe" suffix, e.g. "C:\\x\\herdr-core.exe" -> "herdr-core". */
+function exeName(comm) {
+  return baseName(comm).replace(/\.exe$/i, "");
+}
+
 /** Parses `ps -axo pid=,ppid=,rss=,pcpu=,comm=` output. `comm` is the rest of the
  *  line (it may contain spaces). Malformed lines are skipped. */
 export function parsePs(text) {
@@ -31,7 +36,7 @@ export function parsePs(text) {
  *  herdr-core descendant are excluded. Cycle-safe. */
 export function sessionPids(procs) {
   const list = Array.isArray(procs) ? procs : [];
-  const isRoot = (p) => baseName(p.comm) === "herdr-core";
+  const isRoot = (p) => exeName(p.comm).toLowerCase() === "herdr-core";
   const children = new Map();
   for (const p of list) {
     const kids = children.get(p.ppid);
@@ -94,6 +99,78 @@ export function parseLsofListen(text) {
       seen.add(key);
       out.push({ pid, command, port });
     }
+  }
+  return out;
+}
+
+/** PowerShell script that prints one Win32_Process per line as
+ *  "pid ppid rssKB cpuTicks name" (cpuTicks = kernel+user time in 100 ns units). */
+export const WINDOWS_PS_SCRIPT =
+  "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); " +
+  "Get-CimInstance Win32_Process | ForEach-Object { " +
+  "'{0} {1} {2} {3} {4}' -f $_.ProcessId, $_.ParentProcessId, [math]::Round($_.WorkingSetSize / 1024), " +
+  "([uint64]$_.KernelModeTime + [uint64]$_.UserModeTime), $_.Name }";
+
+/** Parses WINDOWS_PS_SCRIPT output into {pid, ppid, rss, ticks, comm}. Malformed lines are skipped. */
+export function parseWinProcs(text) {
+  const out = [];
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 5) continue;
+    const pid = Number(parts[0]);
+    const ppid = Number(parts[1]);
+    const rss = Number(parts[2]);
+    const ticks = Number(parts[3]);
+    if (![pid, ppid, rss, ticks].every(Number.isFinite)) continue;
+    out.push({ pid, ppid, rss, ticks, comm: parts.slice(4).join(" ") });
+  }
+  return out;
+}
+
+/** Fills `cpu` (percent of one core, like `ps pcpu`) on each Windows proc from the
+ *  tick delta since the previous sample in `prev` (Map pid -> {ticks, comm, at}),
+ *  then refreshes `prev` with this sample. First sightings get 0. */
+export function applyWinCpu(procs, prev, now) {
+  const list = Array.isArray(procs) ? procs : [];
+  const store = prev instanceof Map ? prev : new Map();
+  const at = Number.isFinite(now) ? now : 0;
+  const seen = new Set();
+  for (const p of list) {
+    const last = store.get(p.pid);
+    let cpu = 0;
+    if (last && last.comm === p.comm && at > last.at && p.ticks >= last.ticks) {
+      // ticks are 100 ns; wall ms * 10000 = wall ticks.
+      cpu = ((p.ticks - last.ticks) / ((at - last.at) * 10000)) * 100;
+    }
+    p.cpu = Number.isFinite(cpu) ? cpu : 0;
+    store.set(p.pid, { ticks: p.ticks, comm: p.comm, at });
+    seen.add(p.pid);
+  }
+  for (const pid of store.keys()) if (!seen.has(pid)) store.delete(pid);
+  return list;
+}
+
+/** Parses `netstat -ano -p TCP` (and TCPv6) output into {pid, command, port} listen
+ *  entries. Listening rows are spotted by a ":0" foreign port, not the localized
+ *  state word. `procs` (pid/comm list) names the command. */
+export function parseNetstatListen(text, procs) {
+  const names = new Map();
+  for (const p of Array.isArray(procs) ? procs : []) names.set(p.pid, exeName(p.comm));
+  const out = [];
+  const seen = new Set();
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 4 || !/^TCP/i.test(parts[0])) continue;
+    const local = parts[1];
+    const foreign = parts[2];
+    const pid = Number(parts[parts.length - 1]);
+    if (!/:0$/.test(foreign) || !Number.isFinite(pid) || pid <= 0) continue;
+    const port = Number(local.slice(local.lastIndexOf(":") + 1));
+    if (!Number.isFinite(port) || port <= 0) continue;
+    const key = `${pid}:${port}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ pid, command: names.get(pid) ?? "", port });
   }
   return out;
 }
@@ -406,11 +483,13 @@ export function herdrUsage(procs) {
   for (const p of Array.isArray(procs) ? procs : []) {
     if (!p || typeof p !== "object") continue;
     const comm = typeof p.comm === "string" ? p.comm : "";
-    const base = baseName(comm);
+    const base = exeName(comm);
+    const lower = base.toLowerCase();
+    const isExe = /\.exe$/i.test(comm);
     let bucket = null;
-    if (base === "herdr-core") {
+    if (lower === "herdr-core") {
       bucket = core;
-    } else if (comm.includes("/Herdr.app/") || base === "Herdr" || base === "herdr-app") {
+    } else if (comm.includes("/Herdr.app/") || base === "Herdr" || lower === "herdr-app" || (isExe && lower === "herdr")) {
       bucket = app;
     }
     if (!bucket) continue;

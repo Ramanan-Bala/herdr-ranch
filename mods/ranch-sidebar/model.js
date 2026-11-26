@@ -617,6 +617,87 @@ export function mergeFolderOrder(prev, liveKeys, keptKeys) {
 }
 
 /**
+ * The sidebar's own top-level folder order for a machine. Unlike
+ * mergeFolderOrder, live folders are tracked by identity, not by Herdr's
+ * space order, so nothing moves unless the user drags it.
+ *
+ * `renames` (Map old -> new) carries a live space whose key changed since the
+ * last render (e.g. `space:<id>` -> its raw folder -> its git top): the new key
+ * takes the old one's slot, or the old one is dropped when the new key already
+ * has a slot. Keys of `prev` are kept while they are live, dormant (`keptKeys`)
+ * or listed in `retain` (every kept folder of the machine, so a folder keeps
+ * its slot through a reopen); anything else is dropped. New live keys are
+ * appended in `liveKeys` order, then new kept keys. Never mutates inputs.
+ *
+ * @param {Array<string>|null|undefined} prev
+ * @param {Array<string>|null|undefined} liveKeys
+ * @param {Array<string>|null|undefined} keptKeys
+ * @param {{renames?: Map<string,string>|null, retain?: Iterable<string>|null}} [opts]
+ * @returns {Array<string>}
+ */
+export function stableFolderOrder(prev, liveKeys, keptKeys, { renames = null, retain = null } = {}) {
+  const present = new Set([...(liveKeys ?? []), ...(keptKeys ?? [])]);
+  const keep = new Set([...present, ...(retain ?? [])]);
+  const out = [];
+  const seen = new Set();
+  const push = (k) => {
+    if (seen.has(k) || !keep.has(k)) return;
+    seen.add(k);
+    out.push(k);
+  };
+  const prevSet = new Set(prev ?? []);
+  for (const k of prev ?? []) {
+    const to = renames?.get(k);
+    // A renamed key moves to its new name, unless the old key is still in
+    // use this render or the new key already has its own slot.
+    if (to && to !== k && !present.has(k) && !prevSet.has(to)) {
+      keep.add(to);
+      push(to);
+      continue;
+    }
+    push(k);
+  }
+  for (const k of liveKeys ?? []) if (present.has(k)) push(k);
+  for (const k of keptKeys ?? []) if (present.has(k)) push(k);
+  return out;
+}
+
+/**
+ * Moves `dragKey` before or after `targetKey` in `order` (a drop in the
+ * sidebar). Returns a new array, or null when either key is missing or they
+ * are the same.
+ *
+ * @param {Array<string>} order
+ * @param {string} dragKey
+ * @param {string} targetKey
+ * @param {"before"|"after"} place
+ * @returns {Array<string>|null}
+ */
+export function moveKey(order, dragKey, targetKey, place) {
+  const list = order ?? [];
+  if (dragKey === targetKey || !list.includes(dragKey) || !list.includes(targetKey)) return null;
+  const rest = list.filter((k) => k !== dragKey);
+  const at = rest.indexOf(targetKey) + (place === "after" ? 1 : 0);
+  rest.splice(at, 0, dragKey);
+  return rest;
+}
+
+/**
+ * Normalizes the persisted folder-name overrides ({key: name}): non-empty
+ * trimmed strings only. Never throws on junk storage.
+ * @param {unknown} parsed
+ * @returns {Record<string, string>}
+ */
+export function normalizeFolderNames(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (typeof v === "string" && v.trim()) out[k] = v.trim();
+  }
+  return out;
+}
+
+/**
  * The 1-based index in Herdr's space list for a reopened dormant folder, so it
  * returns to its remembered slot in `order` instead of staying at the end.
  * Counts how many entries in `liveKeys` (the machine's live spaces in Herdr
