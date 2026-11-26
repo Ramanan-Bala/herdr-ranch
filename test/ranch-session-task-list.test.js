@@ -25,6 +25,7 @@ export const theme = () => new Proxy({}, { get: () => "#fff" });
 export const run = () => {};
 export const shared = () => undefined;
 export const setShared = () => {};
+export const layout = () => null;
 export const window = () => ({ platform: "macos" });
 `;
 

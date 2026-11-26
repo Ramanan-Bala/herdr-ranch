@@ -5,7 +5,7 @@
 // branch picker (props().branches), each as a separate copy.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, watchFolder, theme, settings, home, run, props, openOverlay, closeOverlay, shared, setShared } from "herdr";
+import { spaces, panes, focused, exec, watchFolder, theme, settings, home, run, props, openOverlay, closeOverlay, shared, setShared, layout } from "herdr";
 import {
   headerLabel, requestGate, STATUS_ARGS, parseStatusV2, parseBranches, STASH_FORMAT,
   parseStashList, commitPlan, branchNameError, fileActions, actionArgs,
@@ -15,6 +15,7 @@ import { openMenu, renderMenu, runAction, menuKey, normalizeItems } from "./lib/
 import { EdgeGrip } from "./lib/edge-grip.js";
 import { VIEWER_KEY, stableLocation, viewerRequest } from "./lib/file-viewer.js";
 import { diffRows, diffWidth, hunkLines } from "./lib/diff.js";
+import { blockShown, PanelVisibility } from "./lib/panels.js";
 import { loadHistory, renderHistory, restoreHistory } from "./history.js";
 import { renderStashes, pickStash } from "./stashes.js";
 
@@ -56,6 +57,8 @@ export default class Changes extends View {
       return;
     }
 
+    // No repo yet: the panel can be drawn (hidden) before its first read.
+    this.root = null; this.on = null; this.context = null;
     this.staged = []; this.unstaged = []; this.conflicts = []; this.remotes = []; this.stashes = [];
     this.branch = { head: null, detached: false, upstream: null, ahead: 0, behind: 0 };
     this.history = []; this.histOpen = null; this.historyFiles = []; this.histFile = null; this.historyLoading = false;
@@ -88,8 +91,17 @@ export default class Changes extends View {
       select: shared("ranch.changes.select")?.nonce ?? null,
     };
 
-    this.refresh(cx);
-    cx.timer.every(10000, (cx) => this.refresh(cx));
+    // Closed (or another panel on top): no git reads; the first render after
+    // it is shown again catches up at once (lib/panels.js).
+    this.vis = new PanelVisibility(() => blockShown(layout(), { id: "changes", mod: "ranch-changes" }));
+    this.refreshIfShown(cx);
+    cx.timer.every(10000, (cx) => this.refreshIfShown(cx));
+  }
+
+  /** refresh() while the panel is on screen; otherwise remember it for the next show. */
+  refreshIfShown(cx) {
+    if (this.vis.check()) this.refresh(cx);
+    else this.vis.skip();
   }
 
   brief(text) {
@@ -214,7 +226,7 @@ export default class Changes extends View {
       try {
         while (this.watched === root) {
           await watchFolder(root);
-          if (this.watched === root) this.refresh(cx);
+          if (this.watched === root) this.refreshIfShown(cx);
         }
       } catch { this.watched = null; }
     });
@@ -252,16 +264,21 @@ export default class Changes extends View {
           this.selected = null; this.label = null; this.error = "Not a git repository"; return;
         }
         const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
-        const status = await git(STATUS_ARGS);
+        // Independent read-only calls, at most 4 processes at once.
+        const [status, head, stagedDiff, unstagedDiff] = await Promise.all([
+          git(STATUS_ARGS),
+          git(["rev-parse", "--verify", "HEAD"]),
+          git(["diff", "--cached", "--numstat", "-z", "--no-renames"]),
+          git(["diff", "--numstat", "-z", "--no-renames"]),
+        ]);
         if (status.code !== 0) throw new Error(status.stderr);
         const parsed = parseStatusV2(status.stdout);
-        const head = await git(["rev-parse", "--verify", "HEAD"]);
-        const stagedDiff = await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]);
-        const unstagedDiff = await git(["diff", "--numstat", "-z", "--no-renames"]);
         if (stagedDiff.code !== 0) throw new Error(stagedDiff.stderr);
         if (unstagedDiff.code !== 0) throw new Error(unstagedDiff.stderr);
-        const stashOut = await git(["stash", "list", `--format=${STASH_FORMAT}`]);
-        const remoteOut = await git(["remote"]);
+        const [stashOut, remoteOut] = await Promise.all([
+          git(["stash", "list", `--format=${STASH_FORMAT}`]),
+          git(["remote"]),
+        ]);
         if (key() !== context) return;
         const stagedStats = statsMap(parseNumstatZ(stagedDiff.stdout));
         const unstagedStats = statsMap(parseNumstatZ(unstagedDiff.stdout));
@@ -564,7 +581,10 @@ export default class Changes extends View {
   }
 
   renderBody(cx) {
-    if (key() !== this.context) this.refresh(cx);
+    // Reads wait while hidden (a hidden copy may still be drawn); once shown,
+    // a skipped read or a new location refreshes now.
+    if (!this.vis.check()) { if (key() !== this.context) this.vis.skip(); }
+    else if (this.vis.takeMissed() || key() !== this.context) this.refresh(cx);
     this.handleSignals(cx);
     const t = theme();
     return v_flex().id("changes").size_full().min_h(0).overflow_hidden().bg(t.surface).text_color(t.foreground).text_size(13).track_focus(this.handle)

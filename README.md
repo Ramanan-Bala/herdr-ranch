@@ -98,7 +98,7 @@ Every mod lives in `mods/ranch-*/` and is `place: "none"`. Ranch places them onl
 
 The Herdr mods `picker`, `new-menu`, `menu`, `confirm` and `machine-add` are used as they ship.
 
-Shared code lives in [`lib/`](lib). Herdr mods can't import from outside their own folder, so `scripts/sync-lib.sh` copies `lib/*.js` into every `mods/ranch-*/lib/`. **Edit `lib/`, never the copies.**
+Shared code lives in [`lib/`](lib). Herdr mods can't import from outside their own folder, so `scripts/sync-lib.sh` copies into each `mods/ranch-*/lib/` only the `lib/*.js` files that mod imports (and what those import), and deletes copies it no longer needs. **Edit `lib/`, never the copies.**
 
 ## Keyboard shortcuts
 
@@ -131,7 +131,7 @@ git clone https://github.com/Ramanan-Bala/herdr-ranch.git
 cd herdr-ranch
 HERDR=${HERDR_APP_HOME:-$HOME/.config/herdr-app}
 
-sh scripts/sync-lib.sh                       # copy lib/ into each mod
+sh scripts/sync-lib.sh                       # copy the lib/ files each mod uses (needs node)
 cp layouts/ranch.json layouts/ranch.svg "$HERDR/layouts/"
 cp -R mods/ranch-* "$HERDR/mods/"
 # merge the "layout:ranch" block from keys.json into $HERDR/keys.json

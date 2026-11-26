@@ -20,6 +20,7 @@ import {
   knownAgents,
 } from "herdr";
 import { SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
+import { KNOWN_KEY, KNOWN_ON_LAUNCH_MS, refreshKnownAgents } from "./lib/known-agents.js";
 import { branchFromPrompt, worktreePath, launchOrder, launchDecision } from "./lib/launch.js";
 import { homeCache } from "./lib/home.js";
 
@@ -59,20 +60,21 @@ export default class RanchLaunch extends View {
     cx.timer.after(600, () => this.input.focus());
     this.handle = cx.focus_handle();
 
-    // Agents to offer. The top bar caches its knownAgents() answer under
-    // "ranch.knownAgents"; empty here means ask once ourselves.
-    this.known = shared("ranch.knownAgents") ?? null;
-    if (!this.known?.length) {
-      cx.spawn(async (cx) => {
-        try {
-          this.known = await knownAgents();
-          setShared("ranch.knownAgents", this.known);
-        } catch {
-          // A failed check isn't cached; the dialog still works without chips.
-        }
-        cx.notify();
-      });
-    }
+    // Agents to offer: the shared knownAgents() answer (lib/known-agents.js).
+    // None yet means ask now; an answer older than 5 min is re-checked in the
+    // background so a just-installed agent shows up.
+    this.known = shared(KNOWN_KEY) ?? null;
+    cx.spawn(async (cx) => {
+      try {
+        const list = await refreshKnownAgents({
+          knownAgents, shared, setShared, maxAge: this.known?.length ? KNOWN_ON_LAUNCH_MS : 0,
+        });
+        if (list) this.known = list;
+      } catch {
+        // A failed check isn't cached; the dialog still works without chips.
+      }
+      cx.notify();
+    });
     // Default selection: the agent used last time, if it is still offered.
     this.picked = localStorage.getItem("lastAgent");
 
@@ -137,7 +139,7 @@ export default class RanchLaunch extends View {
 
   /** The agents to offer as chips, in Ranch settings order (lib/launch.js). */
   offered() {
-    const known = shared("ranch.knownAgents") ?? this.known ?? [];
+    const known = shared(KNOWN_KEY) ?? this.known ?? [];
     const byKey = new Map(known.map((a) => [a.key, a]));
     const keys = launchOrder(resolveSettings(shared(SETTINGS_KEY)).agents, known);
     return keys.map((k) => byKey.get(k)).filter(Boolean);

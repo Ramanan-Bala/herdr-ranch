@@ -23,11 +23,14 @@ import {
 } from "./lib/git.js";
 import { createWatchLoops } from "./lib/watch.js";
 import { EdgeGrip } from "./lib/edge-grip.js";
-import { Marquee, MARQUEE } from "./lib/marquee.js";
+import { Marquee } from "./lib/marquee.js";
 import { homeCache } from "./lib/home.js";
 import { SETTINGS_KEY, FILTER_KEY, resolveSettings } from "./lib/settings.js";
 import { PRS_FILE, parsePrRegistry, prsFor, registryPrBelongs, repoOfWebBase, samePr } from "./lib/prs.js";
 import { progress } from "./lib/tasks.js";
+import {
+  GIT_SHARE_KEY, PR_SHARE_KEY, withGitSummary, sharedGitSummary, withPr, sharedPr, prBranchKey, prUrlKey,
+} from "./lib/share.js";
 import { TabNamer, ACTIVITY_KEY } from "./namer.js";
 
 const ICON = (name) => `mods/ranch-sidebar/${name}.svg`;
@@ -119,9 +122,11 @@ export default class RanchSidebar extends View {
     this.repoWatch = createWatchLoops({
       watch: (top) => watchFolder(top),
       onChange: async (top) => {
+        const changedAt = Date.now();
         // Debounce: agents write many files in a burst; refresh once it settles.
         await cx.sleep(1000);
-        await this.refreshRepo(null, top, cx);
+        // A summary the Session panel shared counts only if read after the change.
+        await this.refreshRepo(null, top, cx, changedAt);
       },
       sleep: (ms) => cx.sleep(ms),
     });
@@ -167,10 +172,6 @@ export default class RanchSidebar extends View {
     this.namer.start(cx);
 
     cx.timer.every(500, (cx) => this.drain(cx));
-    // Hover marquee for session names too long for their row (lib/marquee.js).
-    cx.timer.every(MARQUEE.tickMs, (cx) => {
-      if (this.marquee.tick()) cx.notify();
-    });
     cx.timer.every(5_000, (cx) => this.sweep(cx));
     cx.timer.every(60_000, (cx) => cx.notify()); // keep "time in status" fresh
     cx.spawn(async (cx) => {
@@ -438,20 +439,37 @@ export default class RanchSidebar extends View {
     }
   }
 
-  async refreshRepo(machine, cwd, cx) {
+  /**
+   * One repo summary for `cwd`. A summary the Session panel (or another copy)
+   * shared counts when its read started within half the refresh interval and
+   * after `changedAt` (lib/share.js); otherwise git runs and the result is shared.
+   */
+  async refreshRepo(machine, cwd, cx, changedAt = 0) {
     const busyKey = `${machine ?? ""}|${cwd}`;
     if (this.busy.has(busyKey)) return;
     this.busy.add(busyKey);
     try {
-      const summary = await repoSummary(this.gitCmd(machine, cwd), {
-        meta: this.gitMeta, metaKey: machine ?? "", now: Date.now(),
-      });
+      const startedAt = Date.now();
+      const everyMs = machine ? Math.max(5_000, resolveSettings(shared(SETTINGS_KEY)).refresh.remoteGitSec * 1000) : 30_000;
+      const hit = sharedGitSummary(shared(GIT_SHARE_KEY), machine, cwd, Math.max(startedAt - everyMs / 2, changedAt));
+      let summary;
+      let at = Date.now();
+      if (hit) {
+        summary = hit.summary;
+        at = hit.at; // due again by the data's age, not by this copy's
+      } else {
+        summary = await repoSummary(this.gitCmd(machine, cwd), {
+          meta: this.gitMeta, metaKey: machine ?? "", now: startedAt,
+        });
+        at = Date.now();
+        if (summary) setShared(GIT_SHARE_KEY, withGitSummary(shared(GIT_SHARE_KEY), machine, cwd, summary, startedAt, at));
+      }
       // One entry shape for both outcomes: null top = no repository found
       // (timeout, unreachable machine or plain not-a-repo); trusted only
       // inside the TOP_OF_RETRY_MS window (model.js topOfFresh).
       this.topOf.set(`${machine ?? ""}|${cwd}`, { top: summary?.top ?? null, at: Date.now() });
       if (summary) {
-        this.repos.set(`${machine ?? ""}|${summary.top}`, { summary, at: Date.now() });
+        this.repos.set(`${machine ?? ""}|${summary.top}`, { summary, at });
         if (!machine) this.repoWatch.add(summary.top);
       }
     } finally {
@@ -542,6 +560,7 @@ export default class RanchSidebar extends View {
 
   async fetchPr(job, cx) {
     try {
+      const startedAt = Date.now();
       const r = await runGh(
         (bin, args) => exec(bin, args, { cwd: job.cwd, on: job.machine, timeout: 15_000 }),
         ["pr", "view", job.ref ?? job.branch, "--json", PR_JSON_FIELDS],
@@ -555,11 +574,22 @@ export default class RanchSidebar extends View {
         try { pr = parsePr(JSON.parse(r.stdout ?? "")); } catch { pr = null; }
       }
       if (health) this.reportHealth(health);
+      // Share definite answers only (a PR, or "no pull request"): a failure
+      // must not read as "no PR" in the Session panel (lib/share.js).
+      const definite = r.code === 0 ? pr !== null : /no pull request/i.test(r.stderr ?? "");
+      const shareKey = this.prShareKey(job);
+      if (definite && shareKey) setShared(PR_SHARE_KEY, withPr(shared(PR_SHARE_KEY), shareKey, pr, startedAt, Date.now()));
       this.prCache.set(job.key, pr, Date.now());
     } finally {
       this.prBusy.delete(job.key);
     }
     cx.notify();
+  }
+
+  /** The lib/share.js key for a PR job: by URL (recorded) or machine|top|branch. */
+  prShareKey(job) {
+    if (job.ref) return prUrlKey(job.ref);
+    return job.top && job.branch ? prBranchKey(job.machine, job.top, job.branch) : null;
   }
 
   reportHealth(state) {
@@ -658,8 +688,18 @@ export default class RanchSidebar extends View {
     if (this.prQueue.length) {
       const jobs = this.prQueue;
       this.prQueue = [];
+      const prTtl = (this.prSec ?? 120) * 1000;
+      const now = Date.now();
       for (const job of jobs) {
         if (this.prBusy.has(job.key)) continue;
+        // The Session panel may have looked it up within half the TTL.
+        const shareKey = this.prShareKey(job);
+        const hit = shareKey ? sharedPr(shared(PR_SHARE_KEY), shareKey, now - prTtl / 2) : undefined;
+        if (hit) {
+          this.prCache.set(job.key, hit.parsed, hit.at);
+          cx.notify();
+          continue;
+        }
         // Claim the key before queueing so render does not queue it again.
         this.prBusy.add(job.key);
         ghLimit.run(() => this.fetchPr(job, cx)).catch(() => {});
@@ -1371,7 +1411,7 @@ export default class RanchSidebar extends View {
       .cursor_pointer()
       .on_hover((isIn, cx) => {
         const next = isIn ? c.tabId : null;
-        const moved = this.marquee.hover(mqKey, isIn);
+        const moved = this.marquee.hover(mqKey, isIn, cx); // scrolls a long name (lib/marquee.js)
         if (this.hovered !== next) {
           this.hovered = next;
           cx.notify();

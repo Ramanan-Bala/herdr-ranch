@@ -36,8 +36,9 @@ export const terminals = () => [];
 export const focused = () => null;
 export const theme = () => new Proxy({}, { get: () => "#fff" });
 export const run = () => {};
-export const shared = () => undefined;
-export const setShared = () => {};
+export const shared = (k) => (H.store ? H.store[k] : undefined);
+export const setShared = (k, v) => { if (H.store) H.store[k] = v; };
+export const layout = () => null;
 export const window = () => ({ platform: "macos" });
 `;
 
@@ -171,9 +172,10 @@ function setAnswers(rows) {
 let current = null;
 
 /** A fresh view bound to a machine|cwd session; exec calls defer until drained. */
-function makeView(machine, cwd, holdIf = () => false) {
+function makeView(machine, cwd, holdIf = () => false, { store = null } = {}) {
   pending = [];
   hold = holdIf;
+  globalThis.__herdr.store = store; // shared state off unless a test passes one
   const view = new RanchSession();
   const cx = {
     notify() {},
@@ -285,4 +287,80 @@ test("late A PR result after switching to B does not appear on B", async () => {
   await p;
   assert.equal(view.prReady(current), false); // B uncached
   assert.equal(view.ctx.prs.get(`${ctxKey(null, "/a")}|f1`).parsed.number, 7);
+});
+
+// ---- shared git / PR results (lib/share.js) --------------------------------
+
+/** Records every exec call while still answering from the canned table. */
+function recordCalls() {
+  const calls = [];
+  globalThis.__herdr.exec = (program, args, opts = {}) => {
+    calls.push(`${program} ${args.join(" ")}`);
+    return fakeExec(program, args, opts);
+  };
+  return { calls, stop: () => { globalThis.__herdr.exec = fakeExec; } };
+}
+
+test("a fresh shared summary leaves only the files and commits to read", async () => {
+  setAnswers(repoAnswers("/top/a", "f1"));
+  const store = {};
+  const first = makeView(null, "/a", () => false, { store });
+  await first.view.refreshGit(first.cx);
+  assert.ok(store["ranch.share.git"], "the full read was shared");
+  const rec = recordCalls();
+  try {
+    const second = makeView(null, "/a", () => false, { store });
+    await second.view.refreshGit(second.cx);
+    assert.deepEqual(rec.calls.map((c) => c.split(" ").slice(0, 2).join(" ")).sort(), ["git diff", "git log"]);
+    const e = second.view.ctx.gitEntry();
+    assert.equal(e.summary.branch, "f1");
+    assert.ok(e.details.files[0].path.startsWith("src/a.js"));
+  } finally {
+    rec.stop();
+  }
+});
+
+test("a repo change after the shared read forces a full read", async () => {
+  setAnswers(repoAnswers("/top/a", "f1"));
+  const store = {};
+  const first = makeView(null, "/a", () => false, { store });
+  await first.view.refreshGit(first.cx);
+  const rec = recordCalls();
+  try {
+    const second = makeView(null, "/a", () => false, { store });
+    second.view.ctx.markGitDirty(Date.now() + 1); // the watch saw a change after that read
+    await second.view.refreshGit(second.cx);
+    assert.ok(rec.calls.some((c) => c.startsWith("git rev-parse --show-toplevel")), "full snapshot ran");
+  } finally {
+    rec.stop();
+  }
+});
+
+test("a shared PR answer is used without calling gh; a fresh gh answer is shared", async () => {
+  setAnswers(repoAnswers("/top/a", "f1"));
+  const store = {};
+  const first = makeView(null, "/a", () => false, { store });
+  await first.view.refreshGit(first.cx);
+  await first.view.refreshPr(first.cx);
+  assert.ok(store["ranch.share.pr"]?.["|/top/a|f1"], "PR shared under machine|top|branch");
+  const rec = recordCalls();
+  try {
+    const second = makeView(null, "/a", () => false, { store });
+    await second.view.refreshGit(second.cx);
+    await second.view.refreshPr(second.cx);
+    assert.equal(rec.calls.some((c) => c.startsWith("gh ")), false);
+    assert.equal(second.view.ctx.prEntry().parsed.number, 7);
+  } finally {
+    rec.stop();
+  }
+});
+
+test("a failed gh lookup is not shared as 'no PR'", async () => {
+  const rows = repoAnswers("/top/a", "f1").filter(([k]) => !k.startsWith("gh|"));
+  setAnswers(rows);
+  const store = {};
+  const { view, cx } = makeView(null, "/a", () => false, { store });
+  await view.refreshGit(cx);
+  await view.refreshPr(cx);
+  assert.equal(store["ranch.share.pr"]?.["|/top/a|f1"], undefined);
 });

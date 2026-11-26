@@ -68,6 +68,8 @@ export class GitContexts {
     /** dirty flags for the CURRENT context (true = refresh it soon) */
     this.gitDirty = false;
     this.prDirty = false;
+    /** when the repo last changed (watch, push): a shared result must be newer */
+    this.changedAt = 0;
     /** the single push slot, bound to the context that started it */
     this.push = { id: 0, key: null, busy: false, err: null, at: 0 };
   }
@@ -156,10 +158,15 @@ export class GitContexts {
     return op.key === this.current.key;
   }
 
-  /** A repo change can move the branch, so the PR follows. */
-  markGitDirty() {
+  /**
+   * A repo change can move the branch, so the PR follows.
+   * @param {number} [now] when it changed: results shared by another mod
+   *   count only if their read started later (see changedAt)
+   */
+  markGitDirty(now = 0) {
     this.gitDirty = true;
     this.prDirty = true;
+    if (now > this.changedAt) this.changedAt = now;
   }
 
   /** The current context's branch, or null with no summary. */
@@ -263,7 +270,7 @@ export class GitContexts {
     if (this.push.id !== op.id) return false;
     const good = Boolean(result?.ok);
     this.push = { id: op.id, key: op.key, busy: false, err: good ? null : result?.err || "Push failed", at: good ? now : 0 };
-    if (op.key === this.current.key) this.markGitDirty();
+    if (op.key === this.current.key) this.markGitDirty(now);
     return true;
   }
 

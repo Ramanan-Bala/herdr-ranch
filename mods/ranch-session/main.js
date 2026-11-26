@@ -17,6 +17,7 @@ import {
   run,
   shared,
   setShared,
+  layout,
   window as appWindow,
 } from "herdr";
 import { isViewerTab } from "./lib/file-viewer.js";
@@ -28,6 +29,7 @@ import {
 } from "./lib/format.js";
 import {
   repoSnapshot,
+  repoDetails,
   links,
   parsePr,
   runGh,
@@ -36,6 +38,9 @@ import {
   PR_JSON_FIELDS,
 } from "./lib/git.js";
 import { GitContexts, ageLabel } from "./gitctx.js";
+import {
+  GIT_SHARE_KEY, PR_SHARE_KEY, withGitSummary, sharedGitSummary, withPr, sharedPr, prBranchKey, prUrlKey,
+} from "./lib/share.js";
 import { createWatchLoops } from "./lib/watch.js";
 import { TASKS_DIR, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
 import { PRS_FILE, parsePrRegistry, prsFor, registryPrBelongs, repoOfWebBase } from "./lib/prs.js";
@@ -80,6 +85,7 @@ import {
 } from "./model.js";
 import { windowsHome } from "./win.js";
 import { EdgeGrip } from "./lib/edge-grip.js";
+import { blockShown, PanelVisibility } from "./lib/panels.js";
 
 const MAX_FILES = 20;
 
@@ -144,13 +150,18 @@ export default class RanchSession extends View {
       watch: (root) => watchFolder(root),
       onChange: (root) => {
         const e = this.ctx.gitEntry();
-        if (this.ctx.current.machine == null && e?.top === root) this.ctx.markGitDirty();
+        if (this.ctx.current.machine == null && e?.top === root) this.ctx.markGitDirty(Date.now());
       },
       sleep: (ms) => cx.sleep(ms),
     });
+    // Closed (or another panel on top): task stores still load (the top bar's
+    // task count comes from here), but git, gh and adapter checks wait until
+    // the panel is shown again (lib/panels.js).
+    this.vis = new PanelVisibility(() => blockShown(layout(), { id: "session", mod: "ranch-session" }));
     cx.timer.every(1000, (cx) => this.pump(cx));
     // Keep sub-agent activity statuses (store-based) fresh on screen.
     cx.timer.every(3000, (cx) => {
+      if (!this.vis.shown) return;
       const s = this.session();
       if (s.chosen && this.subTerminals(s).some((k) => this.subAgentStatus(k) === "working")) cx.notify();
     });
@@ -438,10 +449,10 @@ export default class RanchSession extends View {
   }
 
   /**
-   * Checks (at most every 3 s per pid) whether the OpenCode processes behind
-   * the shown stores are still running; a gone one ends its session on screen.
-   * `process.kill(pid, 0)` works on Windows and POSIX; EPERM means alive.
-   * No node or a failed check leaves the store as it is.
+   * Checks (at most every 3 s per pid, 15 s while the panel is hidden) whether
+   * the OpenCode processes behind the shown stores are still running; a gone
+   * one ends its session on screen. probePid() asks `ps`, or Node's
+   * `process.kill(pid, 0)`. A failed check leaves the store as it is.
    */
   checkAgentExits(s, cx) {
     if (!s.chosen) return;
@@ -454,15 +465,15 @@ export default class RanchSession extends View {
       const key = `${pid}@${machine ?? ""}`;
       const info = this.pidAlive.get(key) ?? { alive: null, at: 0, busy: false };
       this.pidAlive.set(key, info);
-      if (info.alive === false || info.busy || Date.now() - info.at < 3000) continue;
+      // Every 3 s on screen; every 15 s while the panel is hidden (the top
+      // bar's task count still follows an ended session).
+      const every = this.vis?.shown === false ? 15000 : 3000;
+      if (info.alive === false || info.busy || Date.now() - info.at < every) continue;
       info.busy = true;
       cx.spawn(async (cx) => {
         let alive = null;
         try {
-          const r = await exec("node", ["-e",
-            "try{process.kill(Number(process.argv[1]),0)}catch(e){process.exit(e.code==='EPERM'?0:3)}",
-            String(pid)], { on: machine, timeout: 5000 });
-          alive = r.code === 0 ? true : r.code === 3 ? false : null;
+          alive = await this.probePid(pid, machine);
         } catch {}
         info.alive = alive;
         info.at = Date.now();
@@ -597,6 +608,37 @@ export default class RanchSession extends View {
     return this.adapterStatus?.get(s.machine ?? "")?.agents;
   }
 
+  /**
+   * Is process `pid` running on `machine`? true / false, or null when unknown.
+   * `ps -p` on macOS/Linux (a tiny process); Node's process.kill(pid, 0) on
+   * Windows, on a machine whose platform is unknown, or where ps can't answer.
+   */
+  async probePid(pid, machine) {
+    this.psBroken ??= new Set();
+    const mk = machine ?? "";
+    let posix = false;
+    if (!this.psBroken.has(mk)) {
+      if (machine == null) posix = !isWin();
+      else {
+        const dir = await this.homeFor(machine).catch(() => null);
+        posix = Boolean(dir) && !looksWindows(dir);
+      }
+    }
+    if (posix) {
+      try {
+        const r = await exec("ps", ["-p", String(pid), "-o", "pid="], { on: machine, timeout: 5000 });
+        const out = (r.stdout ?? "").trim();
+        if (r.code === 0 && out === String(pid)) return true;
+        if (r.code === 1 && out === "") return false;
+      } catch {}
+      this.psBroken.add(mk); // odd answer: don't guess, use Node from now on
+    }
+    const r = await exec("node", ["-e",
+      "try{process.kill(Number(process.argv[1]),0)}catch(e){process.exit(e.code==='EPERM'?0:3)}",
+      String(pid)], { on: machine, timeout: 5000 });
+    return r.code === 0 ? true : r.code === 3 ? false : null;
+  }
+
   /** Called from pump(): refreshes adapterState for the session's machine. */
   maybeCheckAdapters(machine, cx) {
     if (!this.adapterStatus) this.adapterStatus = new Map();
@@ -657,19 +699,36 @@ export default class RanchSession extends View {
     const op = this.ctx.beginGit();
     if (!op) return;
     const git = (args) => exec("git", args, { cwd: op.cwd, on: op.machine, timeout: 10000 });
+    const startedAt = Date.now();
     let result;
+    let at = null;
     try {
-      result = await repoSnapshot(git, {
-        commits: 5,
-        meta: this.gitMeta,
-        metaKey: op.machine ?? "",
-        now: Date.now(),
-      });
+      // The sidebar reads the same repo: a summary it (or this panel) shared
+      // within half the refresh interval, and after the last repo change,
+      // leaves only the files and commits to read (lib/share.js).
+      const everyMs = this.gitEveryMs({ machine: op.machine }, resolveSettings(shared(SETTINGS_KEY)));
+      const hit = sharedGitSummary(shared(GIT_SHARE_KEY), op.machine, op.cwd,
+        Math.max(startedAt - everyMs / 2, this.ctx.changedAt));
+      if (hit) {
+        const details = await repoDetails(git, hit.summary.base ?? null, { commits: 5 });
+        result = { status: "ok", summary: hit.summary, details };
+        at = hit.at; // the summary's age, for "as of" and the next refresh
+      } else {
+        result = await repoSnapshot(git, {
+          commits: 5,
+          meta: this.gitMeta,
+          metaKey: op.machine ?? "",
+          now: startedAt,
+        });
+        if (result?.status === "ok" && result.summary) {
+          setShared(GIT_SHARE_KEY, withGitSummary(shared(GIT_SHARE_KEY), op.machine, op.cwd, result.summary, startedAt, Date.now()));
+        }
+      }
     } catch {
       result = { status: "failed", summary: null, details: null };
     }
     // Filed under the context that started the read, even if the user moved on.
-    if (this.ctx.finishGit(op, result, Date.now())) this.syncGitWatch();
+    if (this.ctx.finishGit(op, result, at ?? Date.now())) this.syncGitWatch();
     cx.notify();
   }
 
@@ -685,6 +744,19 @@ export default class RanchSession extends View {
     // First stderr line, for the quiet error note (I6).
     const stderrLine = (r) => (r.stderr ?? "").split("\n").map((l) => l.trim()).find(Boolean) ?? null;
     const gh = (cmd, args) => exec(cmd, args, { cwd: op.cwd, on: op.machine, timeout: 15000 });
+    // The sidebar looks up the same branch's PR: use its answer when it is
+    // new enough for this panel's cadence and the last repo change.
+    const top = this.ctx.git.get(op.key)?.summary?.top ?? null;
+    const shareKey = top ? prBranchKey(op.machine, top, op.branch) : null;
+    const startedAt = Date.now();
+    const hit = shareKey
+      ? sharedPr(shared(PR_SHARE_KEY), shareKey,
+        Math.max(startedAt - this.prEveryMs(resolveSettings(shared(SETTINGS_KEY))) / 2, this.ctx.changedAt))
+      : undefined;
+    if (hit) {
+      if (this.ctx.finishPr(op, { parsed: hit.parsed, failed: false, error: null }, hit.at)) cx.notify();
+      return;
+    }
     let res;
     try {
       const r = await ghLimit.run(() => runGh(gh, ["pr", "view", op.branch, "--json", PR_JSON_FIELDS]), { front: true });
@@ -706,6 +778,7 @@ export default class RanchSession extends View {
     } catch {
       res = { parsed: null, failed: true, error: null };
     }
+    if (shareKey && !res.failed) setShared(PR_SHARE_KEY, withPr(shared(PR_SHARE_KEY), shareKey, res.parsed, startedAt, Date.now()));
     if (this.ctx.finishPr(op, res, Date.now())) cx.notify();
   }
 
@@ -744,8 +817,9 @@ export default class RanchSession extends View {
     }
     // loadTasks guards itself (and takes over from a stalled read).
     if (akey !== this.tasks.key) this.loadTasks(cx);
+    const shown = this.vis.check();
     // Only needed while the store is missing (to offer Set up), once a minute.
-    if (s.chosen && this.tasks.parsed && !this.tasks.parsed.ok && this.tasks.parsed.reason === "missing") {
+    if (shown && s.chosen && this.tasks.parsed && !this.tasks.parsed.ok && this.tasks.parsed.reason === "missing") {
       this.maybeCheckAdapters(s.machine, cx);
     }
     // Keep the terminal's identity info (fixes F4) fresh, and gc remote
@@ -760,6 +834,9 @@ export default class RanchSession extends View {
       this.tasksReadAt = now;
       this.loadTasks(cx);
     }
+    // Everything below only feeds what the panel draws: skip it while hidden.
+    // On show, the first tick finds git/PR due (or marked dirty by the watch).
+    if (!shown) return;
     // The context may have changed since the last pump (render can switch it
     // earlier): make the schedule below act on the session being drawn.
     if (this.ctx.select(s.machine, s.cwd)) this.syncGitWatch();
@@ -835,18 +912,26 @@ export default class RanchSession extends View {
   async lookupRecordedPr(cx, s, url) {
     this.recordedPrBusy.add(url);
     try {
-      const gh = (cmd, args) => exec(cmd, args, { cwd: s.cwd, on: s.machine, timeout: 15000 });
-      // Normal priority: the branch PR's lookup queues ahead of this (front).
-      const r = await ghLimit.run(() => runGh(gh, ["pr", "view", url, "--json", PR_JSON_FIELDS]));
-      let parsed = null;
-      if (r.code === 0) {
-        try {
-          parsed = parsePr(JSON.parse(r.stdout));
-        } catch {
-          parsed = null;
+      // Another mod (the sidebar) may have looked this URL up just now.
+      const hit = sharedPr(shared(PR_SHARE_KEY), prUrlKey(url), Date.now() - this.recordedPrTtl / 2);
+      if (hit) {
+        this.recordedPrCache.set(url, hit.parsed, hit.at);
+      } else {
+        const startedAt = Date.now();
+        const gh = (cmd, args) => exec(cmd, args, { cwd: s.cwd, on: s.machine, timeout: 15000 });
+        // Normal priority: the branch PR's lookup queues ahead of this (front).
+        const r = await ghLimit.run(() => runGh(gh, ["pr", "view", url, "--json", PR_JSON_FIELDS]));
+        let parsed = null;
+        if (r.code === 0) {
+          try {
+            parsed = parsePr(JSON.parse(r.stdout));
+            setShared(PR_SHARE_KEY, withPr(shared(PR_SHARE_KEY), prUrlKey(url), parsed, startedAt, Date.now()));
+          } catch {
+            parsed = null;
+          }
         }
+        this.recordedPrCache.set(url, parsed, Date.now());
       }
-      this.recordedPrCache.set(url, parsed, Date.now());
     } catch {
       this.recordedPrCache.set(url, null, Date.now()); // retried after the TTL
     }

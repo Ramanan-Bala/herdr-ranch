@@ -3,7 +3,7 @@
 // logic in ./lib/naming.js. Names flow ONE WAY (agent -> tab): this file never
 // sends anything to an agent or terminal (no `hc send`, no `hc keys`).
 import {
-  spaces, agents, panes, terminals, shared, setShared, run, exec, readTextFile, home,
+  spaces, agents, panes, terminals, shared, setShared, run, exec, readTextFile, home, watchFolder,
 } from "herdr";
 import {
   decide, exitAction, rememberSession, recallSession, ownership, cleanTitle, sessionChanged, withRecordSession, SOURCE_RANK,
@@ -16,7 +16,14 @@ import { folderLabel, subagentsWorking } from "./lib/format.js";
 import { homeCache } from "./lib/home.js";
 import { agentShort, collectInputs, buildModelPrompt, pickNamingAgent } from "./namer-model.js";
 
+/** Store re-read cadence without a working folder watch (every tick). */
 const STORE_TTL = 2000;
+/** This computer, with the tasks folder watched: a store is re-read when the
+ * watch fires, and at least this often in case an event was missed. */
+const LOCAL_WATCHED_TTL = 30000;
+/** Another machine (each read can be a remote call): the Session panel's
+ * remote task cadence. */
+const REMOTE_STORE_TTL = 5000;
 /** How long a pass may run before the next tick replaces it. A Herdr read
  * that never settles (seen across a mod reload) once froze naming and the
  * sidebar's activity for good, because every later tick saw `running`. */
@@ -34,7 +41,11 @@ function paneAgent(panesAll, tabId) {
 
 export class TabNamer {
   constructor() {
-    this.stores = new Map(); // agent address -> { store, at }
+    this.stores = new Map(); // agent address -> { store, at, gen }
+    // Local tasks folder watch: every change bumps localGen, which invalidates
+    // the cached local stores; localWatched is false while the watch fails.
+    this.localGen = 0;
+    this.localWatched = false;
     // Remote home lookup via lib/home.js (sh, then cmd.exe; failures back
     // off and retry). Local machines answer straight from herdr's home().
     this.homeFor = homeCache(exec, home);
@@ -52,8 +63,39 @@ export class TabNamer {
 
   /** Called once from the sidebar View's init(props, cx). */
   start(cx) {
+    this.watchLocalTasks(cx);
     cx.timer.every(2000, (cx) => this.tick(cx));
     this.tick(cx);
+  }
+
+  /** Watches ~/.herdr/ranch/tasks (it may not exist yet: retried every 3 s). */
+  watchLocalTasks(cx) {
+    if (this.watching) return;
+    this.watching = true;
+    const dir = `${home()}/${TASKS_DIR}`;
+    cx.spawn(async (cx) => {
+      for (;;) {
+        this.localWatched = true;
+        try {
+          await watchFolder(dir);
+        } catch {
+          this.localWatched = false;
+          this.localGen++;
+          await cx.sleep(3000);
+          continue;
+        }
+        this.localGen++;
+      }
+    });
+  }
+
+  /** Can a cached store still be used for `machine` (null: this computer)? */
+  storeFresh(cached, machine, now = Date.now()) {
+    const age = now - cached.at;
+    if (machine != null) return age < REMOTE_STORE_TTL;
+    // Watched: valid until the folder changes (gen moves on), up to 30 s.
+    if (this.localWatched) return cached.gen === this.localGen && age < LOCAL_WATCHED_TTL;
+    return age < STORE_TTL;
   }
 
   /** One cheap, idempotent pass over all tabs; async work happens in a spawn. */
@@ -322,7 +364,9 @@ export class TabNamer {
     const [terminal, legacy] = storeCandidates(local);
     if (!terminal) return null;
     const cached = this.stores.get(address);
-    if (cached && Date.now() - cached.at < STORE_TTL) return cached.store;
+    if (cached && this.storeFresh(cached, machine)) return cached.store;
+    // A change while the read runs leaves gen behind: the next tick re-reads.
+    const gen = this.localGen;
     let store = null;
     try {
       const dir = await this.homeFor(machine);
@@ -339,7 +383,7 @@ export class TabNamer {
     } catch (err) {
       this.logOnce(err);
     }
-    this.stores.set(address, { store, at: Date.now() });
+    this.stores.set(address, { store, at: Date.now(), gen });
     return store;
   }
 

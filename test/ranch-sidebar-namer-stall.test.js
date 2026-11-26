@@ -32,6 +32,7 @@ export const run = () => {};
 export const exec = () => Promise.resolve({ code: 1, stdout: "", stderr: "" });
 export const readTextFile = () => { H.reads++; return H.hang ? new Promise(() => {}) : Promise.resolve(null); };
 export const home = () => "/home/u";
+export const watchFolder = (...a) => (globalThis.__namerWatch ? globalThis.__namerWatch(...a) : new Promise(() => {}));
 `;
 const data = (s) => `data:text/javascript,${encodeURIComponent(s)}`;
 registerHooks({
@@ -68,4 +69,41 @@ test("a stalled pass is replaced after PASS_STALL_MS, not waited on forever", as
   } finally {
     Date.now = realNow;
   }
+});
+
+test("store cache: local stores live until the tasks-folder watch fires; remote ones 5 s", () => {
+  const namer = new TabNamer();
+  const at = 1_000_000;
+  // No watch (yet, or it failed): re-read every tick (2 s).
+  assert.equal(namer.storeFresh({ at, gen: 0 }, null, at + 1999), true);
+  assert.equal(namer.storeFresh({ at, gen: 0 }, null, at + 2001), false);
+  // Watched and unchanged: kept for up to 30 s.
+  namer.localWatched = true;
+  assert.equal(namer.storeFresh({ at, gen: 0 }, null, at + 20_000), true);
+  assert.equal(namer.storeFresh({ at, gen: 0 }, null, at + 30_001), false);
+  // A change bumps the generation: the cached store is stale at once.
+  namer.localGen = 1;
+  assert.equal(namer.storeFresh({ at, gen: 0 }, null, at + 1), false);
+  // Another machine: 5 s, whatever the local watch says.
+  assert.equal(namer.storeFresh({ at, gen: 1 }, "box", at + 4_999), true);
+  assert.equal(namer.storeFresh({ at, gen: 1 }, "box", at + 5_001), false);
+});
+
+test("watchLocalTasks bumps the generation on every change and marks a failed watch", async () => {
+  const namer = new TabNamer();
+  const events = [];
+  let fire;
+  globalThis.__namerWatch = () => new Promise((resolve, reject) => { fire = { resolve, reject }; });
+  const cxw = { spawn: (fn) => { fn({ sleep: () => new Promise(() => {}) }); } };
+  namer.watchLocalTasks(cxw);
+  await flush();
+  assert.equal(namer.localWatched, true);
+  fire.resolve([]);
+  await flush();
+  events.push(namer.localGen);
+  fire.reject(new Error("gone"));
+  await flush();
+  assert.equal(namer.localWatched, false);
+  assert.equal(events[0], 1);
+  assert.equal(namer.localGen, 2);
 });
