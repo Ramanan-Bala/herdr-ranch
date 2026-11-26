@@ -1307,9 +1307,8 @@ export default class RanchSidebar extends View {
       : pr.state === "draft" ? t.dim
       : pr.state === "merged" ? t.ansi5
       : t.blocked;
-    const stateWord = { open: "Open", draft: "Draft", merged: "Merged", closed: "Closed" }[pr.state] ?? "";
     return div().id(id).flex_none().text_size(10).font_medium().text_color(color)
-      .cursor_pointer().tooltip([stateWord, pr.title ?? `Pull request #${pr.number}`].filter(Boolean).join(" · "))
+      .cursor_pointer()
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
@@ -1590,7 +1589,7 @@ export default class RanchSidebar extends View {
     const id = keptKey(e.machine, e.folder);
     const { tint, fill } = this.spaceTint({ space: id, color: e.color });
     return h_flex().id(`rail-kept-${id}`).w_full().h(44).flex_none()
-      .items_center().justify_center().cursor_pointer().tooltip(`${this.folderName(id, e.name)}\nNo sessions`)
+      .items_center().justify_center().cursor_pointer()
       .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
       .on_click(() => this.reopenDormant(e))
       .child(div().id(`rail-kept-tile-${id}`).size(34).flex_none().rounded(9)

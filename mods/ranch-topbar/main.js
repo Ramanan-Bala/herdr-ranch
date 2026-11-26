@@ -6,7 +6,7 @@ import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import {
   spaces, panes, agents, run, openOverlay, theme, window, shared, layout,
-  settings, knownAgents, nextCommand, setShared, home,
+  settings, knownAgents, nextCommand, setShared,
 } from "herdr";
 import { AUTONAMES_KEY, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
 import { ownership } from "./lib/naming.js";
@@ -230,7 +230,6 @@ export default class RanchTopbar extends View {
         .bg(t.raised).border(1).border_color(t.border).text_size(11.5).text_color(t.muted)
         .hover(s => s.bg(t.hover))
         .on_mouse_down("left", stop).on_click(() => this.attentionNext())
-        .tooltip(`Next: ${entrySpace?.name ?? "?"} / ${name} ${keySuffix("J")}`)
         .child(blockedCount
           ? div().id("attention-dot").size(6).rounded_full().bg(t.blocked).flex_none().loop("opacity", { from: 0.35, to: 1, period: 1200 })
           : div().id("attention-dot").size(6).rounded_full().bg(t.done).flex_none())
@@ -314,9 +313,9 @@ export default class RanchTopbar extends View {
         .child(this.marquee.render(mqKey, name, el => el.max_w(320).min_w(0),
           el => el.text_color(viewing ? t.muted : t.foreground).when(!viewing, e => e.font_semibold())))
         .when(show.marker && tab.named && ownership(tab, auto) === "auto", el => el.child(div().id(`auto-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
-          .tooltip(`Named by the agent's session (source: ${auto?.source ?? "agent"})`).child("auto")))
+          .child("auto")))
         .when(show.marker && tab.named && ownership(tab, auto) === "locked", el => el.child(div().id(`lock-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
-          .tooltip("You named this tab. Reset name in the tab menu to let the agent name it.").child("✎")))
+          .child("✎")))
         .child(tabClose(`close-${tab.id}`, close));
     })();
 
@@ -330,7 +329,6 @@ export default class RanchTopbar extends View {
         .on_mouse_down("left", stop)
         .on_mouse_down("middle", (_e, cx) => { cx.stop_propagation(); run("tab.close", { id: viewer.id }); })
         .on_click(() => run("tab.select", { id: viewer.id }))
-        .tooltip(want?.abs ? `${want.diff ? "Changes in " : ""}${want.abs.replace(home(), "~")}` : name)
         .child(svg(iconPath(icon.icon)).size(14).flex_none().text_color(t[icon.color] ?? t.muted))
         .child(div().max_w(220).truncate().text_color(viewing ? t.foreground : t.muted).when(viewing, el => el.font_semibold()).child(name))
         .child(tabClose("file-tab-close", (_e, cx) => { cx.stop_propagation(); run("tab.close", { id: viewer.id }); }));
