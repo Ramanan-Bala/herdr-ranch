@@ -3,7 +3,7 @@
 // compact rail for narrow sidebars.
 
 import { View, div, svg, image } from "gpui-kit";
-import { HoverCard, v_flex, h_flex } from "gpui-base";
+import { HoverCard, v_flex, h_flex, InputState, Input } from "gpui-base";
 import {
   spaces, machines, agents, panes, setAgentOrder, exec, watchFolder, run,
   openOverlay, theme, shared, setShared, nextCommand, window, home, readTextFile,
@@ -13,7 +13,7 @@ import {
   normalizeCollapsed, topOfFresh, cardRows, moveIndex, worktreeName,
   keptKey, spaceCwd, spaceGitState, liveSpaceFolder, normalizeKept, refreshKept, forgetKept,
   dormantFolders, applyKeptFolders, mainCheckoutOf, dormantWorktrees, dormantPrimary, touchesWorktrees,
-  mergeFolderOrder, reopenIndex,
+  reopenIndex, stableFolderOrder, moveKey, normalizeFolderNames,
 } from "./model.js";
 import { isViewerTab } from "./lib/file-viewer.js";
 import { parseWorktrees } from "./lib/newspace.js";
@@ -35,6 +35,9 @@ const COLLAPSE_KEY = "collapsed";
 // closes the space itself; this list is Ranch's own memory of it (model.js).
 const KEPT_KEY = "keptFolders";
 const FOLDER_ORDER_KEY = "ranch.sidebar.folderOrder";
+// Names the user gave folders in the sidebar ({folder key: name}); they win over
+// Herdr's space name and survive the folder going session-less.
+const FOLDER_NAMES_KEY = "ranch.sidebar.folderNames";
 // The sidebar's share of the 4-gh budget (requirements §Performance: sidebar 3
 // + session 1); module-level so every copy of this view in the mod shares one
 // limit.
@@ -63,10 +66,11 @@ export default class RanchSidebar extends View {
     this.hoveredSpace = null; // pointer-hovered space id (drives plus/sparkle)
     this.order = []; // visible card tab ids, display order
     this.cardById = new Map();
-    // Drag to reorder: { kind: "space"|"card", id, machine|spaceId, startY,
+    // Drag to reorder: { kind: "folder"|"card", id, machineKey|spaceId, startY,
     // active, over, place } — active after the pointer moved >4px, over/place
-    // name the hovered target row and which side of it. Order itself lives
-    // in Herdr (space.move / tab.move); nothing is saved locally.
+    // name the hovered target row and which side of it. Folder order is the
+    // sidebar's own (this.folderOrder, live and session-less folders alike);
+    // card order lives in Herdr (tab.move).
     this.drag = null;
     this.dragJustEnded = 0; // swallow the click GPUI fires on drag mouse-up
     // Right-edge drag strip with a hover cue (lib/edge-grip.js).
@@ -87,6 +91,10 @@ export default class RanchSidebar extends View {
     // Remembered top-level folder order per machine ("" for local -> array of
     // keptKey strings), so kept folders stay in their slot after closing.
     this.folderOrder = this.loadFolderOrder();
+    // User-given folder names ({folder key: name}) and the inline rename in
+    // progress: {key, state: InputState, spaceId|null, skipFold}.
+    this.folderNames = this.loadFolderNames();
+    this.renaming = null;
     // Last good folder per space id. Herdr's SpaceInfo.folder is where the space
     // was made, not where it is, and it is all a render sees once the last
     // terminal ended; remembering the space's own folder keeps its identity
@@ -95,6 +103,8 @@ export default class RanchSidebar extends View {
     // Space id -> top-level item key from the last render, so reopenDormant
     // can map Herdr's live spaces to their folder-order keys.
     this.spaceKeyById = new Map();
+    // Top-level folder key -> its live space id (null-free), for drag sync.
+    this.folderSpaceIds = new Map();
 
     // Git: repos `${machine}|${top}` -> {summary, at}; topOf `${machine}|${cwd}`
     // -> { top: string|null, at } (top null = no repository found at `at`).
@@ -210,6 +220,113 @@ export default class RanchSidebar extends View {
     } catch {}
   }
 
+  loadFolderNames() {
+    try {
+      return normalizeFolderNames(JSON.parse(localStorage.getItem(FOLDER_NAMES_KEY) ?? "{}"));
+    } catch {
+      return {};
+    }
+  }
+
+  saveFolderNames() {
+    try {
+      localStorage.setItem(FOLDER_NAMES_KEY, JSON.stringify(this.folderNames));
+    } catch {}
+  }
+
+  /** The name a folder row shows: the user's sidebar name, else `fallback`. */
+  folderName(key, fallback) {
+    return (key && this.folderNames[key]) || fallback;
+  }
+
+  // ---- rename ----
+
+  /** Start renaming a folder row in place (double-click or the pencil). */
+  startRename(key, current, spaceId, cx) {
+    if (this.renaming?.key === key) return;
+    const state = InputState.new({ value: current ?? "", placeholder: "Folder name" });
+    const renaming = { key, state, spaceId: spaceId ?? null, skipFold: false };
+    state.on("submit", (_e, cx) => this.commitRename(cx));
+    state.on("blur", (_e, cx) => {
+      if (this.renaming === renaming) this.commitRename(cx);
+    });
+    this.renaming = renaming;
+    try {
+      state.focus();
+    } catch {}
+    cx?.notify();
+  }
+
+  /** Save the typed name: an empty one clears the sidebar name. A live space
+   * is renamed in Herdr too (best effort; the sidebar name stands either way). */
+  commitRename(cx) {
+    const r = this.renaming;
+    if (!r) return;
+    this.renaming = null;
+    let name = "";
+    try {
+      name = String(r.state.value() ?? "").trim();
+    } catch {}
+    const next = { ...this.folderNames };
+    if (name) next[r.key] = name;
+    else delete next[r.key];
+    this.folderNames = next;
+    this.saveFolderNames();
+    if (r.spaceId) {
+      try {
+        run("space.rename", { id: r.spaceId, name });
+      } catch {}
+    }
+    try {
+      this.handle.focus();
+    } catch {}
+    cx?.notify();
+  }
+
+  cancelRename(cx) {
+    if (!this.renaming) return;
+    this.renaming = null;
+    try {
+      this.handle.focus();
+    } catch {}
+    cx?.notify();
+  }
+
+  /** The inline name editor that replaces a folder row's title while renaming. */
+  renameInput(key) {
+    const t = theme();
+    return div().id(`rename-${key}`).flex_1().min_w(0)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => cx.stop_propagation())
+      .child(Input.new(this.renaming.state).w_full().h(22).px(6).rounded(5).border_1()
+        .border_color(t.accent).bg(t.background).text_size(13).text_color(t.foreground));
+  }
+
+  /** Double-click on a folder row: the first click already toggled the fold,
+   * so the click that follows the rename start undoes it (see foldClick). */
+  folderMouseDown(e, key, name, spaceId, cx) {
+    if (e.click_count === 2) {
+      this.startRename(key, name, spaceId, cx);
+      if (this.renaming?.key === key) this.renaming.skipFold = true;
+      return true;
+    }
+    return false;
+  }
+
+  /** A folder row's click: folds it, unless a drag just ended or it is the
+   * second click of the double-click that started a rename. */
+  foldClick(key, foldKey, cx) {
+    if (this.clickSuppressed()) return;
+    if (this.renaming?.key === key) {
+      if (this.renaming.skipFold) {
+        this.renaming.skipFold = false;
+        this.toggleFold("s", foldKey, cx); // undo the first click's fold
+      }
+      return;
+    }
+    this.toggleFold("s", foldKey, cx);
+  }
+
   /** Folders of this render's live spaces, for refreshKept/dormantFolders: git
    * top when the space's checkout is known, else its own folder. `git` is
    * model.js spaceGitState, so a space whose git lookup is still unresolved is
@@ -258,7 +375,9 @@ export default class RanchSidebar extends View {
     const beforeIds = new Set(before.map((s) => s.id));
     const liveKeys = before.map((s) => this.spaceKeyById.get(s.id) ?? null);
     const args = { folder: e.folder, machine: e.machine ?? "", focus: true };
-    if (e.named && e.name) args.name = e.name;
+    const custom = this.folderNames[keptKey(machine, e.folder)];
+    if (custom) args.name = custom;
+    else if (e.named && e.name) args.name = e.name;
     run("space.new", args);
     const after = spaces().filter((s) => (s.machine ?? null) === machine);
     const newPos = after.findIndex((s) => !beforeIds.has(s.id));
@@ -545,6 +664,11 @@ export default class RanchSidebar extends View {
   // ---- keyboard ----
 
   onKey(e, cx) {
+    // Keys typed into the inline rename belong to it; escape cancels it.
+    if (this.renaming) {
+      if (e.key === "escape") this.cancelRename(cx);
+      return;
+    }
     if (e.key === "escape" && this.drag) {
       this.drag = null; // cancel without moving anything
       cx.notify();
@@ -656,6 +780,7 @@ export default class RanchSidebar extends View {
     if (d.over !== rowId || d.place !== place) {
       d.over = rowId;
       d.place = place;
+      if (d.kind === "folder") d.overSpaceId = this.folderSpaceIds.get(rowId) ?? null;
       cx.notify();
     }
   }
@@ -669,18 +794,31 @@ export default class RanchSidebar extends View {
     this.drag = null;
     if (!d.active) return;
     this.dragJustEnded = Date.now();
-    if (d.over != null && d.over !== d.id) {
-      let ids = [];
-      if (d.kind === "space") {
-        ids = spaces().filter((s) => s.machine === d.machine).map((s) => s.id);
-      } else {
-        const sp = spaces().find((s) => s.id === d.spaceId);
-        ids = sp?.tabs.map((tb) => tb.id) ?? [];
+    if (d.over != null && d.over !== d.id && d.kind === "folder") {
+      // The sidebar owns folder order: live and session-less folders move alike.
+      const order = this.folderOrder[d.machineKey] ?? [];
+      const next = moveKey(order, d.id, d.over, d.place);
+      if (next) {
+        this.folderOrder = { ...this.folderOrder, [d.machineKey]: next };
+        this.saveFolderOrder();
       }
+      // Keep Herdr's space list roughly in step when both rows are live spaces.
+      if (d.spaceId && d.overSpaceId) {
+        const ids = spaces().filter((s) => (s.machine ?? null) === d.machine).map((s) => s.id);
+        const index = moveIndex(ids, d.spaceId, d.overSpaceId, d.place);
+        if (index != null) {
+          try {
+            run("space.move", { id: d.spaceId, index });
+          } catch {}
+        }
+      }
+    } else if (d.over != null && d.over !== d.id) {
+      const sp = spaces().find((s) => s.id === d.spaceId);
+      const ids = sp?.tabs.map((tb) => tb.id) ?? [];
       const index = moveIndex(ids, d.id, d.over, d.place);
       if (index != null) {
         try {
-          run(d.kind === "space" ? "space.move" : "tab.move", { id: d.id, index });
+          run("tab.move", { id: d.id, index });
         } catch {}
       }
     }
@@ -791,8 +929,25 @@ export default class RanchSidebar extends View {
       .child(svg(ICON("sparkle")).size(11));
   }
 
-  spaceRow(sp, first = false) {
+  /** The hover strip's pencil: rename this folder in place. */
+  renameBtn(id, go) {
     const t = theme();
+    return div().id(`rename-btn-${id}`).flex_none().size(16).flex().items_center().justify_center()
+      .rounded(4).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip("Rename")
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        go(cx);
+      })
+      .child(svg(ICON("pencil")).size(11));
+  }
+
+  spaceRow(sp, first = false, itemKey = null) {
+    const t = theme();
+    const key = itemKey ?? `space:${sp.space}`;
+    const name = this.folderName(key, sp.name);
+    const renaming = this.renaming?.key === key;
     const folded = !!this.collapsed.s[sp.space];
     const hovered = this.hoveredSpace === sp.space;
     // Clicking the row folds it (like the machine header); the chevron is an
@@ -801,12 +956,13 @@ export default class RanchSidebar extends View {
       .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
     const sessions = sp.cards.length;
     const tooltip = [
-      sp.name,
+      name,
       `${sessions} session${sessions === 1 ? "" : "s"}${sp.blocked > 0 ? ` · ${sp.blocked} needs you` : ""}`,
     ].join("\n");
     // The machine the space belongs to: a drag stays inside it.
     const machine = spaces().find((s) => s.id === sp.space)?.machine ?? null;
-    const line = this.dropLine(sp.space);
+    const machineKey = machine ?? "";
+    const line = this.dropLine(key);
     // When linked worktrees hang off this space, its folded ring and count
     // cover the whole repo: the main checkout plus its worktrees.
     const withWts = sp.worktrees?.length ? [sp, ...sp.worktrees] : null;
@@ -817,8 +973,8 @@ export default class RanchSidebar extends View {
     return h_flex().id(`space-${sp.space}`).relative().h(28).flex_none().pl(12).pr(8).gap(8).items_center()
       .when(first, (e) => e.mt(6))
       .when(!first, (e) => e.mt(12))
-      .cursor_pointer().hover((s) => s.bg(t.hover)).tooltip(tooltip)
-      .when(this.drag?.active && this.drag.id === sp.space, (e) => e.opacity(0.5))
+      .cursor_pointer().hover((s) => s.bg(t.hover)).when(!renaming, (e) => e.tooltip(tooltip))
+      .when(this.drag?.active && this.drag.id === key, (e) => e.opacity(0.5))
       .when(Boolean(line), (e) => e.child(line))
       .on_hover((isIn, cx) => {
         const next = isIn ? sp.space : null;
@@ -829,23 +985,24 @@ export default class RanchSidebar extends View {
       })
       .on_mouse_down("left", (e, cx) => {
         cx.stop_propagation(); // as before the drag support: the press stays on this row
-        this.dragStart("space", sp.space, e, { machine });
+        if (renaming || this.folderMouseDown(e, key, name, sp.space, cx)) return;
+        this.dragStart("folder", key, e, { machine, machineKey, spaceId: sp.space });
       })
-      .on_mouse_move((e, cx) => this.dragMove("space", sp.space, machine === this.drag?.machine, e, cx))
+      .on_mouse_move((e, cx) => this.dragMove("folder", key, machineKey === this.drag?.machineKey, e, cx))
       .on_mouse_up("left", (_e, cx) => this.dragEnd(cx))
-      .on_click((_e, cx) => {
-        if (this.clickSuppressed()) return;
-        this.toggleFold("s", sp.space, cx);
-      })
+      .on_click((_e, cx) => this.foldClick(key, sp.space, cx))
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
         openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: sp.space } } });
       })
       .child(svg(ICON("folder")).size(14).flex_none().text_color(this.spaceTint(sp).tint))
-      .child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold()
-        .text_color(t.foreground).child(sp.name))
+      .when(renaming, (e) => e.child(this.renameInput(key)))
+      .when(!renaming, (e) => e.child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold()
+        .text_color(t.foreground).child(name)))
       // The checkout facts (branch, diff, PR) live on the worktree blocks.
-      .when(hovered, (e) => e.child(this.plusBtn(sp.space)).child(this.sparkBtn(sp.space)))
+      .when(hovered && !renaming, (e) => e
+        .child(this.renameBtn(key, (cx) => this.startRename(key, name, sp.space, cx)))
+        .child(this.plusBtn(sp.space)).child(this.sparkBtn(sp.space)))
       .when(Boolean(status), (e) => e.child(this.ring(status, 9)))
       .when(folded, (e) => e.child(div().flex_none().text_size(11).text_color(t.dim)
         .child(String(count))))
@@ -863,6 +1020,10 @@ export default class RanchSidebar extends View {
   dormantRow(e, first = false, { live = 0 } = {}) {
     const t = theme();
     const id = keptKey(e.machine, e.folder);
+    const machineKey = e.machine ?? "";
+    const name = this.folderName(id, e.name);
+    const renaming = this.renaming?.key === id;
+    const line = this.dropLine(id);
     const hasLive = live > 0;
     const folded = !!this.collapsed.s[id];
     const hovered = this.hoveredSpace === id;
@@ -879,13 +1040,15 @@ export default class RanchSidebar extends View {
         go(cx);
       })
       .child(svg(ICON(icon)).size(11));
-    return h_flex().id(`kept-row-${id}`).h(28).flex_none().pl(12).pr(8).gap(8).items_center()
+    return h_flex().id(`kept-row-${id}`).relative().h(28).flex_none().pl(12).pr(8).gap(8).items_center()
       .when(first, (el) => el.mt(6))
       .when(!first, (el) => el.mt(12))
       .cursor_pointer()
-      .when(!hasLive, (el) => el.opacity(0.6))
+      .when(!hasLive && !renaming, (el) => el.opacity(0.6))
+      .when(this.drag?.active && this.drag.id === id, (el) => el.opacity(0.4))
+      .when(Boolean(line), (el) => el.child(line))
       .hover((s) => (hasLive ? s.bg(t.hover) : s.opacity(1).bg(t.hover)))
-      .tooltip([e.name, e.folder, hasLive ? null : "No sessions"].filter(Boolean).join("\n"))
+      .when(!renaming, (el) => el.tooltip([name, e.folder, hasLive ? null : "No sessions"].filter(Boolean).join("\n")))
       .on_hover((isIn, cx) => {
         const next = isIn ? id : null;
         if (this.hoveredSpace !== next) {
@@ -893,15 +1056,20 @@ export default class RanchSidebar extends View {
           cx.notify();
         }
       })
-      .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
-      .on_click((_ev, cx) => {
-        if (this.clickSuppressed()) return;
-        this.toggleFold("s", id, cx);
+      .on_mouse_down("left", (ev, cx) => {
+        cx.stop_propagation();
+        if (renaming || this.folderMouseDown(ev, id, name, null, cx)) return;
+        this.dragStart("folder", id, ev, { machine: e.machine ?? null, machineKey, spaceId: null });
       })
+      .on_mouse_move((ev, cx) => this.dragMove("folder", id, machineKey === this.drag?.machineKey, ev, cx))
+      .on_mouse_up("left", (_ev, cx) => this.dragEnd(cx))
+      .on_click((_ev, cx) => this.foldClick(id, id, cx))
       .child(svg(ICON("folder")).size(14).flex_none().text_color(tint))
-      .child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold()
-        .text_color(t.muted).child(e.name))
-      .when(hovered, (el) => el
+      .when(renaming, (el) => el.child(this.renameInput(id)))
+      .when(!renaming, (el) => el.child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold()
+        .text_color(t.muted).child(name)))
+      .when(hovered && !renaming, (el) => el
+        .child(this.renameBtn(id, (cx) => this.startRename(id, name, null, cx)))
         .child(iconBtn("plus", "plus", "New terminal here", () => this.reopenDormant(e)))
         .child(iconBtn("spark", "sparkle", "Start agent here", () => {
           // No props.space: space.new takes focus right after run returns
@@ -910,9 +1078,9 @@ export default class RanchSidebar extends View {
           this.reopenDormant(e);
           openOverlay({ mod: "ranch-launch", kind: "dialog", width: 520, height: 256 });
         })))
-      .when(!hovered && !hasLive, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim)
+      .when(!hovered && !hasLive && !renaming, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim)
         .child("No sessions")))
-      .when(hovered, (el) => el.child(iconBtn("forget", "x", "Forget this folder",
+      .when(hovered && !renaming, (el) => el.child(iconBtn("forget", "x", "Forget this folder",
         (cx) => this.forgetDormant(e, cx))))
       .when(hovered || folded, (el) => el.child(fold))
       .when(!hovered && !folded, (el) => el.child(div().flex_none().size(16)));
@@ -1395,7 +1563,7 @@ export default class RanchSidebar extends View {
       .when(sp.active, (e) => e.border(1).border_color(tint))
       .hover((s) => s.bg(fillStrong))
       .text_size(12).font_bold().text_color(sp.active ? t.foreground : tint)
-      .child(initials(sp.name) || "·");
+      .child(initials(this.folderName(this.spaceKeyById.get(sp.space), sp.name)) || "·");
     if (sp.status) {
       // Ringed in the rail colour so it reads against any tile tint.
       tile.child(div().absolute().bottom(-3).right(-3).size(11).rounded(6)
@@ -1429,13 +1597,13 @@ export default class RanchSidebar extends View {
     const id = keptKey(e.machine, e.folder);
     const { tint, fill } = this.spaceTint({ space: id, color: e.color });
     return h_flex().id(`rail-kept-${id}`).w_full().h(44).flex_none()
-      .items_center().justify_center().cursor_pointer().tooltip(`${e.name}\nNo sessions`)
+      .items_center().justify_center().cursor_pointer().tooltip(`${this.folderName(id, e.name)}\nNo sessions`)
       .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
       .on_click(() => this.reopenDormant(e))
       .child(div().id(`rail-kept-tile-${id}`).size(34).flex_none().rounded(9)
         .flex().items_center().justify_center().bg(fill).opacity(0.55)
         .text_size(12).font_bold().text_color(tint)
-        .child(initials(e.name) || "·"));
+        .child(initials(this.folderName(id, e.name)) || "·"));
   }
 
   rail(tree) {
@@ -1704,7 +1872,9 @@ export default class RanchSidebar extends View {
       rows.push(this.rail(view));
     } else {
       const liveBySpace = new Map(live.map((l) => [l.space, l]));
+      const prevKeyById = this.spaceKeyById;
       this.spaceKeyById = new Map();
+      this.folderSpaceIds = new Map();
       let orderChanged = false;
       for (const [i, g] of view.groups.entries()) {
         const key = g.machine ?? "";
@@ -1750,11 +1920,22 @@ export default class RanchSidebar extends View {
             : (e.checkout?.top || liveBySpace.get(e.space)?.folder || null);
           const itemKey = folder ? keptKey(g.machine, folder) : `space:${e.space}`;
           this.spaceKeyById.set(e.space, itemKey);
+          if (!this.folderSpaceIds.has(itemKey)) this.folderSpaceIds.set(itemKey, e.space);
           liveTopKeys.push(itemKey);
           addItem(itemKey, { kind: "live", entry: e });
         }
+        // The sidebar's own order: folders stay where they are (or where the
+        // user dragged them) whatever order Herdr lists its spaces in. A live
+        // space whose key changed (folder found, git top resolved) keeps its
+        // slot; every kept folder of the machine keeps one through a reopen.
         const prev = this.folderOrder[key] ?? [];
-        const next = mergeFolderOrder(prev, liveTopKeys, keptTopKeys);
+        const renames = new Map();
+        for (const [spaceId, itemKey] of this.spaceKeyById) {
+          const old = prevKeyById.get(spaceId);
+          if (old && old !== itemKey) renames.set(old, itemKey);
+        }
+        const retain = this.kept.filter((e) => (e.machine ?? "") === key).map((e) => keptKey(e.machine, e.folder));
+        const next = stableFolderOrder(prev, liveTopKeys, keptTopKeys, { renames, retain });
         if (!filter) {
           const changed = next.length !== prev.length || next.some((k, idx) => k !== prev[idx]);
           if (changed) {
@@ -1772,7 +1953,7 @@ export default class RanchSidebar extends View {
             itemIndex += 1;
             if (item.kind === "live") {
               const e = item.entry;
-              rows.push(this.spaceRow(e, first));
+              rows.push(this.spaceRow(e, first, itemKey));
               // Collected before any fold check: the Settled group lists them all,
               // even from folded spaces and worktrees.
               settledAll.push(...e.settled);

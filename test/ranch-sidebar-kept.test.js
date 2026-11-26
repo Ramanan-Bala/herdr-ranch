@@ -87,6 +87,8 @@ ${chainSource}
 export const HoverCard = { new: () => chain() };
 export const v_flex = () => chain();
 export const h_flex = () => chain();
+export const InputState = { new: () => chain() };
+export const Input = { new: () => chain() };
 `;
 
 const data = (source) => `data:text/javascript,${encodeURIComponent(source)}`;
