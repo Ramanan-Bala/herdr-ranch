@@ -960,11 +960,6 @@ export default class RanchSidebar extends View {
     // indicator only, aligned with the machine chevrons at the far right.
     const fold = div().flex_none().size(16).flex().items_center().justify_center()
       .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
-    const sessions = sp.cards.length;
-    const tooltip = [
-      name,
-      `${sessions} session${sessions === 1 ? "" : "s"}${sp.blocked > 0 ? ` · ${sp.blocked} needs you` : ""}`,
-    ].join("\n");
     // The machine the space belongs to: a drag stays inside it.
     const machine = spaces().find((s) => s.id === sp.space)?.machine ?? null;
     const machineKey = machine ?? "";
@@ -979,7 +974,7 @@ export default class RanchSidebar extends View {
     return h_flex().id(`space-${sp.space}`).relative().h(28).flex_none().pl(12).pr(8).gap(8).items_center()
       .when(first, (e) => e.mt(6))
       .when(!first, (e) => e.mt(12))
-      .cursor_pointer().hover((s) => s.bg(t.hover)).when(!renaming, (e) => e.tooltip(tooltip))
+      .cursor_pointer().hover((s) => s.bg(t.hover))
       .when(this.drag?.active && this.drag.id === key, (e) => e.opacity(0.5))
       .when(Boolean(line), (e) => e.child(line))
       .on_hover((isIn, cx) => {
@@ -1054,7 +1049,6 @@ export default class RanchSidebar extends View {
       .when(this.drag?.active && this.drag.id === id, (el) => el.opacity(0.4))
       .when(Boolean(line), (el) => el.child(line))
       .hover((s) => (hasLive ? s.bg(t.hover) : s.opacity(1).bg(t.hover)))
-      .when(!renaming, (el) => el.tooltip([name, e.folder, hasLive ? null : "No sessions"].filter(Boolean).join("\n")))
       .on_hover((isIn, cx) => {
         const next = isIn ? id : null;
         if (this.hoveredSpace !== next) {

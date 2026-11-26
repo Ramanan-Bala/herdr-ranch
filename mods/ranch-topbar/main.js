@@ -292,7 +292,6 @@ export default class RanchTopbar extends View {
         : div().size(9).rounded_full().border(1).border_color(t.dim).flex_none();
       const mqKey = `tab-${tab.id}`;
       return tabShell(`tab-${tab.id}`, !viewing).max_w(560)
-        .tooltip(name)
         .on_hover((isIn, cx) => {
           if (this.marquee.hover(mqKey, isIn)) cx.notify();
         })
