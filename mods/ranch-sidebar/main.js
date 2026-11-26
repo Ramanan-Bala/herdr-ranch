@@ -1138,7 +1138,6 @@ export default class RanchSidebar extends View {
     return v_flex().id(id).flex_none().mx(6).mt(4).py(4).rounded(8).border(1)
       .border_color(t.chrome).cursor_pointer().opacity(0.6)
       .hover((s) => s.opacity(1).bg(t.hover))
-      .tooltip([name, branch, wt.path, "No sessions"].filter(Boolean).join("\n"))
       .on_hover((isIn, cx) => {
         const next = isIn ? id : null;
         if (this.hoveredSpace !== next) {
@@ -1211,7 +1210,6 @@ export default class RanchSidebar extends View {
         cx.stop_propagation();
         openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: entry.space } } });
       })
-      .tooltip([name, branch, entry.checkout?.top ?? null].filter(Boolean).join("\n"))
       .child(div().flex_none().w(14).flex().items_center().justify_center()
         .when(Boolean(entry.status), (e) => e.child(this.ring(entry.status, 10))))
       .child(div().min_w(0).truncate().text_size(12.5).font_medium()
