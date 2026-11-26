@@ -23,6 +23,7 @@ import {
 } from "./lib/git.js";
 import { createWatchLoops } from "./lib/watch.js";
 import { EdgeGrip } from "./lib/edge-grip.js";
+import { Marquee, MARQUEE } from "./lib/marquee.js";
 import { homeCache } from "./lib/home.js";
 import { SETTINGS_KEY, FILTER_KEY, resolveSettings } from "./lib/settings.js";
 import { PRS_FILE, parsePrRegistry, prsFor, registryPrBelongs, repoOfWebBase, samePr } from "./lib/prs.js";
@@ -60,6 +61,7 @@ function openNewSpace() {
 export default class RanchSidebar extends View {
   init(_props, cx) {
     this.handle = cx.focus_handle();
+    this.marquee = new Marquee({ div });
     this.size = null; // root size, null until first layout
     this.highlight = null; // keyboard-highlighted tab id
     this.hovered = null; // pointer-hovered tab id (drives the card action strip)
@@ -165,6 +167,10 @@ export default class RanchSidebar extends View {
     this.namer.start(cx);
 
     cx.timer.every(500, (cx) => this.drain(cx));
+    // Hover marquee for session names too long for their row (lib/marquee.js).
+    cx.timer.every(MARQUEE.tickMs, (cx) => {
+      if (this.marquee.tick()) cx.notify();
+    });
     cx.timer.every(5_000, (cx) => this.sweep(cx));
     cx.timer.every(60_000, (cx) => cx.notify()); // keep "time in status" fresh
     cx.spawn(async (cx) => {
@@ -1371,6 +1377,8 @@ export default class RanchSidebar extends View {
       ? formatDuration(c.since)
       : "";
     const acts = hovered ? this.cardActions(c) : [];
+    // Settled rows repeat a card that may also be listed live: their own key.
+    const mqKey = `${settled ? "settled-" : ""}${c.tabId}`;
     return h_flex().id(`card-${c.tabId}`).relative().h(24).mx(4).flex_none().pl(16).pr(8).gap(7).items_center()
       .rounded(5).text_size(12)
       .when(active, (e) => e.bg(t.selected))
@@ -1379,10 +1387,11 @@ export default class RanchSidebar extends View {
       .cursor_pointer().tooltip(tip)
       .on_hover((isIn, cx) => {
         const next = isIn ? c.tabId : null;
+        const moved = this.marquee.hover(mqKey, isIn);
         if (this.hovered !== next) {
           this.hovered = next;
           cx.notify();
-        }
+        } else if (moved) cx.notify();
       })
       // Only non-settled rows are drag sources/targets; settled rows keep their
       // plain press behaviour.
@@ -1409,9 +1418,8 @@ export default class RanchSidebar extends View {
       .when(Boolean(logo), (e) => e.child(logo))
       .when(context && c.spaceName, (e) => e.child(div().flex_none().text_color(t.dim)
         .child(`${truncateMiddle(c.spaceName, 14)} · `)))
-      .child(div().flex_1().min_w(0).truncate()
-        .text_color(settled ? t.dim : active ? t.foreground : t.muted)
-        .child(this.cardTitle(c)))
+      .child(this.marquee.render(mqKey, this.cardTitle(c), (el) => el.flex_1().min_w(0),
+        (el) => el.text_color(settled ? t.dim : active ? t.foreground : t.muted)))
       .when(showLoc && Boolean(branch), (e) => e.child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim)))
       .when(!hovered && Boolean(prog), (e) => e.child(div().flex_none().text_size(10.5).text_color(t.dim)
         .child(`${prog.done}/${prog.total}`)))

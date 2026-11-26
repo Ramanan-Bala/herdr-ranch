@@ -14,6 +14,7 @@ import { effectiveStatus, attentionQueue, closeNeedsConfirm, closeConfirmProps }
 import { readPanels } from "./state.js";
 import { VIEWER_KEY, viewerTab, isViewerTab, openViewerCommands, baseName } from "./lib/file-viewer.js";
 import { fileIcon, iconPath } from "./lib/file-icons.js";
+import { Marquee, MARQUEE } from "./lib/marquee.js";
 
 // The right-panel stack ids this bar can toggle, in layout "panel-body".
 const PANELS = ["session", "files", "changes", "settings"];
@@ -53,6 +54,11 @@ export default class RanchTopbar extends View {
     };
     cx.spawn(loadAgents);
     cx.timer.every(60000, (cx) => cx.spawn(loadAgents));
+    // Hover marquee for a tab title too long for its slot (lib/marquee.js).
+    this.marquee = new Marquee({ div });
+    cx.timer.every(MARQUEE.tickMs, (cx) => {
+      if (this.marquee.tick()) cx.notify();
+    });
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
@@ -284,7 +290,12 @@ export default class RanchTopbar extends View {
         : status === "blocked" ? div().size(7).rounded_full().bg(t.blocked).flex_none()
         : status === "done" ? svg("mods/ranch-topbar/check.svg").size(12).flex_none().text_color(t.done)
         : div().size(9).rounded_full().border(1).border_color(t.dim).flex_none();
+      const mqKey = `tab-${tab.id}`;
       return tabShell(`tab-${tab.id}`, !viewing).max_w(560)
+        .tooltip(name)
+        .on_hover((isIn, cx) => {
+          if (this.marquee.hover(mqKey, isIn)) cx.notify();
+        })
         .on_mouse_down("left", (e, cx) => {
           cx.stop_propagation();
           if (viewing) run("tab.select", { id: tab.id });
@@ -301,7 +312,8 @@ export default class RanchTopbar extends View {
         .when(show.space, el => el
           .child(div().max_w(160).truncate().text_color(t.muted).child(space.name))
           .child(div().text_color(t.dim).flex_none().child("/")))
-        .child(div().max_w(320).truncate().text_color(viewing ? t.muted : t.foreground).when(!viewing, el => el.font_semibold()).child(name))
+        .child(this.marquee.render(mqKey, name, el => el.max_w(320).min_w(0),
+          el => el.text_color(viewing ? t.muted : t.foreground).when(!viewing, e => e.font_semibold())))
         .when(show.marker && tab.named && ownership(tab, auto) === "auto", el => el.child(div().id(`auto-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
           .tooltip(`Named by the agent's session (source: ${auto?.source ?? "agent"})`).child("auto")))
         .when(show.marker && tab.named && ownership(tab, auto) === "locked", el => el.child(div().id(`lock-${tab.id}`).text_size(10).text_color(t.dim).flex_none()
