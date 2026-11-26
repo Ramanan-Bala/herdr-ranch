@@ -936,7 +936,6 @@ export default class RanchSession extends View {
         .text_size(13)
         .font_semibold()
         .truncate()
-        .tooltip(this.tabTitle(s))
         .child("Session Details")
     );
     const sub = subtitle(this.totals(s)); // null when nothing is tracked
@@ -969,15 +968,6 @@ export default class RanchSession extends View {
   /** Completed/total across the chosen agent's tasks and its sub-agents'. */
   totals(s) {
     return totalsOf(this.taskLists(s).map((tasks) => this.liveTasks(tasks)));
-  }
-
-  /** Same rule as the top bar: an unnamed tab shows its agent's program name. */
-  tabTitle(s) {
-    if (!s.tab) return "No tab focused";
-    const unnamed = /^tb\d+$/.test(s.tab.name) || (!s.tab.named && /^\d+$/.test(s.tab.name));
-    if (!unnamed) return s.tab.name;
-    const pane = panes().find((p) => p.tab === s.tab.id && p.program?.agent) ?? panes().find((p) => p.tab === s.tab.id);
-    return pane?.program?.name ?? "Terminal";
   }
 
   picker(t, s) {
@@ -1241,9 +1231,6 @@ export default class RanchSession extends View {
           .flex_none()
           .text_size(12)
           .text_color(dbl.behind > 0 ? t.blocked : t.muted)
-          .when(dbl.behind > 0, (el) =>
-            el.tooltip(`${dbl.default} has ${dbl.behind} commits this branch doesn't`)
-          )
           .child(`${dbl.behind} behind`)
       );
       row.child(div().flex_none().text_size(12).text_color(t.dim).child(dbl.default));
@@ -1515,7 +1502,6 @@ export default class RanchSession extends View {
             .min_w(0)
             .cursor_pointer()
             .hover((h) => h.bg(t.hover))
-            .tooltip(p.url)
             .on_click(() => this.openUrl(p.url))
             .child(h_flex().h(18).flex_none().items_center().child(
               svg("mods/ranch-session/git-pull-request.svg").size(12).text_color(token ? t[token] : t.dim)

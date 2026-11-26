@@ -704,7 +704,7 @@ export default class RanchNewSpace extends View {
     return h_flex().id(`machine-${m.name ?? "_local"}`).h(ROW_H).flex_none().px(7).gap(8).items_center().rounded(5)
       .when(selected, (e) => e.bg(t.selected))
       .when(lit, (e) => e.border_1().border_color(t.accent))
-      .when(m.disabled, (e) => e.opacity(0.45).tooltip(`${m.label} is unavailable`))
+      .when(m.disabled, (e) => e.opacity(0.45))
       .when(!m.disabled, (e) => e.cursor_pointer().hover((h) => h.bg(t.hover))
         .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
         .on_click((_e, cx) => {
@@ -779,7 +779,7 @@ export default class RanchNewSpace extends View {
         h_flex().gap(6).items_center()
           .child(svg(ICON(this.browse.open ? "chevron-down" : "folder")).size(12).flex_none())
           .child("Folders"),
-        (_e, cx) => this.toggleBrowser(cx)).tooltip(`Browse folders on ${this.local() ? "this computer" : this.machine}`))
+        (_e, cx) => this.toggleBrowser(cx)))
       // The system picker only knows this computer; the browser above works
       // everywhere, so local keeps both.
       .when(this.local(), (e) => e.child(this.button(t, "folder-browse",

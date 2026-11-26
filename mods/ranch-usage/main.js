@@ -53,12 +53,8 @@ const textColor = (level, text, t) => (level === "ok" ? (text === "—" ? t.dim 
 const limitColor = (level, text, t) => (text === "—" ? t.dim : levelColor(level, t));
 
 // One-colour glyphs (tint) take the text colour; full-colour logos draw as images.
-// GPUI can't report whether text was cut off, so estimate it from the text and
-// the room it has: truncated text gets its full value as a tooltip.
 const INNER_W = PANEL_W - 28; // the panel's content width (p(14) each side)
-const fits = (text, px, size = 12) => String(text ?? "").length * size * 0.56 <= px;
-const clip = (id, text, px, size = 12) => div().id(id).min_w(0).truncate()
-  .when(!fits(text, px, size), (e) => e.tooltip(String(text))).child(text);
+const clip = (id, text, _px, _size = 12) => div().id(id).min_w(0).truncate().child(text);
 
 const providerIcon = (p, size, t) => (p.tint ? svg(p.icon).size(size).flex_none().text_color(t.foreground) : image(p.icon).size(size).flex_none());
 
@@ -302,7 +298,6 @@ export default class UsageLimits extends View {
     const labelW = INNER_W - PANEL_BAR_W - (this.prefs().showRemaining ? PCT_W.remaining : PCT_W.used) - LEFT_W - 24;
     return v_flex().gap(3)
       .child(h_flex().id(`ul-row-${providerId}-${r.id}`).gap(8).items_center()
-        .when(r.hint != null, (e) => e.tooltip(r.hint))
         .child(clip(`ul-row-${providerId}-${r.id}-label`, r.long, labelW).flex_1().text_color(t.muted))
         .child(usageBar(PANEL_BAR_W, r.fill, r.tick, levelColor(r.level, t), t))
         .child(div().w(this.prefs().showRemaining ? PCT_W.remaining : PCT_W.used).flex_none().flex().justify_end().whitespace_nowrap().text_color(textColor(r.level, r.percent, t)).child(r.percent))

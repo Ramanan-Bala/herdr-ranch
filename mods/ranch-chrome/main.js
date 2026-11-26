@@ -277,10 +277,8 @@ export default class RanchChrome extends View {
         try {
           const aliveCount = (stats?.rows ?? []).filter((r) => r.alive).length;
           const orphanCount = stats?.orphanAddresses?.size ?? 0;
-          const tip = `Resource Manager, ${aliveCount} terminal${aliveCount === 1 ? "" : "s"}\nClick for memory and CPU per terminal`;
           const trigger = h_flex().id("sb-resources").gap(5).items_center().min_w(0).flex_shrink(1)
             .cursor_pointer().hover((s) => s.text_color(t.foreground))
-            .tooltip(tip)
             .child(svg("mods/ranch-chrome/memory-stick.svg").size(12).flex_none().text_color(t.dim))
             .child(svg("mods/ranch-chrome/square-terminal.svg").size(12).flex_none().text_color(t.dim))
             .child(div().truncate().child(String(aliveCount)))
@@ -303,7 +301,7 @@ export default class RanchChrome extends View {
       }
       if (show.terminals) {
         const n = panes().filter((p) => p.terminal).length;
-        items.push(item("sb-terminals", "square-terminal", String(n), `${n} terminals · ${agents().length} agents`));
+        items.push(item("sb-terminals", "square-terminal", String(n), null));
       }
       if (show.ports && stats?.ports) {
         const ports = stats.ports;
@@ -317,9 +315,7 @@ export default class RanchChrome extends View {
         const ms = machines();
         const n = Math.max(ms.length, 1);
         const bad = ms.some((m) => m.layout === "unavailable");
-        const tip = ms.map((m) => `${m.name ?? "This computer"} · ${m.layout === "ready" ? "online" : m.layout === "loading" ? "connecting" : "offline"}`).join("\n");
         items.push(h_flex().id("sb-hosts").gap(5).items_center().min_w(0).flex_shrink(1)
-          .when(Boolean(tip), (el) => el.tooltip(tip))
           .when(bad, (el) => el.child(div().size(5).flex_none().rounded_full().bg(t.dim)))
           .child(svg("mods/ranch-chrome/server.svg").size(12).flex_none().text_color(t.dim))
           .child(div().truncate().child(`${n} host${n === 1 ? "" : "s"}`)));
@@ -359,8 +355,8 @@ export default class RanchChrome extends View {
         counts.working ? chip("working", t.working, false) : null,
         counts.done ? chip("done", t.done, false) : null,
       ].filter(Boolean);
-      const idleTip = counts.idle ? `${counts.idle} idle` : null;
       // The rail keeps only the non-zero counts as small badges, blocked first.
+      // A bare coloured count: the tooltip is its only label (requirements: never colour alone).
       const badge = (status, color) => h_flex().id(`rail-${status}`).size(18).items_center().justify_center().rounded_full().bg(t.hover).flex_none()
         .text_size(10).text_color(color).cursor_pointer().tooltip(`${counts[status]} ${status === "blocked" ? "needs you" : status}`)
         .on_click(() => toggle(status)).child(String(counts[status]));
@@ -370,15 +366,14 @@ export default class RanchChrome extends View {
         counts.done ? badge("done", t.done) : null,
       ].filter(Boolean);
       const quiet = h_flex().id("status-summary").h(22).px(8).gap(8).items_center()
-        .when(idleTip, el => el.tooltip(idleTip))
         .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child("Nothing needs you"))
         .when(counts.done > 0, el => el.child(chip("done", t.done, false)));
       const summary = collapsed
         ? h_flex().id("status-summary").h(22).gap(6).items_center().justify_center()
-            .when(idleTip && !badges.length, el => el.tooltip(idleTip)).children(badges)
+            .children(badges)
         : busy
           ? h_flex().id("status-summary").h(22).px(8).gap(6).items_center()
-              .when(idleTip, el => el.tooltip(idleTip)).children(chips)
+              .children(chips)
           : quiet;
       // Tools: two icon buttons; the update-ready dot sits on the settings slot.
       const tool = (id, icon, label, action) => this.button(id, svg(`mods/ranch-chrome/${icon}.svg`).size(14), action, 22)

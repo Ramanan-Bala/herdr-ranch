@@ -960,11 +960,6 @@ export default class RanchSidebar extends View {
     // indicator only, aligned with the machine chevrons at the far right.
     const fold = div().flex_none().size(16).flex().items_center().justify_center()
       .child(svg(ICON(folded ? "chevron-right" : "chevron-down")).size(11));
-    const sessions = sp.cards.length;
-    const tooltip = [
-      name,
-      `${sessions} session${sessions === 1 ? "" : "s"}${sp.blocked > 0 ? ` · ${sp.blocked} needs you` : ""}`,
-    ].join("\n");
     // The machine the space belongs to: a drag stays inside it.
     const machine = spaces().find((s) => s.id === sp.space)?.machine ?? null;
     const machineKey = machine ?? "";
@@ -979,7 +974,7 @@ export default class RanchSidebar extends View {
     return h_flex().id(`space-${sp.space}`).relative().h(28).flex_none().pl(12).pr(8).gap(8).items_center()
       .when(first, (e) => e.mt(6))
       .when(!first, (e) => e.mt(12))
-      .cursor_pointer().hover((s) => s.bg(t.hover)).when(!renaming, (e) => e.tooltip(tooltip))
+      .cursor_pointer().hover((s) => s.bg(t.hover))
       .when(this.drag?.active && this.drag.id === key, (e) => e.opacity(0.5))
       .when(Boolean(line), (e) => e.child(line))
       .on_hover((isIn, cx) => {
@@ -1054,7 +1049,6 @@ export default class RanchSidebar extends View {
       .when(this.drag?.active && this.drag.id === id, (el) => el.opacity(0.4))
       .when(Boolean(line), (el) => el.child(line))
       .hover((s) => (hasLive ? s.bg(t.hover) : s.opacity(1).bg(t.hover)))
-      .when(!renaming, (el) => el.tooltip([name, e.folder, hasLive ? null : "No sessions"].filter(Boolean).join("\n")))
       .on_hover((isIn, cx) => {
         const next = isIn ? id : null;
         if (this.hoveredSpace !== next) {
@@ -1144,7 +1138,6 @@ export default class RanchSidebar extends View {
     return v_flex().id(id).flex_none().mx(6).mt(4).py(4).rounded(8).border(1)
       .border_color(t.chrome).cursor_pointer().opacity(0.6)
       .hover((s) => s.opacity(1).bg(t.hover))
-      .tooltip([name, branch, wt.path, "No sessions"].filter(Boolean).join("\n"))
       .on_hover((isIn, cx) => {
         const next = isIn ? id : null;
         if (this.hoveredSpace !== next) {
@@ -1217,7 +1210,6 @@ export default class RanchSidebar extends View {
         cx.stop_propagation();
         openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: entry.space } } });
       })
-      .tooltip([name, branch, entry.checkout?.top ?? null].filter(Boolean).join("\n"))
       .child(div().flex_none().w(14).flex().items_center().justify_center()
         .when(Boolean(entry.status), (e) => e.child(this.ring(entry.status, 10))))
       .child(div().min_w(0).truncate().text_size(12.5).font_medium()
@@ -1315,9 +1307,8 @@ export default class RanchSidebar extends View {
       : pr.state === "draft" ? t.dim
       : pr.state === "merged" ? t.ansi5
       : t.blocked;
-    const stateWord = { open: "Open", draft: "Draft", merged: "Merged", closed: "Closed" }[pr.state] ?? "";
     return div().id(id).flex_none().text_size(10).font_medium().text_color(color)
-      .cursor_pointer().tooltip([stateWord, pr.title ?? `Pull request #${pr.number}`].filter(Boolean).join(" · "))
+      .cursor_pointer()
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
@@ -1338,22 +1329,15 @@ export default class RanchSidebar extends View {
     const hovered = this.hovered === c.tabId;
     const plain = !c.primaryAgent && !c.agentIcon?.agent;
     // Task progress from the primary agent's store (the namer's tick keeps it
-    // fresh); the active task goes in the tooltip.
+    // fresh). No tooltip: a long name scrolls on hover instead (lib/marquee.js).
     const tasks = c.primaryAgent ? (this.namer.cachedStore(c.primaryAgent)?.tasks ?? []) : [];
     const prog = tasks.length ? progress(tasks) : null;
-    const activeTask = tasks.find((task) => task.status === "in_progress") ?? null;
     const branch = this.branchOf(c);
     // Grouped under a checkout whose facts moved to the header above: the
     // branch icon shows only when the session's branch differs from it.
     const co = this.checkoutBySpace.get(c.spaceId) ?? null;
     const coBranch = co ? (co.detached ? `detached @${co.head ?? ""}` : co.branch ?? null) : null;
     const showLoc = Boolean(branch) && branch !== coBranch;
-    const tip = [
-      activeTask ? `Now: ${activeTask.active_form ?? activeTask.title}` : null,
-      c.summary ? c.repo : c.cwd,
-      branch,
-      c.label,
-    ].filter(Boolean).join("\n");
     const line = this.dropLine(c.tabId);
     // Left slot = status: an agent whose status report was cleared reads idle.
     const agentKeys = (shared("ranch.knownAgents") ?? []).map((k) => k.key);
@@ -1384,7 +1368,7 @@ export default class RanchSidebar extends View {
       .when(active, (e) => e.bg(t.selected))
       .when(!active, (e) => e.hover((s) => s.bg(t.hover)))
       .when(this.highlight === c.tabId, (e) => e.border(1).border_color(t.accent))
-      .cursor_pointer().tooltip(tip)
+      .cursor_pointer()
       .on_hover((isIn, cx) => {
         const next = isIn ? c.tabId : null;
         const moved = this.marquee.hover(mqKey, isIn);
@@ -1605,7 +1589,7 @@ export default class RanchSidebar extends View {
     const id = keptKey(e.machine, e.folder);
     const { tint, fill } = this.spaceTint({ space: id, color: e.color });
     return h_flex().id(`rail-kept-${id}`).w_full().h(44).flex_none()
-      .items_center().justify_center().cursor_pointer().tooltip(`${this.folderName(id, e.name)}\nNo sessions`)
+      .items_center().justify_center().cursor_pointer()
       .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
       .on_click(() => this.reopenDormant(e))
       .child(div().id(`rail-kept-tile-${id}`).size(34).flex_none().rounded(9)
