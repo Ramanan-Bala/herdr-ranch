@@ -186,9 +186,9 @@ export function nestWorktrees(spaces, infoOf) {
 // empty space alive. So Ranch remembers the folders itself: a live space
 // refreshes a "kept" entry (machine + folder, plus its display name, whether it
 // was named and its custom colour); when no live space matches, the entry is
-// drawn as a dimmed "dormant" row that reopens the folder. Dormant rows are
-// appended at the end of their machine group (position tracking across the
-// space list is not worth its complexity here). Linked git worktrees are never
+// drawn as a dimmed "dormant" row that reopens the folder. Dormant rows keep
+// their remembered position in their machine group (`mergeFolderOrder`). Linked
+// git worktrees are never
 // stored in the kept list itself; instead, worktrees are listed from a git
 // scan of their main checkout, so a closed worktree still shows a dormant row
 // under its project while its main checkout keeps one.
@@ -563,6 +563,82 @@ export function applyKeptFolders(tree, dormant) {
     });
   }
   return { ...tree, showMachines: groups.length > 1, groups };
+}
+
+/**
+ * Merges the remembered top-level folder order for a machine (`prev`) with
+ * this render's live keys (`liveKeys`) and kept keys (`keptKeys`). Returns a
+ * new array listing every key from `liveKeys` and `keptKeys` once and dropping
+ * any other key: live keys keep `liveKeys`' exact relative order, kept keys
+ * keep their slot from `prev` (live slots in `prev` are filled in order from
+ * `liveKeys`), remaining live keys are appended, and kept keys absent from
+ * `prev` are appended last in `keptKeys` order. Never mutates inputs; null or
+ * undefined arguments are treated as empty.
+ *
+ * @param {Array<string>|null|undefined} prev
+ * @param {Array<string>|null|undefined} liveKeys
+ * @param {Array<string>|null|undefined} keptKeys
+ * @returns {Array<string>}
+ */
+export function mergeFolderOrder(prev, liveKeys, keptKeys) {
+  const liveQueue = [];
+  const liveSet = new Set();
+  for (const k of liveKeys ?? []) {
+    if (liveSet.has(k)) continue;
+    liveSet.add(k);
+    liveQueue.push(k);
+  }
+  const keptList = [];
+  const keptSet = new Set();
+  for (const k of keptKeys ?? []) {
+    if (liveSet.has(k) || keptSet.has(k)) continue;
+    keptSet.add(k);
+    keptList.push(k);
+  }
+  const out = [];
+  const seenPrev = new Set();
+  const placedKept = new Set();
+  let liveIdx = 0;
+  for (const k of prev ?? []) {
+    if (seenPrev.has(k)) continue;
+    seenPrev.add(k);
+    if (keptSet.has(k)) {
+      out.push(k);
+      placedKept.add(k);
+    } else if (liveSet.has(k)) {
+      if (liveIdx < liveQueue.length) out.push(liveQueue[liveIdx++]);
+    }
+  }
+  while (liveIdx < liveQueue.length) out.push(liveQueue[liveIdx++]);
+  for (const k of keptList) {
+    if (!placedKept.has(k)) out.push(k);
+  }
+  return out;
+}
+
+/**
+ * The 1-based index in Herdr's space list for a reopened dormant folder, so it
+ * returns to its remembered slot in `order` instead of staying at the end.
+ * Counts how many entries in `liveKeys` (the machine's live spaces in Herdr
+ * order, before the new space opened) appear before `key` in `order`, and
+ * returns `1 + count`, or `null` when `key` is not in `order`. Never mutates
+ * inputs; null or undefined arguments are treated as empty.
+ *
+ * @param {Array<string>|null|undefined} order
+ * @param {string} key
+ * @param {Array<string|null|undefined>|null|undefined} liveKeys
+ * @returns {number|null}
+ */
+export function reopenIndex(order, key, liveKeys) {
+  const list = order ?? [];
+  const pos = list.indexOf(key);
+  if (pos === -1) return null;
+  const before = new Set(list.slice(0, pos));
+  let count = 0;
+  for (const k of liveKeys ?? []) {
+    if (before.has(k)) count += 1;
+  }
+  return count + 1;
 }
 
 /** Palette used for agent initials badges (theme token names). */

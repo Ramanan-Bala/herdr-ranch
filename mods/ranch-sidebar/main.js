@@ -13,6 +13,7 @@ import {
   normalizeCollapsed, topOfFresh, cardRows, moveIndex, worktreeName,
   keptKey, spaceCwd, spaceGitState, liveSpaceFolder, normalizeKept, refreshKept, forgetKept,
   dormantFolders, applyKeptFolders, mainCheckoutOf, dormantWorktrees, dormantPrimary, touchesWorktrees,
+  mergeFolderOrder, reopenIndex,
 } from "./model.js";
 import { isViewerTab } from "./lib/file-viewer.js";
 import { parseWorktrees } from "./lib/newspace.js";
@@ -33,6 +34,7 @@ const COLLAPSE_KEY = "collapsed";
 // Folders kept alive in the sidebar after their last session closes. Herdr
 // closes the space itself; this list is Ranch's own memory of it (model.js).
 const KEPT_KEY = "keptFolders";
+const FOLDER_ORDER_KEY = "ranch.sidebar.folderOrder";
 // The sidebar's share of the 4-gh budget (requirements §Performance: sidebar 3
 // + session 1); module-level so every copy of this view in the mod shares one
 // limit.
@@ -82,11 +84,17 @@ export default class RanchSidebar extends View {
     // raw, name, named, color}], rendered as dimmed rows when no live space
     // matches. Rebuilt from live spaces on every render, persisted on change.
     this.kept = this.loadKept();
+    // Remembered top-level folder order per machine ("" for local -> array of
+    // keptKey strings), so kept folders stay in their slot after closing.
+    this.folderOrder = this.loadFolderOrder();
     // Last good folder per space id. Herdr's SpaceInfo.folder is where the space
     // was made, not where it is, and it is all a render sees once the last
     // terminal ended; remembering the space's own folder keeps its identity
     // across those degraded renders (model.js liveSpaceFolder).
     this.spaceFolderById = new Map();
+    // Space id -> top-level item key from the last render, so reopenDormant
+    // can map Herdr's live spaces to their folder-order keys.
+    this.spaceKeyById = new Map();
 
     // Git: repos `${machine}|${top}` -> {summary, at}; topOf `${machine}|${cwd}`
     // -> { top: string|null, at } (top null = no repository found at `at`).
@@ -182,6 +190,26 @@ export default class RanchSidebar extends View {
     } catch {}
   }
 
+  loadFolderOrder() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(FOLDER_ORDER_KEY) ?? "{}");
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+      const out = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (Array.isArray(v)) out[k] = v.filter((x) => typeof x === "string");
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  saveFolderOrder() {
+    try {
+      localStorage.setItem(FOLDER_ORDER_KEY, JSON.stringify(this.folderOrder));
+    } catch {}
+  }
+
   /** Folders of this render's live spaces, for refreshKept/dormantFolders: git
    * top when the space's checkout is known, else its own folder. `git` is
    * model.js spaceGitState, so a space whose git lookup is still unresolved is
@@ -205,6 +233,7 @@ export default class RanchSidebar extends View {
       if (!degraded) this.spaceFolderById.set(sp.id, raw);
       const state = git.get(sp.id) ?? null;
       out.push({
+        space: sp.id,
         machine: sp.machine ?? null,
         folder: state?.top || raw,
         raw,
@@ -224,9 +253,26 @@ export default class RanchSidebar extends View {
 
   /** Reopen a dormant folder as a live space (row click, +, sparkle). */
   reopenDormant(e) {
+    const machine = e.machine ?? null;
+    const before = spaces().filter((s) => (s.machine ?? null) === machine);
+    const beforeIds = new Set(before.map((s) => s.id));
+    const liveKeys = before.map((s) => this.spaceKeyById.get(s.id) ?? null);
     const args = { folder: e.folder, machine: e.machine ?? "", focus: true };
     if (e.named && e.name) args.name = e.name;
     run("space.new", args);
+    const after = spaces().filter((s) => (s.machine ?? null) === machine);
+    const newPos = after.findIndex((s) => !beforeIds.has(s.id));
+    if (newPos === -1) return;
+    const index = reopenIndex(
+      this.folderOrder[machine ?? ""] ?? [],
+      keptKey(machine, e.folder),
+      liveKeys,
+    );
+    if (index != null && index < newPos + 1) {
+      try {
+        run("space.move", { id: after[newPos].id, index });
+      } catch {}
+    }
   }
 
   forgetDormant(e, cx) {
@@ -814,9 +860,10 @@ export default class RanchSidebar extends View {
    * opens a terminal there, sparkle opens the start-agent dialog, and "x"
    * forgets it. No right-click.
    */
-  dormantRow(e, first = false) {
+  dormantRow(e, first = false, { live = 0 } = {}) {
     const t = theme();
     const id = keptKey(e.machine, e.folder);
+    const hasLive = live > 0;
     const folded = !!this.collapsed.s[id];
     const hovered = this.hoveredSpace === id;
     const fold = div().flex_none().size(16).flex().items_center().justify_center()
@@ -835,8 +882,10 @@ export default class RanchSidebar extends View {
     return h_flex().id(`kept-row-${id}`).h(28).flex_none().pl(12).pr(8).gap(8).items_center()
       .when(first, (el) => el.mt(6))
       .when(!first, (el) => el.mt(12))
-      .cursor_pointer().opacity(0.6).hover((s) => s.opacity(1).bg(t.hover))
-      .tooltip([e.name, e.folder, "No sessions"].filter(Boolean).join("\n"))
+      .cursor_pointer()
+      .when(!hasLive, (el) => el.opacity(0.6))
+      .hover((s) => (hasLive ? s.bg(t.hover) : s.opacity(1).bg(t.hover)))
+      .tooltip([e.name, e.folder, hasLive ? null : "No sessions"].filter(Boolean).join("\n"))
       .on_hover((isIn, cx) => {
         const next = isIn ? id : null;
         if (this.hoveredSpace !== next) {
@@ -861,7 +910,7 @@ export default class RanchSidebar extends View {
           this.reopenDormant(e);
           openOverlay({ mod: "ranch-launch", kind: "dialog", width: 520, height: 256 });
         })))
-      .when(!hovered, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim)
+      .when(!hovered && !hasLive, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim)
         .child("No sessions")))
       .when(hovered, (el) => el.child(iconBtn("forget", "x", "Forget this folder",
         (cx) => this.forgetDormant(e, cx))))
@@ -1654,6 +1703,9 @@ export default class RanchSidebar extends View {
     } else if (narrow) {
       rows.push(this.rail(view));
     } else {
+      const liveBySpace = new Map(live.map((l) => [l.space, l]));
+      this.spaceKeyById = new Map();
+      let orderChanged = false;
       for (const [i, g] of view.groups.entries()) {
         const key = g.machine ?? "";
         const liveTops = new Set();
@@ -1665,49 +1717,104 @@ export default class RanchSidebar extends View {
           rows.push(this.machineHeader(g, i === 0));
           if (this.collapsed.m[key]) continue;
         }
+        // Build one ordered list of top-level items per machine group so kept
+        // folders stay at their remembered position and live linked worktrees
+        // nest under their kept main checkout.
+        const itemsByKey = new Map();
+        const addItem = (itemKey, item) => {
+          const bucket = itemsByKey.get(itemKey);
+          if (bucket) bucket.push(item);
+          else itemsByKey.set(itemKey, [item]);
+        };
+        const keptByFolder = new Map();
+        const keptTopKeys = [];
+        for (const e of g.kept ?? []) {
+          const itemKey = keptKey(e.machine, e.folder);
+          const item = { kind: "kept", entry: e, worktrees: [] };
+          keptTopKeys.push(itemKey);
+          keptByFolder.set(e.folder, item);
+          addItem(itemKey, item);
+        }
+        const liveTopKeys = [];
+        for (const e of nestWorktrees(g.spaces, (sp) => sp.checkout)) {
+          if (e.checkout?.linked) {
+            const main = mainCheckoutOf(e.checkout.common);
+            const host = main ? keptByFolder.get(main) : null;
+            if (host) {
+              host.worktrees.push(e);
+              continue;
+            }
+          }
+          const folder = e.checkout && !e.checkout.linked && e.checkout.top
+            ? e.checkout.top
+            : (e.checkout?.top || liveBySpace.get(e.space)?.folder || null);
+          const itemKey = folder ? keptKey(g.machine, folder) : `space:${e.space}`;
+          this.spaceKeyById.set(e.space, itemKey);
+          liveTopKeys.push(itemKey);
+          addItem(itemKey, { kind: "live", entry: e });
+        }
+        const prev = this.folderOrder[key] ?? [];
+        const next = mergeFolderOrder(prev, liveTopKeys, keptTopKeys);
+        if (!filter) {
+          const changed = next.length !== prev.length || next.some((k, idx) => k !== prev[idx]);
+          if (changed) {
+            this.folderOrder[key] = next;
+            orderChanged = true;
+          }
+        }
         // Settled tabs of the whole machine gather in one group after the last
         // space, in display order (this space, its worktrees, next space…).
         const settledAll = [];
-        for (const [si, e] of nestWorktrees(g.spaces, (sp) => sp.checkout).entries()) {
-          rows.push(this.spaceRow(e, si === 0));
-          // Collected before any fold check: the Settled group lists them all,
-          // even from folded spaces and worktrees.
-          settledAll.push(...e.settled);
-          for (const wt of e.worktrees) settledAll.push(...wt.settled);
-          if (this.collapsed.s[e.space]) continue; // folded: hides its worktrees too
-          if (!e.checkout) {
-            // Non-git space: its sessions sit directly under the space row.
-            for (const c of e.cards) {
-              rows.push(this.sessionRow(c));
-              this.order.push(c.tabId);
+        let itemIndex = 0;
+        for (const itemKey of next) {
+          for (const item of itemsByKey.get(itemKey) ?? []) {
+            const first = itemIndex === 0;
+            itemIndex += 1;
+            if (item.kind === "live") {
+              const e = item.entry;
+              rows.push(this.spaceRow(e, first));
+              // Collected before any fold check: the Settled group lists them all,
+              // even from folded spaces and worktrees.
+              settledAll.push(...e.settled);
+              for (const wt of e.worktrees) settledAll.push(...wt.settled);
+              if (this.collapsed.s[e.space]) continue; // folded: hides its worktrees too
+              if (!e.checkout) {
+                // Non-git space: its sessions sit directly under the space row.
+                for (const c of e.cards) {
+                  rows.push(this.sessionRow(c));
+                  this.order.push(c.tabId);
+                }
+                continue;
+              }
+              // Git space: the main checkout's block first (tagged "primary"), then
+              // its linked worktrees, each with its own session rows.
+              rows.push(this.worktreeBlock(e, { primary: true, foldKey: `main:${e.space}` }));
+              for (const wt of e.worktrees) {
+                rows.push(this.worktreeBlock(wt, { primary: false, foldKey: wt.space }));
+              }
+              if (!e.checkout.linked) {
+                const dWts = dormantWorktrees(scan(e.checkout.top), liveTops);
+                for (const wt of dWts) rows.push(this.dormantWorktreeRow(wt, g.machine));
+              }
+            } else {
+              const e = item.entry;
+              rows.push(this.dormantRow(e, first, { live: item.worktrees.length }));
+              for (const wt of item.worktrees) settledAll.push(...wt.settled);
+              if (this.collapsed.s[keptKey(e.machine, e.folder)]) continue;
+              const p = dormantPrimary(scan(e.folder), e.folder);
+              if (p) {
+                rows.push(this.dormantWorktreeRow(p, g.machine, {
+                  primary: p.git,
+                  onOpen: () => this.reopenDormant(e),
+                }));
+              }
+              for (const wt of item.worktrees) {
+                rows.push(this.worktreeBlock(wt, { primary: false, foldKey: wt.space }));
+              }
+              const dWts = dormantWorktrees(scan(e.folder), liveTops);
+              for (const wt of dWts) rows.push(this.dormantWorktreeRow(wt, g.machine));
             }
-            continue;
           }
-          // Git space: the main checkout's block first (tagged "primary"), then
-          // its linked worktrees, each with its own session rows.
-          rows.push(this.worktreeBlock(e, { primary: true, foldKey: `main:${e.space}` }));
-          for (const wt of e.worktrees) {
-            rows.push(this.worktreeBlock(wt, { primary: false, foldKey: wt.space }));
-          }
-          if (!e.checkout.linked) {
-            const dWts = dormantWorktrees(scan(e.checkout.top), liveTops);
-            for (const wt of dWts) rows.push(this.dormantWorktreeRow(wt, g.machine));
-          }
-        }
-        // Kept folders with no live space sit at the end of their machine
-        // group, before the machine's Settled section.
-        for (const [ki, e] of (g.kept ?? []).entries()) {
-          rows.push(this.dormantRow(e, g.spaces.length === 0 && ki === 0));
-          if (this.collapsed.s[keptKey(e.machine, e.folder)]) continue;
-          const p = dormantPrimary(scan(e.folder), e.folder);
-          if (p) {
-            rows.push(this.dormantWorktreeRow(p, g.machine, {
-              primary: p.git,
-              onOpen: () => this.reopenDormant(e),
-            }));
-          }
-          const dWts = dormantWorktrees(scan(e.folder), liveTops);
-          for (const wt of dWts) rows.push(this.dormantWorktreeRow(wt, g.machine));
         }
         if (settledAll.length) {
           const folded = !!this.collapsed.settled[`m:${key}`];
@@ -1721,6 +1828,7 @@ export default class RanchSidebar extends View {
           }
         }
       }
+      if (orderChanged) this.saveFolderOrder();
     }
 
     return v_flex().id("root").relative().size_full().min_h(0).bg(t.chrome)
