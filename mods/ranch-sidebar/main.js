@@ -1338,22 +1338,15 @@ export default class RanchSidebar extends View {
     const hovered = this.hovered === c.tabId;
     const plain = !c.primaryAgent && !c.agentIcon?.agent;
     // Task progress from the primary agent's store (the namer's tick keeps it
-    // fresh); the active task goes in the tooltip.
+    // fresh). No tooltip: a long name scrolls on hover instead (lib/marquee.js).
     const tasks = c.primaryAgent ? (this.namer.cachedStore(c.primaryAgent)?.tasks ?? []) : [];
     const prog = tasks.length ? progress(tasks) : null;
-    const activeTask = tasks.find((task) => task.status === "in_progress") ?? null;
     const branch = this.branchOf(c);
     // Grouped under a checkout whose facts moved to the header above: the
     // branch icon shows only when the session's branch differs from it.
     const co = this.checkoutBySpace.get(c.spaceId) ?? null;
     const coBranch = co ? (co.detached ? `detached @${co.head ?? ""}` : co.branch ?? null) : null;
     const showLoc = Boolean(branch) && branch !== coBranch;
-    const tip = [
-      activeTask ? `Now: ${activeTask.active_form ?? activeTask.title}` : null,
-      c.summary ? c.repo : c.cwd,
-      branch,
-      c.label,
-    ].filter(Boolean).join("\n");
     const line = this.dropLine(c.tabId);
     // Left slot = status: an agent whose status report was cleared reads idle.
     const agentKeys = (shared("ranch.knownAgents") ?? []).map((k) => k.key);
@@ -1384,7 +1377,7 @@ export default class RanchSidebar extends View {
       .when(active, (e) => e.bg(t.selected))
       .when(!active, (e) => e.hover((s) => s.bg(t.hover)))
       .when(this.highlight === c.tabId, (e) => e.border(1).border_color(t.accent))
-      .cursor_pointer().tooltip(tip)
+      .cursor_pointer()
       .on_hover((isIn, cx) => {
         const next = isIn ? c.tabId : null;
         const moved = this.marquee.hover(mqKey, isIn);
