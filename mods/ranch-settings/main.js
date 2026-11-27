@@ -1,12 +1,14 @@
 import { View, div, image, svg } from "gpui-kit";
 import { Popover, v_flex, h_flex } from "gpui-base";
-import { theme, shared, setShared, run, exec, home, knownAgents, nextCommand, spaces, readTextFile, window as appWindow } from "herdr";
+import { theme, shared, setShared, run, exec, home, knownAgents, nextCommand, spaces, readTextFile, layout, window as appWindow } from "herdr";
 import { runGh } from "./lib/git.js";
 import { SETTINGS_KEY, MAX_AGENTS, resolveSettings, withSetting } from "./lib/settings.js";
 import { tasksCommand, looksWindows } from "./lib/tasks-command.js";
 import { homeCache } from "./lib/home.js";
 import { pushBridge, bridgeMissing } from "./lib/remote-bridge.js";
 import { EdgeGrip } from "./lib/edge-grip.js";
+import { KNOWN_KEY, KNOWN_ON_SETTINGS_MS, refreshKnownAgents } from "./lib/known-agents.js";
+import { blockShown, PanelVisibility } from "./lib/panels.js";
 
 // Ranch settings panel: one flat list. Every row sits on the same grid
 // (label left, control right, 28px tall); sections are split by a hairline,
@@ -21,6 +23,8 @@ const UPDATE_EVERY = 30 * 60_000;
 const IDLE_UPD = { state: "checking", installed: null, latest: null, message: "", bridgeOnly: false };
 const TASK_KEYS = ["claude", "codex", "opencode", "pi", "antigravity"];
 const HERDR_MIN = [0, 1, 15];
+const TASKS_EVERY = 60_000; // task-reporting status, while the panel is shown
+const HEALTH_EVERY = 5 * 60_000; // git / herdr-app versions, while shown
 const ROW_H = 28;
 
 const displayName = (key, known) => (key === "terminal" ? "Terminal" : known.find((k) => k.key === key)?.name || key);
@@ -40,7 +44,7 @@ export default class RanchSettings extends View {
     this.handle = cx.focus_handle();
     // knownAgents() result: [{key, name, icon, tint, run, installed}]. It can take
     // ~30 s (it asks the login shell), so start from the last cached answer.
-    this.known = shared("ranch.knownAgents") ?? null;
+    this.known = shared(KNOWN_KEY) ?? null;
     // Task reporting and updates follow the machine of the shown space: its
     // agents run there, so that is where the bridge must be installed.
     this.homeFor = homeCache(exec, home);
@@ -50,36 +54,65 @@ export default class RanchSettings extends View {
     this.machineKey = this.machineNow() ?? "";
     this.health = { git: "checking", herdr: "checking" };
     this.healthBusy = false;
-    cx.spawn(async (cx) => {
-      try {
-        this.known = await knownAgents();
-        setShared("ranch.knownAgents", this.known);
-      } catch {
-        this.known = this.known ?? [];
-      }
-      cx.notify();
-    });
+    this.loadKnown(cx);
+    // One check of everything at start, so the panel opens filled in. After
+    // that the recurring checks (each starts processes) run only while the
+    // panel is shown, and catch up when it is opened (lib/panels.js).
+    this.vis = new PanelVisibility(() => blockShown(layout(), { id: "settings", mod: "ranch-settings" }));
+    this.tasksAt = new Map(); // machine key -> last loadTasks start
+    this.healthAt = 0;
     this.loadTasks(cx);
-    cx.timer.every(60_000, (cx) => this.loadTasks(cx));
-    // Follow the shown space's machine: check it as soon as it changes.
-    cx.timer.every(1000, (cx) => {
-      const key = this.machineNow() ?? "";
-      if (key === this.machineKey) return;
-      this.machineKey = key;
-      if (!this.tasksBy.has(key)) this.loadTasks(cx);
-      this.checkUpdate(cx, false);
-      cx.notify();
-    });
     this.loadHealth(cx);
-    // Version checks spawn processes: every 5 min is plenty.
-    cx.timer.every(5 * 60_000, (cx) => this.loadHealth(cx));
     this.checkUpdate(cx, false);
+    cx.timer.every(1000, (cx) => this.tick(cx));
     if (shared("ranch.health.gh") !== "ok") this.checkGh(cx);
     cx.spawn(async (cx) => {
       for (;;) if ((await nextCommand()) === "focus") {
         this.handle.focus();
         this.checkUpdate(cx, false);
       }
+    });
+  }
+
+  /** 1 s heartbeat: follow the shown space's machine, and refresh what's due while shown. */
+  tick(cx) {
+    const key = this.machineNow() ?? "";
+    if (key !== this.machineKey) {
+      this.machineKey = key; // followed even while hidden (no processes)
+      this.machineMoved = true;
+    }
+    if (!this.vis.check()) return;
+    const now = Date.now();
+    if (now - (this.tasksAt.get(key) ?? 0) >= TASKS_EVERY) this.loadTasks(cx);
+    if (now - this.healthAt >= HEALTH_EVERY) this.loadHealth(cx);
+    // checkUpdate keeps its own 30 min cache: cheap to ask on every show.
+    if (this.vis.justShown) this.loadKnown(cx);
+    if (this.machineMoved || this.vis.justShown) {
+      this.machineMoved = false;
+      this.checkUpdate(cx, false);
+      cx.notify();
+    }
+  }
+
+  /** knownAgents() as last shared by any copy (top bar, launch, here), else this copy's. */
+  get known() {
+    return shared(KNOWN_KEY) ?? this._known ?? null;
+  }
+
+  set known(v) {
+    this._known = v;
+  }
+
+  /** Installed agents (shared with the top bar), re-checked when older than a minute. */
+  loadKnown(cx) {
+    cx.spawn(async (cx) => {
+      try {
+        const list = await refreshKnownAgents({ knownAgents, shared, setShared, maxAge: KNOWN_ON_SETTINGS_MS });
+        if (list) this.known = list;
+      } catch {
+        this.known = this.known ?? [];
+      }
+      cx.notify();
     });
   }
 
@@ -124,6 +157,7 @@ export default class RanchSettings extends View {
 
   loadTasks(cx, machine = this.machine()) {
     const key = machine ?? "";
+    this.tasksAt?.set(key, Date.now());
     cx.spawn(async (cx) => {
       let tasks;
       let r = null;
@@ -269,6 +303,7 @@ export default class RanchSettings extends View {
   loadHealth(cx) {
     if (this.healthBusy) return; // never overlapping loads
     this.healthBusy = true;
+    this.healthAt = Date.now();
     cx.spawn(async (cx) => {
       try {
         const git = await exec("git", ["--version"]).then((r) => (r.code === 0 ? "ok" : "missing")).catch(() => "missing");

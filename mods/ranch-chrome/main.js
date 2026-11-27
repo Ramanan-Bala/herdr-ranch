@@ -78,7 +78,9 @@ export default class RanchChrome extends View {
     // Herdr hands init() no props here; the block's props come from props().
     if (!props()?.status) return;
     // Status bar only: the processes inside Herdr sessions and what they use.
-    // Render can't spawn, so a 1 s tick polls every 5 s (or 2 s while open).
+    // Render can't spawn, so a 1 s tick polls: every 2 s while the Resource
+    // Manager is open (and at once when it opens), else every 15 s for the
+    // strip's totals (30 s on Windows, where each poll starts PowerShell).
     this.stats = null;
     this.statsBusy = false;
     this.pidCache = new Map();
@@ -97,7 +99,7 @@ export default class RanchChrome extends View {
     if (!checking()) {
       this.pollStats(cx);
       cx.timer.every(1000, (cx) => {
-        const interval = this.resOpen ? 2000 : 5000;
+        const interval = this.resOpen ? 2000 : window()?.platform === "windows" ? 30000 : 15000;
         if (Date.now() - this.lastPollAt >= interval - 50) this.pollStats(cx);
       });
     }
@@ -112,6 +114,8 @@ export default class RanchChrome extends View {
         // Windows has no ps/lsof: PowerShell's Win32_Process list (CPU from the
         // tick delta between polls) and netstat stand in for them.
         const win = window()?.platform === "windows";
+        // Listening ports: for the strip's ports item, or the open popover.
+        const wantPorts = this.resOpen || resolveSettings(shared(SETTINGS_KEY)).statusbar.ports;
         const tryExec = async (cmd, args, timeout) => {
           try {
             return await exec(cmd, args, { timeout });
@@ -126,14 +130,18 @@ export default class RanchChrome extends View {
           // Without a process list there is nothing to attribute; keep the last stats (or null).
           if (!ps || ps.code !== 0) return;
           procs = applyWinCpu(parseWinProcs(ps.stdout), this.winCpu, Date.now());
-          const ns = await tryExec("netstat", ["-ano"], 5000);
-          if (ns && ns.code === 0) listens = parseNetstatListen(ns.stdout, procs);
+          if (wantPorts) {
+            const ns = await tryExec("netstat", ["-ano"], 5000);
+            if (ns && ns.code === 0) listens = parseNetstatListen(ns.stdout, procs);
+          }
         } else {
           const ps = await tryExec("ps", ["-axo", "pid=,ppid=,rss=,pcpu=,comm="], 5000);
           if (!ps || ps.code !== 0) return;
           procs = parsePs(ps.stdout);
-          const lsof = await tryExec("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"], 5000);
-          if (lsof && lsof.code === 0) listens = parseLsofListen(lsof.stdout);
+          if (wantPorts) {
+            const lsof = await tryExec("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"], 5000);
+            if (lsof && lsof.code === 0) listens = parseLsofListen(lsof.stdout);
+          }
         }
         const pids = sessionPids(procs);
         const usage = sumUsage(procs, pids);

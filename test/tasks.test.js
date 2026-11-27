@@ -10,7 +10,6 @@ import {
   storeFileName,
   storeAddress,
   emptyStore,
-  withActivity,
   normalizeActivity,
   pointerSession,
   listVisible,
@@ -185,17 +184,6 @@ test("storeFileName and emptyStore", () => {
   assert.equal(storeFileName("../x"), ".._x.json");
   assert.equal(storeFileName(""), null);
   assert.equal(emptyStore("t1", "codex").tasks.length, 0);
-});
-
-test("activity is normalized and set immutably", () => {
-  assert.equal(normalizeActivity({ state: "nope" }), null);
-  assert.deepEqual(normalizeActivity({ state: "working", at: 5 }), { state: "working", at: 5 });
-  const base = emptyStore("t1", "codex");
-  const next = withActivity(base, "blocked", 9);
-  assert.equal(base.session, null);
-  assert.deepEqual(next.session.activity, { state: "blocked", at: 9 });
-  const r = parseStore(JSON.stringify(next));
-  assert.deepEqual(r.store.session.activity, { state: "blocked", at: 9 });
 });
 
 test("progress and orderTasks leave cancelled tasks out of the count and last in order", () => {

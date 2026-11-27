@@ -74,3 +74,41 @@ test("Marquee.render: truncated off hover, clipped and shifted on hover", () => 
   assert.ok(inner.calls.some(([p]) => p === "whitespace_nowrap"));
   assert.ok(inner.calls.some(([p]) => p === "ml"));
 });
+
+test("Marquee.animate redraws only while a name is hovered, one loop at a time", async () => {
+  let now = 0;
+  const m = new Marquee({ div: fakeDiv, now: () => now });
+  m.sizes.set("a", { box: 50, text: 120 });
+  let spawns = 0;
+  let notifies = 0;
+  let sleeps = 0;
+  const loops = [];
+  const cx = {
+    spawn(fn) {
+      spawns++;
+      const inner = {
+        sleep: async () => {
+          sleeps++;
+          // Hover ends after the third tick.
+          if (sleeps === 3) m.hover("a", false);
+        },
+        notify: () => notifies++,
+      };
+      loops.push(fn(inner));
+    },
+  };
+  m.animate(cx); // nothing hovered: no loop
+  assert.equal(spawns, 0);
+  m.hover("a", true, cx);
+  m.hover("b", true, cx); // switching rows reuses the running loop
+  m.hover("a", true, cx);
+  await Promise.all(loops);
+  assert.equal(spawns, 1);
+  assert.equal(notifies, 2);
+  assert.equal(m.running, false);
+  // A later hover starts a fresh loop.
+  m.hover("a", true, cx);
+  assert.equal(spawns, 2);
+  m.hover("a", false);
+  await Promise.all(loops);
+});

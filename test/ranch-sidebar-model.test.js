@@ -10,8 +10,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 execFileSync("sh", [join(root, "scripts/sync-lib.sh")]);
 
 const {
-  buildTree, nestWorktrees, BADGE_COLORS, initials, badgeColorIndex, diffSquares, worktreeName, branchLine,
-  keptKey, spaceCwd, spaceFolder, spaceGitState, liveSpaceFolder, normalizeKept, refreshKept, forgetKept, dormantFolders, applyKeptFolders,
+  buildTree, nestWorktrees, BADGE_COLORS, initials, badgeColorIndex, worktreeName, keptKey, spaceCwd, spaceGitState, liveSpaceFolder, normalizeKept, refreshKept, forgetKept, dormantFolders, applyKeptFolders,
 } = await import(pathToFileURL(join(root, "mods/ranch-sidebar/model.js")).href);
 
 const NOW = Date.parse("2026-11-11T10:00:00Z");
@@ -249,21 +248,6 @@ test("badgeColorIndex: deterministic and in range", () => {
   assert.ok(buckets.size > 1);
 });
 
-test("diffSquares: zero diff is all none", () => {
-  assert.deepEqual(diffSquares(), ["none", "none", "none", "none", "none"]);
-  assert.deepEqual(diffSquares(0, 0), ["none", "none", "none", "none", "none"]);
-});
-
-test("diffSquares: proportional fills, five squares always", () => {
-  assert.deepEqual(diffSquares(10, 0), ["add", "add", "add", "add", "add"]);
-  assert.deepEqual(diffSquares(0, 10), ["del", "del", "del", "del", "del"]);
-  // 2/2 ties at 3/3 after rounding, capped to 2/3.
-  assert.deepEqual(diffSquares(2, 2), ["add", "add", "del", "del", "del"]);
-  // Nonzero counts get at least one square.
-  assert.deepEqual(diffSquares(1, 99), ["add", "del", "del", "del", "del"]);
-  assert.deepEqual(diffSquares(1, 0), ["add", "add", "add", "add", "add"]);
-});
-
 test("a card at this computer's home reads ~, not the user's folder name", () => {
   const tree = buildTree({
     home: "/Users/someone",
@@ -354,7 +338,7 @@ test("nestWorktrees: never mutates its inputs", () => {
 });
 
 // ---------------------------------------------------------------------------
-// worktreeName / branchLine
+// worktreeName
 
 const wt = (over = {}) => ({
   name: over.name ?? "space-name",
@@ -380,35 +364,8 @@ test("worktreeName: missing checkout falls back to entry.name", () => {
   assert.equal(worktreeName({ name: "solo", checkout: undefined }, true), "solo");
 });
 
-test("branchLine: equal to the name is dropped", () => {
-  assert.equal(branchLine("feat", { branch: "feat" }), null);
-  assert.equal(branchLine("detached @abc", { detached: true, head: "abc" }), null);
-});
-
-test("branchLine: a different branch is the label", () => {
-  assert.equal(branchLine("ranch-wt-x", { branch: "feat/x" }), "feat/x");
-  assert.equal(branchLine("ranch-wt-x", { detached: true, head: "abc123" }), "detached @abc123");
-});
-
-test("branchLine: no checkout or no branch is null", () => {
-  assert.equal(branchLine("x", null), null);
-  assert.equal(branchLine("x", undefined), null);
-  assert.equal(branchLine("x", {}), null);
-  assert.equal(branchLine("x", { branch: null }), null);
-});
-
 // ---------------------------------------------------------------------------
 // Kept (dormant) folders
-
-test("spaceFolder: first tab's live cwd wins, then SpaceInfo.folder", () => {
-  const sp = { tabs: [{ id: "t1" }, { id: "t2" }], folder: "/fallback" };
-  assert.equal(spaceFolder(sp, [{ tab: "t1", cwd: null }, { tab: "t2", cwd: "/live" }]), "/live");
-  assert.equal(spaceFolder(sp, []), "/fallback");
-  assert.equal(spaceFolder({ tabs: [], folder: "/only" }, []), "/only");
-  assert.equal(spaceFolder(null, []), null);
-  // A pane for a tab not in the space is ignored.
-  assert.equal(spaceFolder(sp, [{ tab: "other", cwd: "/nope" }]), "/fallback");
-});
 
 test("spaceCwd: only a live pane folder, never the space's creation folder", () => {
   const sp = { tabs: [{ id: "t1" }, { id: "t2" }], folder: "/made-in" };

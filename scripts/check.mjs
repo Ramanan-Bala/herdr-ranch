@@ -2,7 +2,8 @@
 // ranch-tasks-windows-install-plan.md §3.4): re-syncs lib/ into the Ranch
 // mods, runs `herdr-app check` on every mods/ranch-* and validates layout and
 // keys JSON. Usage: node scripts/check.mjs [mod-name]
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { syncLib } from "./sync-lib.mjs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,13 +13,8 @@ const mods = (process.argv[2] ? [process.argv[2]] : readdirSync(join(root, "mods
   .filter((m) => existsSync(join(root, "mods", m, "main.js")));
 let status = 0;
 
-// sync-lib.sh: Herdr mods can't import outside their own folder.
-for (const mod of mods) {
-  mkdirSync(join(root, "mods", mod, "lib"), { recursive: true });
-  for (const f of readdirSync(join(root, "lib")).filter((f) => f.endsWith(".js"))) {
-    cpSync(join(root, "lib", f), join(root, "mods", mod, "lib", f));
-  }
-}
+// sync-lib: Herdr mods can't import outside their own folder.
+syncLib(root, { mods });
 
 if (spawnSync("herdr-app", ["--version"]).status !== 0) {
   console.error("herdr-app not found on PATH; mod checks cannot run");

@@ -87,12 +87,18 @@ export default class UsageLimits extends View {
 
   // Fetch whatever is due, then redraw (countdowns and pace move every minute).
   tick(cx, force) {
+    // Usage bar turned off in Ranch settings: nothing shows these numbers, so
+    // no CLI runs; the next tick after it is turned back on fetches what's due.
+    if (!resolveSettings(shared(SETTINGS_KEY)).usage.show) return;
     const st = states();
     for (const p of PROVIDERS) {
       const every = st[p.id]?.installed === false ? MISSING_EVERY : FETCH_EVERY;
       if (force || now() - (this.lastFetch[p.id] ?? 0) >= every) this.fetch(p, cx);
     }
-    this.readSession(cx);
+    // The focused session's numbers (hc get + a helper): kept fresh every
+    // minute only when the bar shows some of them. The hover panel re-reads
+    // on open (SESSION_EVERY), and a focus change reads at once (render).
+    if (this.prefs().sessionOnBar.length) this.readSession(cx);
     this.checkUnreported(cx);
     cx.notify();
   }
@@ -221,14 +227,6 @@ export default class UsageLimits extends View {
   }
 
   // ---------- status bar ----------
-
-  segment(s, density, t) {
-    const color = levelColor(s.level, t);
-    return h_flex().gap(5).items_center().flex_none()
-      .when(density < 2, (e) => e.child(div().text_size(10.5).text_color(t.dim).child(s.short)))
-      .when(density === 0, (e) => e.child(usageBar(BAR_W, s.fill, s.tick, color, t)))
-      .child(div().whitespace_nowrap().text_color(limitColor(s.level, s.text, t)).child(density === 3 ? s.brief : s.text));
-  }
 
   renderBar(cx) {
     const t = theme();

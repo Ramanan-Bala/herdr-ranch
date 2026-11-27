@@ -8,7 +8,6 @@ import {
   formatDuration,
   statusSince,
   truncateMiddle,
-  diffSummary,
   relativeTime,
   folderLabel,
   attentionQueue,
@@ -94,14 +93,6 @@ test("truncateMiddle", () => {
   assert.equal(truncateMiddle("abcdef", 0), "…");
   assert.equal(truncateMiddle("abcdef", -3), "…");
   assert.equal(truncateMiddle("abcdef", 2), "…f");
-});
-
-test("diffSummary", () => {
-  assert.equal(diffSummary(null), null);
-  assert.equal(diffSummary({ files: 0, add: 0, del: 0 }), null);
-  assert.equal(diffSummary({ files: 0, add: undefined, del: 0 }), null);
-  assert.equal(diffSummary({ files: 12, add: 340, del: 87 }), "12 files  +340  \u221287");
-  assert.equal(diffSummary({ files: 1, add: 1, del: 0 }), "1 file  +1  \u22120");
 });
 
 test("relativeTime", () => {

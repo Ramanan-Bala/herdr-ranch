@@ -91,21 +91,6 @@ export function truncateMiddle(text, max) {
 }
 
 /**
- * One-line summary of a diff stat.
- * @param {{files: number, add: number, del: number}|null} stat
- * @returns {string|null} e.g. "12 files  +340  −87", or null when empty.
- */
-export function diffSummary(stat) {
-  if (!stat) return null;
-  const files = stat.files ?? 0;
-  const add = stat.add ?? 0;
-  const del = stat.del ?? 0;
-  if (files === 0 && add === 0 && del === 0) return null;
-  const noun = files === 1 ? "file" : "files";
-  return `${files} ${noun}  +${add}  \u2212${del}`;
-}
-
-/**
  * Coarse relative time for an age in milliseconds.
  * @param {number} msAgo
  * @returns {string} "just now", "5m ago", "3h ago", "2d ago", "3w ago",

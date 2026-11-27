@@ -14,11 +14,8 @@ import {
   expandHome,
   firstLine,
   parseWorktrees,
-  parseBranches,
   repoInfo,
   tilde,
-  pickDefaultBranch,
-  branchSuggestions,
   newSpacePlan,
   planLabel,
   planLines,
@@ -138,13 +135,6 @@ export default class RanchNewSpace extends View {
     this.folderInput.on("focus", (_e, cx) => { this.folderFocused = true; cx.notify(); });
     this.folderInput.on("blur", (_e, cx) => { this.folderFocused = false; cx.notify(); });
 
-    this.branchInput = InputState.new({ value: "", placeholder: "branch name" });
-    this.branchFocused = false;
-    this.branchInput.on("change", (_e, cx) => { this.error = ""; cx.notify(); });
-    this.branchInput.on("submit", (_e, cx) => this.submit(cx));
-    this.branchInput.on("focus", (_e, cx) => { this.branchFocused = true; cx.notify(); });
-    this.branchInput.on("blur", (_e, cx) => { this.branchFocused = false; cx.notify(); });
-
     this.nameInput = InputState.new({ value: "", placeholder: "Named automatically when empty" });
     this.nameFocused = false;
     this.nameInput.on("change", (_e, cx) => { this.error = ""; cx.notify(); });
@@ -158,8 +148,6 @@ export default class RanchNewSpace extends View {
     this.folderPath = "";
     this.repo = null; // { top, main, name }
     this.checkouts = []; // parseWorktrees() rows, main first
-    this.branches = { local: [], remote: [], default: null };
-    this.base = null; // branch a new branch is cut from
     this.worktree = "new"; // "new" or an existing checkout path
     this.homeDir = null; // the target machine's home; null while unknown
     this.more = false;
@@ -198,8 +186,8 @@ export default class RanchNewSpace extends View {
   }
 
   /**
-   * Reads the folder's repo (toplevel + primary checkout), then its worktrees
-   * and branches. The folder is checked first (`test -d` on that machine), so
+   * Reads the folder's repo (toplevel + primary checkout), then its worktrees.
+   * The folder is checked first (`test -d` on that machine), so
    * a path from another machine gets its own answer instead of git's, and git
    * is only ever started with a cwd that machine has. The generation token
    * drops a completion from an older run, so a stale probe never decides for a
@@ -211,8 +199,6 @@ export default class RanchNewSpace extends View {
       const clear = () => {
         this.repo = null;
         this.checkouts = [];
-        this.branches = { local: [], remote: [], default: null };
-        this.base = null;
       };
       try {
         const userHome = machine ? await this.homeFor(machine) : home();
@@ -259,16 +245,12 @@ export default class RanchNewSpace extends View {
           return;
         }
         const list = await git(machine, repo.main, ["worktree", "list", "--porcelain"]);
-        const refs = await git(machine, repo.main, ["for-each-ref", "--format=%(refname)%09%(symref)", "refs/heads", "refs/remotes"]);
         if (gen !== this.probeGen) return;
         const checkouts = parseWorktrees(list.ok ? list.out : "")
           .filter((c) => !c.bare && !c.prunable)
           .sort((a, b) => Number(b.main) - Number(a.main) || a.path.localeCompare(b.path));
-        const current = checkouts.find((c) => c.path === repo.top)?.branch ?? null;
         this.repo = repo;
         this.checkouts = checkouts;
-        this.branches = parseBranches(refs.ok ? refs.out : "");
-        this.base = pickDefaultBranch(this.branches, current);
         // Keep a chosen checkout that still exists; anything else starts at "new".
         if (this.worktree !== "new" && !checkouts.some((c) => c.path === this.worktree)) this.worktree = "new";
         this.probe = "repo";
@@ -335,9 +317,6 @@ export default class RanchNewSpace extends View {
       repoTop: this.repo?.main ?? null,
       worktree: this.probe === "repo" && main ? main : this.worktree,
       checkouts: this.checkouts,
-      branch: this.branchInput.value(),
-      localBranches: this.branches?.local ?? [],
-      defaultBranch: this.base,
       home: this.homeDir,
       error: this.probeError,
     });
@@ -370,8 +349,6 @@ export default class RanchNewSpace extends View {
     this.homeDir = null;
     this.repo = null;
     this.checkouts = [];
-    this.branches = { local: [], remote: [], default: null };
-    this.base = null;
     this.worktree = "new";
     this.probeError = "";
     this.error = "";
@@ -632,16 +609,6 @@ export default class RanchNewSpace extends View {
       .child(body);
   }
 
-  /** A selectable row in the worktree list. */
-  optionRow(t, id, selected, on, body) {
-    return h_flex().id(id).flex_none().h(26).px(6).gap(6).items_center().rounded(5).cursor_pointer()
-      .when(selected, (e) => e.bg(t.selected))
-      .when(!selected, (e) => e.hover((h) => h.bg(t.hover)))
-      .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
-      .on_click(on)
-      .child(body);
-  }
-
   // ---- machine picker ----
 
   /** The dropdown: a full-width field (icon, name, state, chevron) and a list. */
@@ -898,89 +865,6 @@ export default class RanchNewSpace extends View {
     return null;
   }
 
-  worktreeField(t) {
-    const rows = this.checkouts.map((c, i) => this.optionRow(t, `worktree-${i}`, this.worktree === c.path,
-      (_e, cx) => { this.worktree = c.path; this.error = ""; cx.notify(); },
-      h_flex().w_full().min_w(0).gap(6).items_center()
-        .child(svg(ICON("git-branch")).size(11).flex_none().text_color(t.dim))
-        .child(div().flex_none().max_w(190).truncate().text_size(11.5)
-          .when(this.worktree === c.path, (e) => e.font_semibold().text_color(t.foreground))
-          .when(this.worktree !== c.path, (e) => e.text_color(t.muted))
-          .child(c.branch ?? "detached"))
-        .when(c.main, (e) => e.child(div().flex_none().text_size(10).text_color(t.dim).child("primary")))
-        .child(div().flex_1().min_w(0))
-        .child(div().flex_none().max_w(230).truncate().text_size(10.5).text_color(t.dim)
-          .child(tilde(c.path, this.homeForDisplay())))));
-
-    const newRow = this.optionRow(t, "worktree-new", this.worktree === "new",
-      (_e, cx) => {
-        this.worktree = "new";
-        this.error = "";
-        cx.notify();
-        this.branchInput.focus();
-      },
-      h_flex().gap(6).items_center()
-        .child(svg(ICON("plus")).size(11).flex_none().text_color(this.worktree === "new" ? t.foreground : t.dim))
-        .child(div().text_size(11.5)
-          .when(this.worktree === "new", (e) => e.font_semibold().text_color(t.foreground))
-          .when(this.worktree !== "new", (e) => e.text_color(t.muted))
-          .child("New worktree…")));
-
-    // Same fixed-height pattern as the folder browser: the list scrolls inside
-    // a box that is only as tall as its rows, up to six of them.
-    const count = rows.length + 1;
-    const listH = Math.min(26 * 6 + 2, count * 26 + Math.max(0, count - 1) * 1);
-    return this.row(t, "Worktree", v_flex().relative().w_full().h(listH).flex_none()
-      .child(v_flex().id("worktree-list").absolute().inset_0().overflow_y_scroll().gap(1)
-        .children(rows).child(newRow))
-      .child(Scrollbar.vertical("worktree-list").absolute().inset_0()), { start: true });
-  }
-
-  branchField(t) {
-    const query = this.branchInput.value().trim();
-    const suggestions = query ? branchSuggestions(this.branches, query, 4) : [];
-    return this.row(t, "Branch", v_flex().w_full().gap(5).items_start()
-      .child(Input.new(this.branchInput)
-        .w_full().h(FIELD_H).px(9).rounded(7).border_1()
-        .border_color(this.branchFocused ? t.accent : t.input)
-        .bg(t.background).text_size(12.5).text_color(t.foreground))
-      .child(this.branchState(t, query))
-      .when(suggestions.length > 0, (e) => e.child(v_flex().w_full().gap(1)
-        .children(suggestions.map((name, i) => h_flex().id(`branch-suggestion-${i}`).w_full().h(22).px(6).gap(6).items_center()
-          .rounded(5).cursor_pointer().text_color(t.muted)
-          .hover((h) => h.bg(t.hover).text_color(t.foreground))
-          .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
-          .on_click((_e, cx) => {
-            this.branchInput.set_value(name);
-            this.error = "";
-            cx.notify();
-          })
-          .child(svg(ICON("git-branch")).size(10).flex_none().text_color(t.dim))
-          .child(div().flex_1().min_w(0).truncate().text_size(11).child(name)))))), { start: true });
-  }
-
-  /** What the typed branch means: existing, new (from which base), or taken. */
-  branchState(t, query) {
-    const line = (body) => h_flex().gap(6).items_center().text_size(11).child(body);
-    if (!query) {
-      return line(div().text_color(t.dim).child(`New or existing branch, cut from ${this.base ?? "HEAD"}.`));
-    }
-    const taken = this.checkouts.find((c) => c.branch === query);
-    if (taken) {
-      return h_flex().gap(8).items_center().text_size(11)
-        .child(div().text_color(t.muted).child(`Already checked out in ${tilde(taken.path, this.homeForDisplay())}`))
-        .child(div().id("branch-select-worktree").flex_none().text_size(11).text_color(t.accent)
-          .cursor_pointer().hover((h) => h.opacity(0.85))
-          .on_mouse_down("left", (_ev, cx) => cx.stop_propagation())
-          .on_click((_e, cx) => { this.worktree = taken.path; this.error = ""; cx.notify(); })
-          .child("Select that worktree"));
-    }
-    if (this.branches.local.includes(query)) {
-      return line(div().text_color(t.muted).child("Existing branch — checked out in the new worktree."));
-    }
-    return line(div().text_color(t.muted).child(`Will create branch ${query} from ${this.base ?? "HEAD"}.`));
-  }
-
   moreOptions(t) {
     const toggle = h_flex().id("more-options").flex_none().gap(6).items_center().cursor_pointer()
       .text_color(t.dim).hover((h) => h.text_color(t.muted))
@@ -998,8 +882,7 @@ export default class RanchNewSpace extends View {
   }
 
   confirmBlock(t, plan) {
-    // A branch already checked out elsewhere says so under the branch field;
-    // the button next to this names the move.
+    // The button next to this names the move.
     const lines = plan.action === "select" ? [] : planLines(plan, this.homeForDisplay());
     // A folder that could not be read already says so under the field.
     const message = this.error || (plan.action === "error" && this.probe !== "error" ? plan.error : "");

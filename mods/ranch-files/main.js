@@ -10,11 +10,12 @@
 // Previews stay bounded (400000 chars, binary detection) and read-only.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, run, props, openOverlay, closeOverlay, shared, setShared } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, run, props, openOverlay, closeOverlay, shared, setShared, layout } from "herdr";
 import { EdgeGrip } from "./lib/edge-grip.js";
 import { openMenu, renderMenu, runAction, menuKey, nextIndex } from "./lib/popup-menu.js";
 import { fileIcon, folderIcon, iconPath, languageFor } from "./lib/file-icons.js";
-import { VIEWER_KEY, viewerRequest, stableLocation } from "./lib/file-viewer.js";
+import { VIEWER_KEY, viewerRequest, stableLocation, isViewerTab } from "./lib/file-viewer.js";
+import { blockShown, PanelVisibility } from "./lib/panels.js";
 import { diffRows, diffWidth, diffStats, hunkLines, addedLines, diffArgs } from "./lib/diff.js";
 import { treeMarks, viewerBreadcrumbs, parentPath, previewText, lineCount } from "./view-model.js";
 
@@ -87,8 +88,30 @@ export default class Files extends View {
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set();
     this.marks = {}; this.treeMarks = { files: new Map(), folders: new Map() };
     this.reqNonce = shared(REQUEST_KEY)?.nonce ?? null;
-    this.refresh(cx);
-    cx.timer.every(10000, cx => this.refresh(cx));
+    // Closed (or another panel on top): no listing or git reads; the first
+    // render after it is shown again catches up at once (lib/panels.js).
+    this.vis = new PanelVisibility(() => blockShown(layout(), { id: "files", mod: "ranch-files" }));
+    this.refreshIfShown(cx);
+    // Every 10 s; every 60 s while a local folder watch is working (it
+    // refreshes on change, so the timer is only a safety net).
+    this.lastRead = 0;
+    cx.timer.every(10000, cx => {
+      if (this.watched && !this.on && Date.now() - this.lastRead < 60000) return;
+      this.refreshIfShown(cx);
+    });
+  }
+
+  /** refresh() while the panel is on screen; otherwise remember it for the next show. */
+  refreshIfShown(cx) {
+    if (this.vis.check()) this.refresh(cx);
+    else this.vis.skip();
+  }
+
+  /** The viewer tab is on screen only while it is the focused tab. */
+  viewerShown() {
+    const f = focused();
+    const tab = spaces().find(sp => sp.id === f?.space)?.tabs.find(tb => tb.id === f?.tab);
+    return Boolean(tab) && isViewerTab(tab, panes());
   }
 
   // ---- the one open document (viewer tab and pane copies) ----
@@ -138,6 +161,8 @@ export default class Files extends View {
   checkDoc(cx) {
     const doc = this.doc;
     if (!doc || doc.loading) return;
+    // A viewer tab in the background re-checks once it is focused again.
+    if (this.mode === "viewer" && !this.viewerShown()) return;
     if (doc.diff) { this.loadDiff(doc, cx); return; }
     cx.spawn(async cx => {
       let here;
@@ -232,7 +257,7 @@ export default class Files extends View {
     this.watched = root;
     const context = this.context;
     cx.spawn(async cx => {
-      try { while (this.context === context) { await watchFolder(root); if (this.current(context)) this.refresh(cx); } }
+      try { while (this.context === context) { await watchFolder(root); if (this.current(context)) this.refreshIfShown(cx); } }
       catch { if (this.context === context) this.watched = null; }
     });
   }
@@ -263,6 +288,7 @@ export default class Files extends View {
     if (!cwd || this.loading) return;
     const context = this.context;
     this.loading = true;
+    this.lastRead = Date.now();
     this.limited = false;
     cx.spawn(async cx => {
       try {
@@ -508,7 +534,10 @@ export default class Files extends View {
   }
 
   renderBody(cx) {
-    if (key() !== this.context?.key) this.refresh(cx);
+    // Reads wait while hidden (a hidden copy may still be drawn); once shown,
+    // a skipped read or a new location refreshes now.
+    if (!this.vis.check()) { if (key() !== this.context?.key) this.vis.skip(); }
+    else if (this.vis.takeMissed() || key() !== this.context?.key) this.refresh(cx);
     this.handleRequest(cx);
     const t = theme();
     const folder = this.root?.split(/[\\/]/).pop() ?? "";

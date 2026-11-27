@@ -40,12 +40,16 @@ export class Marquee {
     this.sizes = new Map();
   }
 
-  /** Row hover in/out. Returns true when the view should redraw. */
-  hover(key, isIn) {
+  /**
+   * Row hover in/out. Returns true when the view should redraw. Pass the
+   * handler's `cx` to start the redraw loop (animate) on hover-in.
+   */
+  hover(key, isIn, cx) {
     if (isIn) {
       if (this.key === key) return false;
       this.key = key;
       this.since = this.now();
+      this.animate(cx);
       return true;
     }
     if (this.key !== key) return false;
@@ -61,7 +65,27 @@ export class Marquee {
     return over > 1 ? over : 0;
   }
 
-  /** Timer tick: true while a hovered name is scrolling (redraw needed). */
+  /**
+   * Redraws every `tickMs` while a name is hovered, then stops: an idle view
+   * (nothing hovered) never wakes. At most one loop runs per Marquee.
+   * @param {any} cx  a gpui-kit context with spawn(); the loop's own cx sleeps
+   */
+  animate(cx) {
+    if (this.running || this.key === null || typeof cx?.spawn !== "function") return;
+    this.running = true;
+    cx.spawn(async (cx) => {
+      try {
+        while (this.key !== null) {
+          await cx.sleep(MARQUEE.tickMs);
+          if (this.tick()) cx.notify();
+        }
+      } finally {
+        this.running = false;
+      }
+    });
+  }
+
+  /** True while a hovered name is scrolling (redraw needed). */
   tick() {
     return this.key !== null && this.overflow() > 0;
   }

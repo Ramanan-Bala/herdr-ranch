@@ -9,12 +9,13 @@ import {
   settings, knownAgents, nextCommand, setShared,
 } from "herdr";
 import { AUTONAMES_KEY, SETTINGS_KEY, resolveSettings } from "./lib/settings.js";
+import { KNOWN_KEY, KNOWN_EVERY_MS, KNOWN_ON_SETTINGS_MS, refreshKnownAgents } from "./lib/known-agents.js";
 import { ownership } from "./lib/naming.js";
 import { effectiveStatus, attentionQueue, closeNeedsConfirm, closeConfirmProps } from "./lib/format.js";
 import { readPanels } from "./state.js";
 import { VIEWER_KEY, viewerTab, isViewerTab, openViewerCommands, baseName } from "./lib/file-viewer.js";
 import { fileIcon, iconPath } from "./lib/file-icons.js";
-import { Marquee, MARQUEE } from "./lib/marquee.js";
+import { Marquee } from "./lib/marquee.js";
 
 // The right-panel stack ids this bar can toggle, in layout "panel-body".
 const PANELS = ["session", "files", "changes", "settings"];
@@ -42,23 +43,23 @@ export default class RanchTopbar extends View {
     this.viewerNonce = shared(VIEWER_KEY)?.nonce ?? null;
     this.lastTab = new Map();
     // knownAgents(), null until the first check lands; the cached answer shows at once.
-    this.agents = shared("ranch.knownAgents") ?? null;
-    const loadAgents = async (cx) => {
+    // It asks the login shell, so it runs at start and then every 15 min;
+    // opening Settings or the Start-agent dialog re-checks sooner, and every
+    // copy reads the one shared answer (lib/known-agents.js).
+    this.agents = shared(KNOWN_KEY) ?? null;
+    const loadAgents = (maxAge) => async (cx) => {
       try {
-        this.agents = await knownAgents();
-        setShared("ranch.knownAgents", this.agents);
+        const list = await refreshKnownAgents({ knownAgents, shared, setShared, maxAge });
+        if (list) this.agents = list;
       } catch {
         // A failed check isn't cached; keep what we have and retry on the timer.
       }
       cx.notify();
     };
-    cx.spawn(loadAgents);
-    cx.timer.every(60000, (cx) => cx.spawn(loadAgents));
+    cx.spawn(loadAgents(KNOWN_ON_SETTINGS_MS));
+    cx.timer.every(60000, (cx) => cx.spawn(loadAgents(KNOWN_EVERY_MS)));
     // Hover marquee for a tab title too long for its slot (lib/marquee.js).
     this.marquee = new Marquee({ div });
-    cx.timer.every(MARQUEE.tickMs, (cx) => {
-      if (this.marquee.tick()) cx.notify();
-    });
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
@@ -194,7 +195,8 @@ export default class RanchTopbar extends View {
         return launch("launch-terminal", svg("mods/ranch-topbar/terminal.svg").size(14), "New terminal tab",
           () => run("tab.new", space ? { space: space.id } : {}));
       }
-      const agent = this.agents?.find(a => a.key === key);
+      const known = shared(KNOWN_KEY) ?? this.agents; // another copy may have re-checked
+      const agent = known?.find(a => a.key === key);
       const name = agent?.name ?? cap(key);
       // Until knownAgents() answers, Herdr's shipped icon for the key stands in.
       const fallback = ["claude", "codex", "opencode", "antigravity"].includes(key) ? `icons/${key}.svg` : null;
@@ -203,7 +205,7 @@ export default class RanchTopbar extends View {
         : fallback ? image(fallback).size(14) : div().text_size(10).child(cap(key).slice(0, 2));
       if (!agent) {
         // Still checking, or a settings key no agent answers to: shown but inert.
-        return launch(`launch-${key}`, icon, this.agents === null ? null : `${name} isn't installed`, null);
+        return launch(`launch-${key}`, icon, known == null ? null : `${name} isn't installed`, null);
       }
       if (agent.installed === false) {
         return launch(`launch-${key}`, icon, `${name} isn't installed`, null);
@@ -292,7 +294,7 @@ export default class RanchTopbar extends View {
       const mqKey = `tab-${tab.id}`;
       return tabShell(`tab-${tab.id}`, !viewing).max_w(560)
         .on_hover((isIn, cx) => {
-          if (this.marquee.hover(mqKey, isIn)) cx.notify();
+          if (this.marquee.hover(mqKey, isIn, cx)) cx.notify();
         })
         .on_mouse_down("left", (e, cx) => {
           cx.stop_propagation();

@@ -68,8 +68,8 @@ export class GitContexts {
     /** dirty flags for the CURRENT context (true = refresh it soon) */
     this.gitDirty = false;
     this.prDirty = false;
-    /** the single push slot, bound to the context that started it */
-    this.push = { id: 0, key: null, busy: false, err: null, at: 0 };
+    /** when the repo last changed (watch event): a shared result must be newer */
+    this.changedAt = 0;
   }
 
   /**
@@ -96,11 +96,6 @@ export class GitContexts {
   /** A summary is known for the current folder. */
   gitReady() {
     return Boolean(this.current.cwd) && this.git.has(this.current.key);
-  }
-
-  /** Ready but about to change (a read is running or a refresh is due). */
-  gitUpdating() {
-    return this.gitReady() && (this.gitBusy.has(this.current.key) || this.gitDirty);
   }
 
   /** Age of the current entry in ms, or null with no entry. */
@@ -156,10 +151,15 @@ export class GitContexts {
     return op.key === this.current.key;
   }
 
-  /** A repo change can move the branch, so the PR follows. */
-  markGitDirty() {
+  /**
+   * A repo change can move the branch, so the PR follows.
+   * @param {number} [now] when it changed: results shared by another mod
+   *   count only if their read started later (see changedAt)
+   */
+  markGitDirty(now = 0) {
     this.gitDirty = true;
     this.prDirty = true;
+    if (now > this.changedAt) this.changedAt = now;
   }
 
   /** The current context's branch, or null with no summary. */
@@ -186,11 +186,6 @@ export class GitContexts {
   /** A PR row can be drawn for the current context+branch. */
   prReady() {
     return this.prEntry() !== null;
-  }
-
-  /** Ready but about to change (a PR read is running or a refresh is due). */
-  prUpdating() {
-    return this.prReady() && prNeeded(this.gitEntry().summary) && (this.prBusy.has(this.prKey()) || this.prDirty);
   }
 
   /**
@@ -234,47 +229,6 @@ export class GitContexts {
     return op.prKey === this.prKey();
   }
 
-  /** Start the single push, bound to the current context. */
-  beginPush() {
-    if (this.push.busy || !this.gitReady()) return null;
-    const summary = this.gitEntry().summary;
-    if (!summary?.top || !summary.branch) return null;
-    const id = this.push.id + 1;
-    this.push = { id, key: this.current.key, busy: true, err: null, at: 0 };
-    return Object.freeze({
-      id,
-      key: this.current.key,
-      machine: this.current.machine,
-      cwd: this.current.cwd,
-      top: summary.top,
-      branch: summary.branch,
-      gen: this.current.gen,
-    });
-  }
-
-  /**
-   * File a finished push; an old completion never changes a newer push.
-   * @param {{id: number, key: string}} op a beginPush() op
-   * @param {{ok: boolean, err?: string|null}} result
-   * @param {number} now
-   * @returns {boolean} false when the op is stale
-   */
-  finishPush(op, result, now) {
-    if (this.push.id !== op.id) return false;
-    const good = Boolean(result?.ok);
-    this.push = { id: op.id, key: op.key, busy: false, err: good ? null : result?.err || "Push failed", at: good ? now : 0 };
-    if (op.key === this.current.key) this.markGitDirty();
-    return true;
-  }
-
-  /**
-   * Push state to show for the CURRENT context: another context's push
-   * leaves this one inert (blocked) without showing the other's state.
-   */
-  pushView() {
-    if (this.push.key === this.current.key) return { busy: this.push.busy, err: this.push.err, at: this.push.at, blocked: false };
-    return { busy: false, err: null, at: 0, blocked: this.push.busy };
-  }
 }
 
 /**
