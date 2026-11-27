@@ -61,7 +61,6 @@ test("cache hit on switch: ready immediately, background refresh scheduled", () 
   assert.equal(g.gitEntry().summary.branch, "f1");
   assert.equal(g.gitDirty, true);
   assert.equal(g.shouldRefreshGit(t, 30000), true);
-  assert.equal(g.gitUpdating(), true);
 });
 
 test("no cross-folder data on an uncached select", () => {
@@ -179,7 +178,6 @@ test("default branch or no host: synthetic ready PR entry, no refresh", () => {
   assert.equal(e.error, null);
   assert.equal(e.at, t);
   assert.equal(g.prReady(), true);
-  assert.equal(g.prUpdating(), false);
   assert.equal(g.shouldRefreshPr(t, 30000), false);
   assert.equal(g.beginPr(), null);
   // No host: nothing to ask.

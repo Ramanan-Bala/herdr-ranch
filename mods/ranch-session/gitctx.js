@@ -98,11 +98,6 @@ export class GitContexts {
     return Boolean(this.current.cwd) && this.git.has(this.current.key);
   }
 
-  /** Ready but about to change (a read is running or a refresh is due). */
-  gitUpdating() {
-    return this.gitReady() && (this.gitBusy.has(this.current.key) || this.gitDirty);
-  }
-
   /** Age of the current entry in ms, or null with no entry. */
   gitAge(now) {
     const e = this.gitEntry();
@@ -191,11 +186,6 @@ export class GitContexts {
   /** A PR row can be drawn for the current context+branch. */
   prReady() {
     return this.prEntry() !== null;
-  }
-
-  /** Ready but about to change (a PR read is running or a refresh is due). */
-  prUpdating() {
-    return this.prReady() && prNeeded(this.gitEntry().summary) && (this.prBusy.has(this.prKey()) || this.prDirty);
   }
 
   /**

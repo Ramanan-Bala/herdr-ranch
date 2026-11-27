@@ -1162,8 +1162,8 @@ export default class RanchSession extends View {
   /**
    * True once git has been read for this tab's folder. The per-context cache
    * (gitctx) answers for the context the tab is showing: a tab change keeps
-   * the previous folder's cached data on screen ("Updating…"), an unseen one
-   * shows "Refreshing…" instead of another repo's branch.
+   * the previous folder's cached data on screen (refreshed silently), an
+   * unseen one shows "Refreshing…" instead of another repo's branch.
    */
   gitReady(s) {
     this.ctx.select(s.machine, s.cwd);
@@ -1189,13 +1189,6 @@ export default class RanchSession extends View {
       .child("Refreshing\u2026");
   }
 
-  /** The quieter badge for cached data that is being refreshed in place. */
-  updating(t) {
-    return h_flex().gap(5).items_center().flex_none().text_size(11).text_color(t.dim)
-      .child(svg("mods/ranch-session/spinner.svg").size(11).flex_none().text_color(t.working).spin(900))
-      .child("Updating\u2026");
-  }
-
   /** Dim "as of 12s" badge: the data on screen is that old. */
   asOf(t, label) {
     return div().flex_none().text_size(11).text_color(t.dim).child(label);
@@ -1204,18 +1197,16 @@ export default class RanchSession extends View {
   gitCard(t, s, set) {
     const card = this.cardShell(t);
     const ready = this.gitReady(s);
-    // Header badge: "Refreshing…" with nothing cached, "Updating…" over data
-    // being refreshed in place, "as of …" once it is older than the cadence.
+    // Header badge: "Refreshing…" with nothing cached, "as of …" once the
+    // data is older than the cadence. Background refreshes stay silent.
     const age = this.ctx.gitAge(Date.now());
     const badge = !s.cwd
       ? null
       : !ready
         ? this.refreshing(t)
-        : this.ctx.gitUpdating()
-          ? this.updating(t)
-          : age != null && age > this.gitEveryMs(s, set)
-            ? this.asOf(t, ageLabel(age))
-            : null;
+        : age != null && age > this.gitEveryMs(s, set)
+          ? this.asOf(t, ageLabel(age))
+          : null;
     card.child(
       h_flex().gap(6).items_center().min_w(0)
         .child(this.cardTitle(t, "Git"))
@@ -1430,11 +1421,9 @@ export default class RanchSession extends View {
     head.child(div().flex_1().min_w(0));
     // Same badge rule as the git card, on the PR's own cadence.
     const now = Date.now();
-    const badge = ready && this.ctx.prUpdating()
-      ? this.updating(t)
-      : pe && this.ctx.prs.has(this.ctx.prKey()) && now - pe.at > this.prEveryMs(set) // a real lookup, not the no-PR placeholder
-        ? this.asOf(t, ageLabel(now - pe.at))
-        : null;
+    const badge = pe && this.ctx.prs.has(this.ctx.prKey()) && now - pe.at > this.prEveryMs(set) // a real lookup, not the no-PR placeholder
+      ? this.asOf(t, ageLabel(now - pe.at))
+      : null;
     if (badge) head.child(badge);
     if (pr) {
       // The PR's own state as the label (the token is only its colour), in
